@@ -23,6 +23,9 @@ WANTED_SECTIONS = {
     # 19 of them here and only 1 in SYSTEM LOG -- parsing only SYSTEM LOG
     # would have silently missed 95% of them.
     "event_log",
+    # `dumpsys meminfo` -- the per-process blocks run 15,000+ lines, but
+    # only the summary tables at the end are parsed.
+    "meminfo",
 }
 
 __all__ = [

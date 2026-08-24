@@ -26,7 +26,10 @@ from app.models.db_models import (
     PackageFactRow,
     PacketAnalysisRow,
     PacketCaptureSummaryRow,
+    MemorySnapshotRow,
     ProcessKillEventRow,
+    ProcessMemorySampleRow,
+    ProcessMemoryUsageRow,
     SelinuxDenialRow,
     TombstoneRow,
     WifiEventRow,
@@ -95,6 +98,10 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
             select(func.count()).select_from(ProcessKillEventRow)
             .where(ProcessKillEventRow.capture_id == capture_id, ProcessKillEventRow.kind == "kill")
         ).one(),
+        "memory_samples": session.exec(
+            select(func.count()).select_from(ProcessMemorySampleRow)
+            .where(ProcessMemorySampleRow.capture_id == capture_id)
+        ).one(),
         "selinux_denials": session.exec(
             select(func.count()).select_from(SelinuxDenialRow)
             .where(SelinuxDenialRow.capture_id == capture_id)
@@ -148,6 +155,14 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
     ).all()
     process_kill_rows = session.exec(
         select(ProcessKillEventRow).where(ProcessKillEventRow.capture_id == capture_id)
+    ).all()
+    memory_snapshot_row = session.exec(
+        select(MemorySnapshotRow).where(MemorySnapshotRow.capture_id == capture_id)
+    ).first()
+    memory_usage_rows = session.exec(
+        select(ProcessMemoryUsageRow)
+        .where(ProcessMemoryUsageRow.capture_id == capture_id)
+        .order_by(ProcessMemoryUsageRow.metric, ProcessMemoryUsageRow.rank)
     ).all()
     selinux_rows = session.exec(
         select(SelinuxDenialRow).where(SelinuxDenialRow.capture_id == capture_id)
@@ -315,6 +330,27 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
                 "source": _source(k.source_section, k.source_line_start, k.source_line_end),
             } for k in process_kill_rows
         ],
+        "memory_snapshot": (
+            {
+                **{k: v for k, v in memory_snapshot_row.__dict__.items()
+                   if not k.startswith("_")
+                   and k not in ("id", "capture_id", "source_section",
+                                 "source_line_start", "source_line_end")},
+                "top_by_rss": [
+                    {"rank": u.rank, "process": u.process, "pid": u.pid,
+                     "memory_kb": u.memory_kb, "state": u.state}
+                    for u in memory_usage_rows if u.metric == "rss"
+                ],
+                "top_by_pss": [
+                    {"rank": u.rank, "process": u.process, "pid": u.pid,
+                     "memory_kb": u.memory_kb, "swap_kb": u.swap_kb, "state": u.state}
+                    for u in memory_usage_rows if u.metric == "pss"
+                ],
+                "source": _source(memory_snapshot_row.source_section,
+                                  memory_snapshot_row.source_line_start,
+                                  memory_snapshot_row.source_line_end),
+            } if memory_snapshot_row else None
+        ),
         "selinux_denials": [
             {
                 "timestamp": d.timestamp, "verdict": d.verdict, "permissions": d.permissions,

@@ -516,3 +516,180 @@ def test_selinux_denials_found_in_event_log_not_just_system_log(capture1):
     if capture1.selinux_denials:
         assert "event_log" in sections or "system_log" in sections
         assert all(d.verdict in {"denied", "granted"} for d in capture1.selinux_denials)
+
+
+MEMINFO_LINES = """Total RSS by process:
+    772,644K: system (pid 1731)
+    577,760K: com.google.android.apps.wear.companion (pid 6609 / activities)
+     12,000K: tiny (pid 42)
+
+Total PSS by process:
+  1,377,160K: com.google.android.apps.pixel.creativeassistant (pid 4385)  (1,282,633K in swap)
+    332,637K: com.google.android.apps.wear.companion (pid 6609 / activities)(    1,533K in swap)
+
+Total RAM: 11,830,476K (status normal)
+ Free RAM: 8,112,505K (3,834,577K cached pss + 3,726,924K cached kernel +   551,004K free)
+ Used RAM: 5,359,176K (3,359,752K used pss + 1,999,424K kernel)
+ Lost RAM:   853,074K
+     ZRAM:   535,536K physical used for 2,235,288K in swap (5,915,232K total swap)
+""".splitlines()
+
+
+def test_meminfo_snapshot_parses_ram_totals_and_both_rankings():
+    from app.parsers.memory import parse_meminfo
+
+    section = Section(name="meminfo", priority="HIGH", line_start=100,
+                      line_end=100 + len(MEMINFO_LINES) - 1,
+                      lines=MEMINFO_LINES, kind="dumpsys")
+    snap = parse_meminfo(section)
+
+    assert snap.total_ram_kb == 11_830_476
+    assert snap.status == "normal"
+    # Free RAM's inner terms must stay separate: 8.1 GB "free" is mostly
+    # reclaimable cache, and only 551 MB is actually unused. Collapsing
+    # them either way misreports how much headroom the device really has.
+    assert snap.free_ram_kb == 8_112_505
+    assert snap.cached_pss_kb == 3_834_577
+    assert snap.truly_free_kb == 551_004
+    assert snap.used_pss_kb == 3_359_752
+    assert snap.kernel_kb == 1_999_424
+    assert snap.lost_ram_kb == 853_074
+    assert snap.zram_physical_kb == 535_536
+    assert snap.total_swap_kb == 5_915_232
+
+    # RSS and PSS are different measurements, kept in separate lists.
+    assert [u.pid for u in snap.top_by_rss] == [1731, 6609, 42]
+    assert snap.top_by_rss[0].memory_kb == 772_644
+    assert snap.top_by_rss[0].swap_kb is None      # RSS table has no swap column
+    assert snap.top_by_rss[1].state == "activities"
+
+    assert len(snap.top_by_pss) == 2
+    assert snap.top_by_pss[0].memory_kb == 1_377_160
+    assert snap.top_by_pss[0].swap_kb == 1_282_633
+    # The no-space "(pid N / state)(   NK in swap)" spelling is real output.
+    assert snap.top_by_pss[1].swap_kb == 1_533
+    assert snap.top_by_pss[1].state == "activities"
+
+
+AM_PSS_LINES = """06-25 00:40:24.336  1000  1731  2036 I am_pss  : [11797,10234,com.google.android.calendar,0,0,0,189673472,0,14,52]
+06-25 01:10:00.000  1000  1731  2036 I am_pss  : [11797,10234,com.google.android.calendar,4096,2048,1024,199673472,0,14,50]
+""".splitlines()
+
+
+def test_am_pss_zero_pss_is_unknown_not_a_measurement_of_zero():
+    # Modern Android skips the expensive PSS collection and reports RSS
+    # only -- all 244 am_pss events in the real test capture had pss=0. A
+    # zero must surface as "not collected", never as "this process uses
+    # 0 KB", which would be a fabricated measurement.
+    from app.parsers.memory import parse_memory_samples
+
+    section = Section(name="event_log", priority=None, line_start=900,
+                      line_end=901, lines=AM_PSS_LINES, kind="log")
+    samples = parse_memory_samples(section)
+    assert len(samples) == 2
+
+    first = samples[0]
+    assert first.pss_kb is None          # raw 0 -> unknown
+    assert first.swap_pss_kb is None
+    # am_pss reports BYTES; the dumpsys tables report KB. Both normalize to
+    # KB so the two sources can be compared at all.
+    assert first.rss_kb == 189_673_472 // 1024
+    assert first.pid == 11797
+    assert first.process == "com.google.android.calendar"
+    assert first.proc_state == 14
+    assert first.source_ref.line_start == 900
+
+    assert samples[1].pss_kb == 4           # a real nonzero PSS is kept
+    assert samples[1].swap_pss_kb == 1
+
+
+def test_memory_growth_reports_shape_and_never_claims_a_leak():
+    # The real wear.companion sequence: 146 -> 556 -> 560 -> 504 -> 504 ->
+    # 533 MB. That is +387 MB net and NOT monotonic -- it rises, falls, and
+    # rises again, which is ordinary allocate/release. A tool that called
+    # this a leak would be inventing a conclusion the data cannot support.
+    from app.services.reasoning import _derive_memory_growth
+
+    class Row:
+        def __init__(self, ts, rss_mb):
+            self.capture_id, self.pid = 1, 6609
+            self.process = self.package = "com.example.app"
+            self.timestamp, self.rss_kb = ts, rss_mb * 1024
+            self.source_section = "event_log"
+            self.source_line_start = self.source_line_end = 10
+
+    rows = [Row("06-25 0%d:00:00.000" % i, mb)
+            for i, mb in enumerate([146, 556, 560, 504, 504, 533])]
+    growth = _derive_memory_growth(rows, lambda cid: {"capture_id": cid})
+
+    assert len(growth) == 1
+    g = growth[0]
+    assert g["first_rss_kb"] == 146 * 1024
+    assert g["last_rss_kb"] == 533 * 1024
+    assert g["peak_rss_kb"] == 560 * 1024      # peak is higher than last
+    assert g["delta_kb"] == (533 - 146) * 1024
+    assert g["sample_count"] == 6
+    assert g["monotonic"] is False             # it dropped, 560 -> 504
+    assert [s["rss_kb"] for s in g["samples"]][0] == 146 * 1024
+
+    # A single sample proves nothing about change over time.
+    assert _derive_memory_growth([Row("06-25 01:00:00.000", 900)],
+                                 lambda cid: {"capture_id": cid}) == []
+
+
+def test_memory_findings_never_use_the_word_leak():
+    # Guards the one claim this evidence cannot support. am_pss samples
+    # cannot distinguish a leak from an app legitimately doing more work,
+    # so no memory finding may say "leak" no matter how the numbers look.
+    from app.services.reasoning import rank_findings
+
+    bundle = {
+        "memory_growth_evidence": {
+            "growing_processes": [{
+                "process": "com.example.app", "pid": 1, "capture_id": 1,
+                "first_rss_kb": 100 * 1024, "last_rss_kb": 900 * 1024,
+                "peak_rss_kb": 900 * 1024, "delta_kb": 800 * 1024,
+                "sample_count": 8, "monotonic": True,
+            }],
+        },
+    }
+    findings = [f for f in rank_findings(bundle) if f["category"] == "memory"]
+    assert findings
+    blob = " ".join(f["title"] + " " + f["detail"] for f in findings).lower()
+    assert "leak" not in blob
+    assert "grew" in blob
+
+
+def test_meminfo_status_drives_severity_not_a_homegrown_free_ram_threshold():
+    # Android already computes memory status. Second-guessing it with a
+    # "free RAM below X%" rule would flag healthy devices, because free RAM
+    # counts reclaimable cache. A "normal" device produces no finding even
+    # though its truly-free RAM looks small next to its total.
+    from app.services.reasoning import rank_findings
+
+    def bundle_with(status):
+        return {"memory_snapshot_evidence": {"ram": {
+            "status": status, "total_ram_kb": 11_830_476,
+            "free_ram_kb": 8_112_505, "used_ram_kb": 5_359_176,
+            "truly_free_kb": 551_004, "cached_pss_kb": 3_834_577,
+        }}}
+
+    assert [f for f in rank_findings(bundle_with("normal"))
+            if f["category"] == "memory"] == []
+    critical = rank_findings(bundle_with("critical"))
+    assert critical[0]["severity"] == "CRITICAL"
+    assert "critical" in critical[0]["title"]
+    assert rank_findings(bundle_with("moderate"))[0]["severity"] == "MEDIUM"
+
+
+def test_memory_snapshot_and_samples_present_on_real_capture(capture1):
+    # meminfo lives in a dumpsys section; am_pss lives in the EVENT LOG
+    # alongside am_kill. Both wires have to be connected for the memory
+    # picture to be complete.
+    if capture1.memory_snapshot is not None:
+        assert capture1.memory_snapshot.total_ram_kb > 0
+        assert capture1.memory_snapshot.top_by_rss
+    if capture1.memory_samples:
+        assert all(s.source_ref.section == "event_log" for s in capture1.memory_samples)
+        # Never a fabricated zero -- unknown is None.
+        assert all(s.pss_kb is None or s.pss_kb > 0 for s in capture1.memory_samples)

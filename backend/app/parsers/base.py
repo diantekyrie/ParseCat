@@ -443,6 +443,71 @@ class CdmPairingEvent:
 
 
 @dataclass
+class ProcessMemoryUsage:
+    """One row of a `dumpsys meminfo` per-process ranking table. Which
+    metric `memory_kb` holds depends on which table it came from (RSS or
+    PSS) -- the caller keeps them in separate lists rather than mixing
+    two different measurements into one number."""
+
+    process: str
+    pid: int
+    memory_kb: int
+    swap_kb: Optional[int]
+    state: Optional[str]        # e.g. "activities" from "(pid 6609 / activities)"
+    source_ref: SourceRef
+
+
+@dataclass
+class MemorySnapshot:
+    """System-wide memory state at capture time, from `dumpsys meminfo`.
+
+    Every field is Optional because the exact lines printed vary by
+    Android version and build -- an absent field is reported as unknown
+    rather than zero.
+    """
+
+    total_ram_kb: Optional[int]
+    free_ram_kb: Optional[int]
+    used_ram_kb: Optional[int]
+    lost_ram_kb: Optional[int]
+    cached_pss_kb: Optional[int]
+    cached_kernel_kb: Optional[int]
+    truly_free_kb: Optional[int]      # the "N K free" term inside Free RAM
+    used_pss_kb: Optional[int]
+    kernel_kb: Optional[int]
+    zram_physical_kb: Optional[int]
+    zram_in_swap_kb: Optional[int]
+    total_swap_kb: Optional[int]
+    status: Optional[str]             # e.g. "normal", "moderate", "low", "critical"
+    top_by_rss: list["ProcessMemoryUsage"]
+    top_by_pss: list["ProcessMemoryUsage"]
+    source_ref: SourceRef
+
+
+@dataclass
+class ProcessMemorySample:
+    """One `am_pss` sample -- a per-process memory reading at a moment in
+    time. Repeated samples of the same pid are what make memory growth
+    visible at all.
+
+    `pss_kb` is None when the build didn't collect PSS (common on modern
+    Android, where only RSS is populated) -- None means not measured, NOT
+    measured-as-zero.
+    """
+
+    timestamp: str
+    pid: Optional[int]
+    uid: Optional[int]
+    process: str
+    package: Optional[str]
+    pss_kb: Optional[int]
+    rss_kb: Optional[int]
+    swap_pss_kb: Optional[int]
+    proc_state: Optional[int]
+    source_ref: SourceRef
+
+
+@dataclass
 class ProcessKillEvent:
     """An ActivityManager process kill (am_kill) or death (am_proc_died).
 
@@ -539,5 +604,7 @@ class ParsedCapture:
     companion_device_associations: list[CompanionDeviceAssociation] = field(default_factory=list)
     selinux_denials: list[SelinuxDenial] = field(default_factory=list)
     process_kills: list[ProcessKillEvent] = field(default_factory=list)
+    memory_snapshot: Optional[MemorySnapshot] = None
+    memory_samples: list[ProcessMemorySample] = field(default_factory=list)
     device_info: Optional[DeviceInfo] = None
     parse_warnings: list[str] = field(default_factory=list)

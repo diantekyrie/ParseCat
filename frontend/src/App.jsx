@@ -166,6 +166,15 @@ function CaptureTag({ filename }) {
   return <span className="capture-tag" title={filename}>{short}</span>;
 }
 
+// Renders a kilobyte figure at a human scale. A null/undefined value means
+// the capture did not report the field, which is a different claim from
+// reporting zero -- so it shows as "unknown" rather than "0 MB".
+function formatKb(kb) {
+  if (kb === null || kb === undefined) return "unknown";
+  if (kb >= 1024 * 1024) return `${(kb / 1024 / 1024).toFixed(1)} GB`;
+  return `${Math.round(kb / 1024).toLocaleString()} MB`;
+}
+
 function StatCard({ label, value, tone }) {
   return (
     <div className={`stat stat-${tone || "default"}`}>
@@ -1213,6 +1222,70 @@ export default function App() {
                           ))}
                         </tbody>
                       </table>
+                    </section>
+                  )}
+
+                  {summary.memory_snapshot && (
+                    <section className="panel">
+                      <h2>Memory</h2>
+                      <p className="muted small">
+                        A point-in-time snapshot from <code>dumpsys meminfo</code>. <strong>Status</strong> is the
+                        device&apos;s own assessment — trust it over the raw numbers. Free RAM already counts cached
+                        memory as free, because cached pages are reclaimable on demand, so a small &ldquo;truly
+                        free&rdquo; figure next to a large cache is normal and is <em>not</em> memory pressure.
+                      </p>
+                      <div className="stat-row">
+                        <StatCard label="Total RAM" value={formatKb(summary.memory_snapshot.total_ram_kb)} />
+                        <StatCard label="Free RAM" value={formatKb(summary.memory_snapshot.free_ram_kb)} />
+                        <StatCard label="Used RAM" value={formatKb(summary.memory_snapshot.used_ram_kb)} />
+                        <StatCard
+                          label="Status"
+                          value={summary.memory_snapshot.status ?? "not reported"}
+                          tone={
+                            !summary.memory_snapshot.status || summary.memory_snapshot.status === "normal"
+                              ? "ok"
+                              : "warning"
+                          }
+                        />
+                      </div>
+                      <p className="muted small">
+                        Of that free RAM, {formatKb(summary.memory_snapshot.cached_pss_kb)} is reclaimable cached
+                        memory and {formatKb(summary.memory_snapshot.truly_free_kb)} is genuinely unused.
+                        {summary.memory_snapshot.zram_in_swap_kb
+                          ? ` ${formatKb(summary.memory_snapshot.zram_in_swap_kb)} is compressed into ${formatKb(
+                              summary.memory_snapshot.zram_physical_kb,
+                            )} of ZRAM — compressed, not lost.`
+                          : ""}
+                      </p>
+                      {summary.memory_snapshot.top_by_pss.length > 0 && (
+                        <>
+                          <h3 className="small">Top processes by PSS</h3>
+                          <p className="muted small">
+                            PSS divides shared pages by how many processes share them, so these figures can be
+                            meaningfully compared between processes. (RSS, shown by <code>am_pss</code> samples
+                            elsewhere, counts every resident page including shared ones — never sum RSS across
+                            processes, and never compare an RSS figure to a PSS one.)
+                          </p>
+                          <table className="fact-table">
+                            <thead>
+                              <tr><th>#</th><th>Process</th><th>PID</th><th>PSS</th><th>In swap</th><th>State</th><th>Cite</th></tr>
+                            </thead>
+                            <tbody>
+                              {summary.memory_snapshot.top_by_pss.slice(0, 10).map((u) => (
+                                <tr key={`pss-${u.rank}`}>
+                                  <td>{u.rank}</td>
+                                  <td className="small">{u.process}</td>
+                                  <td>{u.pid}</td>
+                                  <td>{formatKb(u.memory_kb)}</td>
+                                  <td>{u.swap_kb ? formatKb(u.swap_kb) : ""}</td>
+                                  <td className="small">{u.state ?? ""}</td>
+                                  <td><SourceTag source={summary.memory_snapshot.source} /></td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </>
+                      )}
                     </section>
                   )}
 

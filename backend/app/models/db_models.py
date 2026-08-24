@@ -323,6 +323,79 @@ class ProcessKillEventRow(SQLModel, table=True):
     source_line_end: int
 
 
+class MemorySnapshotRow(SQLModel, table=True):
+    """System-wide memory state from `dumpsys meminfo`, one row per capture.
+
+    Every column is nullable because which lines dumpsys prints varies by
+    Android version -- a NULL means the capture did not report it, which is
+    a different claim from reporting zero.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    total_ram_kb: Optional[int]
+    free_ram_kb: Optional[int]
+    used_ram_kb: Optional[int]
+    lost_ram_kb: Optional[int]
+    cached_pss_kb: Optional[int]
+    cached_kernel_kb: Optional[int]
+    truly_free_kb: Optional[int]
+    used_pss_kb: Optional[int]
+    kernel_kb: Optional[int]
+    zram_physical_kb: Optional[int]
+    zram_in_swap_kb: Optional[int]
+    total_swap_kb: Optional[int]
+    status: Optional[str] = Field(default=None, index=True)
+    source_section: str
+    source_line_start: int
+    source_line_end: int
+
+
+class ProcessMemoryUsageRow(SQLModel, table=True):
+    """One row of a meminfo per-process ranking. `metric` records which
+    table it came from ("rss" or "pss") -- the two measure different things
+    and must never be summed or compared against each other."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    metric: str = Field(index=True)
+    rank: int
+    process: str
+    package: Optional[str] = Field(default=None, index=True)
+    pid: int
+    memory_kb: int
+    swap_kb: Optional[int]
+    state: Optional[str]
+    source_section: str
+    source_line_start: int
+    source_line_end: int
+
+
+class ProcessMemorySampleRow(SQLModel, table=True):
+    """One `am_pss` sample. Repeated samples of the same pid are what make
+    memory growth measurable at all.
+
+    `pss_kb` is NULL when the build did not collect PSS (the common case on
+    modern Android, where only RSS is populated) -- NULL means not
+    measured, never measured-as-zero.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    timestamp: str
+    pid: Optional[int] = Field(default=None, index=True)
+    uid: Optional[int]
+    process: str
+    package: Optional[str] = Field(default=None, index=True)
+    pss_kb: Optional[int]
+    rss_kb: Optional[int]
+    swap_pss_kb: Optional[int]
+    proc_state: Optional[int]
+    source_section: str
+    source_line_start: int
+    source_line_end: int
+
+
 class SelinuxDenialRow(SQLModel, table=True):
     """One parsed SELinux AVC denial. `enforcing` distinguishes a real
     blocked operation (permissive=0) from a logged-but-allowed one

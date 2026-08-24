@@ -24,6 +24,7 @@ from app.parsers.media_session import parse_media_sessions
 from app.parsers.package_info import parse_packages
 from app.parsers.packet_analysis import analyze_packet_capture
 from app.parsers.pcap import parse_pcap
+from app.parsers.memory import parse_meminfo, parse_memory_samples
 from app.parsers.process_kills import parse_process_kills
 from app.parsers.section_extractor import extract_sections, extract_sections_from_text
 from app.parsers.selinux import parse_selinux_denials
@@ -182,6 +183,12 @@ def _parse_sections_into_capture(capture: ParsedCapture, sections: dict) -> Pars
     # AVC denials.
     if "event_log" in sections:
         capture.process_kills = parse_process_kills(sections["event_log"])
+        # am_pss lives in the EVENT LOG alongside am_kill -- both are
+        # ActivityManager events, not SYSTEM LOG messages.
+        capture.memory_samples = parse_memory_samples(sections["event_log"])
+
+    if "meminfo" in sections:
+        capture.memory_snapshot = parse_meminfo(sections["meminfo"])
     if "event_log" not in sections:
         capture.parse_warnings.append("No 'EVENT LOG' section found (SELinux denials may be undercounted)")
 

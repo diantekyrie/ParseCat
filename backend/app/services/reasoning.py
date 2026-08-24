@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 
 from sqlmodel import Session
@@ -30,7 +31,10 @@ from app.models.db_models import (
     DeviceInfoRow,
     PacketAnalysisRow,
     PacketCaptureSummaryRow,
+    MemorySnapshotRow,
     ProcessKillEventRow,
+    ProcessMemorySampleRow,
+    ProcessMemoryUsageRow,
     SelinuxDenialRow,
     TombstoneRow,
     WifiEventRow,
@@ -186,6 +190,18 @@ numbers). Rules, no exceptions:
     report counts and reasons plainly and do not assert the device is
     "leaking memory" or "under memory pressure" unless a reason field
     actually says so.
+10d. If the bundle includes "memory_snapshot_evidence", that is dumpsys
+    meminfo. Quote the device's own `status` field for pressure; do not
+    derive pressure from free RAM yourself, since free RAM already counts
+    reclaimable cached memory. Never sum RSS across processes (shared
+    pages are counted in each one) and never compare an RSS figure to a
+    PSS figure.
+10e. If the bundle includes "memory_growth_evidence", those are repeated
+    am_pss samples. NEVER use the words "memory leak" -- these samples
+    cannot distinguish a leak from an app legitimately using more memory.
+    Say a process "grew from X to Y". Report `monotonic: false` honestly
+    as fluctuation, not as steady growth. If `pss_collected` is false,
+    say PSS was not collected on this build; do not report it as 0.
 11. If the bundle includes a "device_context" object, that's real parsed
     device info (build fingerprint, kernel, security patch, etc.) -- open
     the report with a short "Device" line or table using it verbatim, not
@@ -286,6 +302,61 @@ def build_entity_claim(ev: EntityVerification, history: PackageHistory | None) -
             "ever_hosted_foreground_service": history.ever_hosted_foreground_service,
         }
     return claim
+
+
+def _derive_memory_growth(sample_rows, capture_tag, min_delta_kb: int = 20 * 1024) -> list[dict]:
+    """Groups repeated am_pss samples per process and reports how RSS moved.
+
+    Deliberately reports the SHAPE of the change, not a verdict. Real data
+    from a test capture:
+
+        146MB -> 556MB -> 560MB -> 504MB -> 504MB -> 533MB
+
+    That is +387MB net, and it is also not a leak -- it goes up, down, then
+    up again, which is what an app that allocates and releases looks like.
+    A tool that called this a "memory leak" would be inventing a
+    conclusion the data doesn't support. So `monotonic` is emitted as a
+    plain fact (did it only ever increase?) and the full sample sequence
+    rides along, letting the reader see the curve. Nothing here uses the
+    word leak.
+
+    Grouped by (capture_id, pid, process) rather than package: a pid is
+    reused after a process restarts, and a restarted process starting
+    small again is not the same process shrinking.
+    """
+    groups: dict[tuple, list] = defaultdict(list)
+    for r in sample_rows:
+        if r.rss_kb is None or r.pid is None:
+            continue
+        groups[(r.capture_id, r.pid, r.process)].append(r)
+
+    growth = []
+    for (capture_id, pid, process), rows in groups.items():
+        if len(rows) < 2:
+            continue  # a single sample says nothing about change over time
+        rows.sort(key=lambda r: r.timestamp)
+        values = [r.rss_kb for r in rows]
+        delta = values[-1] - values[0]
+        if delta < min_delta_kb:
+            continue
+        growth.append({
+            "process": process, "package": rows[0].package, "pid": pid,
+            "first_rss_kb": values[0], "last_rss_kb": values[-1],
+            "peak_rss_kb": max(values), "delta_kb": delta,
+            "sample_count": len(values),
+            # True only if RSS never once decreased between samples. False
+            # means it fluctuated, which is normal allocate/release
+            # behavior and must not be described as unbounded growth.
+            "monotonic": all(b >= a for a, b in zip(values, values[1:])),
+            "first_timestamp": rows[0].timestamp, "last_timestamp": rows[-1].timestamp,
+            "samples": [{"timestamp": r.timestamp, "rss_kb": r.rss_kb} for r in rows],
+            **capture_tag(capture_id),
+            "source": {"section": rows[0].source_section,
+                       "line_start": rows[0].source_line_start,
+                       "line_end": rows[-1].source_line_end},
+        })
+    growth.sort(key=lambda g: g["delta_kb"], reverse=True)
+    return growth
 
 
 def build_diagnosis_bundle(
@@ -551,6 +622,85 @@ def build_diagnosis_bundle(
                 ],
             }
 
+        # The snapshot answers "was the device actually short on memory?",
+        # which the kill list alone cannot -- Android kills cached processes
+        # routinely on a perfectly healthy device.
+        snap_row = session.exec(
+            select(MemorySnapshotRow).where(MemorySnapshotRow.capture_id == capture_id)
+        ).first()
+        if snap_row is not None:
+            usage_rows = session.exec(
+                select(ProcessMemoryUsageRow)
+                .where(ProcessMemoryUsageRow.capture_id == capture_id)
+                .order_by(ProcessMemoryUsageRow.metric, ProcessMemoryUsageRow.rank)
+            ).all()
+            bundle["memory_snapshot_evidence"] = {
+                "confidence": memory_confidence,
+                "corroboration": memory_corroboration,
+                "note": (
+                    "System-wide memory at the moment the bugreport was taken, from "
+                    "`dumpsys meminfo`. `status` is the device's own assessment "
+                    "(normal/moderate/low/critical) -- prefer it over inferring pressure "
+                    "from the raw numbers. Free RAM already counts cached memory as free, "
+                    "because cached pages are reclaimable on demand; a low 'truly_free_kb' "
+                    "next to a large 'cached_pss_kb' is normal and is NOT memory pressure. "
+                    "RSS and PSS measure different things -- RSS counts every page the "
+                    "process has resident including shared ones, so RSS figures double-count "
+                    "across processes and must never be summed; PSS divides shared pages by "
+                    "how many processes share them. A process high in swap is compressed, "
+                    "not lost. Any null field means this build did not report it."
+                ),
+                "ram": {k: v for k, v in snap_row.__dict__.items()
+                        if not k.startswith("_")
+                        and k not in ("id", "capture_id", "source_section",
+                                      "source_line_start", "source_line_end")},
+                "top_processes_by_rss": [
+                    {"rank": u.rank, "process": u.process, "pid": u.pid,
+                     "rss_kb": u.memory_kb, "state": u.state}
+                    for u in usage_rows if u.metric == "rss"
+                ][:10],
+                "top_processes_by_pss": [
+                    {"rank": u.rank, "process": u.process, "pid": u.pid,
+                     "pss_kb": u.memory_kb, "swap_kb": u.swap_kb, "state": u.state}
+                    for u in usage_rows if u.metric == "pss"
+                ][:10],
+                "source": {"section": snap_row.source_section,
+                           "line_start": snap_row.source_line_start,
+                           "line_end": snap_row.source_line_end},
+            }
+
+        sample_rows = session.exec(
+            select(ProcessMemorySampleRow)
+            .where(ProcessMemorySampleRow.capture_id.in_(sibling_capture_ids))
+        ).all()
+        if sample_rows:
+            growth = _derive_memory_growth(sample_rows, _capture_tag)
+            pss_collected = any(r.pss_kb is not None for r in sample_rows)
+            bundle["memory_growth_evidence"] = {
+                "confidence": memory_confidence,
+                "corroboration": memory_corroboration,
+                "note": (
+                    f"Per-process memory sampled repeatedly over the life of the log "
+                    f"(am_pss events), across all {captures_checked} capture(s) for this "
+                    f"device. Only processes whose RSS rose by at least 20 MB between first "
+                    f"and last sample are listed. "
+                    + ("" if pss_collected else
+                       "This build did NOT collect PSS -- every sample reported RSS only, so "
+                       "PSS is unavailable here rather than zero. ")
+                    + "CRITICAL: growth is not a leak. `monotonic: true` means RSS never "
+                    "decreased between samples; `monotonic: false` means it rose and fell, "
+                    "which is ordinary allocate-and-release behavior. Describe what the "
+                    "`samples` sequence shows and do NOT call any of this a memory leak -- "
+                    "these samples cannot distinguish a leak from an app legitimately using "
+                    "more memory as it does more work. Sampling is irregular, so the gap "
+                    "between two samples is not a fixed interval."
+                ),
+                "processes_sampled": len({(r.capture_id, r.pid) for r in sample_rows}),
+                "total_samples": len(sample_rows),
+                "pss_collected": pss_collected,
+                "growing_processes": growth[:10],
+            }
+
     if want_selinux:
         # An SELinux denial with permissive=0 is a real, already-happened
         # functional failure: the kernel blocked the operation. permissive=1
@@ -713,6 +863,8 @@ def build_diagnosis_bundle(
         "device_wide_battery_evidence": "battery consumption evidence",
         "device_wide_selinux_evidence": "SELinux policy denials",
         "device_wide_memory_evidence": "process kill / memory pressure evidence",
+        "memory_snapshot_evidence": "system-wide RAM snapshot (dumpsys meminfo)",
+        "memory_growth_evidence": "per-process memory sampled over time (am_pss)",
         "device_wide_pairing_evidence": "Bluetooth / Companion Device Manager pairing evidence",
         "bt_hci_summary": "Bluetooth HCI packet log",
         "packet_capture_summary": "packet capture container metadata",
@@ -752,6 +904,12 @@ def _truncate_detail(detail: str | None) -> str | None:
 
 
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+
+
+def _mb(kb: int | None) -> str:
+    """Formats KB as MB for human-facing finding text. Returns "unknown"
+    for None so a missing measurement never renders as "0 MB"."""
+    return "unknown" if kb is None else f"{kb / 1024:,.0f} MB"
 
 
 def rank_findings(bundle: dict) -> list[dict]:
@@ -840,6 +998,38 @@ def rank_findings(bundle: dict) -> list[dict]:
             f"reason: {k.get('reason') or 'not recorded'}"
             + (f", oom_adj {k.get('oom_adj')}" if k.get("oom_adj") is not None else "")
             + (f", {rss} kB RSS" if rss else ""), k)
+
+    snapshot = bundle.get("memory_snapshot_evidence") or {}
+    ram = snapshot.get("ram") or {}
+    # Severity comes from the device's OWN status field, not from a
+    # threshold invented here. Android already computes this, and second-
+    # guessing it with a "free RAM below X%" rule would flag healthy
+    # devices -- cached memory counts as free precisely because it is
+    # reclaimable on demand.
+    status = (ram.get("status") or "").lower()
+    if status and status != "normal":
+        add({"critical": "CRITICAL", "low": "HIGH", "moderate": "MEDIUM"}.get(status, "MEDIUM"),
+            "memory", f"Device reported memory status \"{ram.get('status')}\"",
+            f"total RAM {_mb(ram.get('total_ram_kb'))}, free {_mb(ram.get('free_ram_kb'))}, "
+            f"used {_mb(ram.get('used_ram_kb'))} -- status is the device's own assessment",
+            snapshot)
+
+    growth = bundle.get("memory_growth_evidence") or {}
+    for g in growth.get("growing_processes", []):
+        # Ranked on the size of the rise, with `monotonic` reported rather
+        # than used to escalate. A steady climb and a sawtooth can produce
+        # the same delta, and neither one proves a leak -- so the title
+        # says "grew", the detail shows the shape, and the word leak is
+        # never used.
+        delta = g.get("delta_kb") or 0
+        severity = "MEDIUM" if delta >= 256 * 1024 else "LOW"
+        shape = ("rose steadily, never dropped" if g.get("monotonic")
+                 else "rose and fell between samples (normal allocate/release)")
+        add(severity, "memory",
+            f"{g.get('process') or 'unknown process'} grew {_mb(delta)} in RSS",
+            f"{_mb(g.get('first_rss_kb'))} -> {_mb(g.get('last_rss_kb'))} "
+            f"(peak {_mb(g.get('peak_rss_kb'))}) over {g.get('sample_count')} samples; {shape}",
+            g)
 
     selinux = bundle.get("device_wide_selinux_evidence") or {}
     for d in selinux.get("denials", []):

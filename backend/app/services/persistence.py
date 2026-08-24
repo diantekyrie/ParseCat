@@ -31,7 +31,10 @@ from app.models.db_models import (
     PackageFactRow,
     PacketAnalysisRow,
     PacketCaptureSummaryRow,
+    MemorySnapshotRow,
     ProcessKillEventRow,
+    ProcessMemorySampleRow,
+    ProcessMemoryUsageRow,
     SelinuxDenialRow,
     TombstoneRow,
     WifiEventRow,
@@ -272,6 +275,45 @@ def persist_capture(
             source_section=k.source_ref.section,
             source_line_start=k.source_ref.line_start,
             source_line_end=k.source_ref.line_end,
+        ))
+
+    snap = parsed.memory_snapshot
+    if snap is not None:
+        session.add(MemorySnapshotRow(
+            capture_id=capture.id,
+            total_ram_kb=snap.total_ram_kb, free_ram_kb=snap.free_ram_kb,
+            used_ram_kb=snap.used_ram_kb, lost_ram_kb=snap.lost_ram_kb,
+            cached_pss_kb=snap.cached_pss_kb, cached_kernel_kb=snap.cached_kernel_kb,
+            truly_free_kb=snap.truly_free_kb, used_pss_kb=snap.used_pss_kb,
+            kernel_kb=snap.kernel_kb, zram_physical_kb=snap.zram_physical_kb,
+            zram_in_swap_kb=snap.zram_in_swap_kb, total_swap_kb=snap.total_swap_kb,
+            status=snap.status,
+            source_section=snap.source_ref.section,
+            source_line_start=snap.source_ref.line_start,
+            source_line_end=snap.source_ref.line_end,
+        ))
+        # `rank` is stored rather than derived later: the tables arrive
+        # already sorted by the device, and re-sorting on memory_kb after a
+        # round-trip would silently reorder ties.
+        for metric, rows in (("rss", snap.top_by_rss), ("pss", snap.top_by_pss)):
+            for rank, u in enumerate(rows, start=1):
+                session.add(ProcessMemoryUsageRow(
+                    capture_id=capture.id, metric=metric, rank=rank,
+                    process=u.process, package=u.process.split(":")[0],
+                    pid=u.pid, memory_kb=u.memory_kb, swap_kb=u.swap_kb, state=u.state,
+                    source_section=u.source_ref.section,
+                    source_line_start=u.source_ref.line_start,
+                    source_line_end=u.source_ref.line_end,
+                ))
+
+    for m in parsed.memory_samples:
+        session.add(ProcessMemorySampleRow(
+            capture_id=capture.id, timestamp=m.timestamp, pid=m.pid, uid=m.uid,
+            process=m.process, package=m.package, pss_kb=m.pss_kb, rss_kb=m.rss_kb,
+            swap_pss_kb=m.swap_pss_kb, proc_state=m.proc_state,
+            source_section=m.source_ref.section,
+            source_line_start=m.source_ref.line_start,
+            source_line_end=m.source_ref.line_end,
         ))
 
     for d in parsed.selinux_denials:

@@ -37,7 +37,15 @@ def _parse_history(raw: str | None) -> list[dict] | None:
 
 
 @router.post("/captures")
-async def upload_capture(
+# Deliberately `def`, not `async def`. parse_capture_file() is a blocking,
+# CPU-bound call (~8s on a 188MB bugreport) -- inside an async route it
+# blocks the whole event loop, stalling every other request on the server.
+# Measured before this change: a trivial /api/health call went from 116ms
+# to 7,266ms while one upload was parsing. FastAPI runs sync routes in a
+# threadpool instead, so concurrent uploads no longer freeze each other.
+# (For real multi-tenant scale this still wants a job queue with workers --
+# a threadpool bounds concurrency, it doesn't make parsing free.)
+def upload_capture(
     device_label: str = Form(...),
     investigation_label: str | None = Form(None),
     file: UploadFile = File(...),

@@ -31,6 +31,10 @@ from app.models.db_models import (
     PackageFactRow,
     PacketAnalysisRow,
     PacketCaptureSummaryRow,
+    GnssSignalIntervalRow,
+    LocationAppUsageRow,
+    LocationProviderRow,
+    LocationSnapshotRow,
     MemorySnapshotRow,
     ProcessKillEventRow,
     ProcessMemorySampleRow,
@@ -275,6 +279,58 @@ def persist_capture(
             source_section=k.source_ref.section,
             source_line_start=k.source_ref.line_start,
             source_line_end=k.source_ref.line_end,
+        ))
+
+    loc = parsed.location_snapshot
+    if loc is not None:
+        k = loc.kpi
+        session.add(LocationSnapshotRow(
+            capture_id=capture.id,
+            location_enabled=loc.location_enabled,
+            gnss_hardware_model=loc.gnss_hardware_model,
+            location_failure_pct=k.location_failure_pct if k else None,
+            ttff_mean_sec=k.ttff_mean_sec if k else None,
+            ttff_stddev_sec=k.ttff_stddev_sec if k else None,
+            accuracy_mean_m=k.accuracy_mean_m if k else None,
+            accuracy_stddev_m=k.accuracy_stddev_m if k else None,
+            cn0_mean_dbhz=k.cn0_mean_dbhz if k else None,
+            cn0_threshold_dbhz=k.cn0_threshold_dbhz if k else None,
+            cn0_time_above_threshold_min=k.cn0_time_above_threshold_min if k else None,
+            cn0_time_below_threshold_min=k.cn0_time_below_threshold_min if k else None,
+            constellations=k.constellations if k else None,
+            source_section=loc.source_ref.section,
+            source_line_start=loc.source_ref.line_start,
+            source_line_end=loc.source_ref.line_end,
+        ))
+        for pr in loc.providers:
+            session.add(LocationProviderRow(
+                capture_id=capture.id, name=pr.name, last_fix_provider=pr.last_fix_provider,
+                latitude=pr.latitude, longitude=pr.longitude,
+                horizontal_accuracy_m=pr.horizontal_accuracy_m, satellites=pr.satellites,
+                max_cn0=pr.max_cn0, mean_cn0=pr.mean_cn0,
+                source_section=pr.source_ref.section,
+                source_line_start=pr.source_ref.line_start,
+                source_line_end=pr.source_ref.line_end,
+            ))
+        for u in loc.app_usage:
+            session.add(LocationAppUsageRow(
+                capture_id=capture.id, provider=u.provider, uid=u.uid, package=u.package,
+                tag=u.tag, min_interval=u.min_interval, max_interval=u.max_interval,
+                total_duration=u.total_duration, foreground_duration=u.foreground_duration,
+                locations=u.locations,
+                source_section=u.source_ref.section,
+                source_line_start=u.source_ref.line_start,
+                source_line_end=u.source_ref.line_end,
+            ))
+
+    for iv in parsed.gnss_signal_intervals:
+        session.add(GnssSignalIntervalRow(
+            capture_id=capture.id, quality=iv.quality,
+            start_timestamp=iv.start_timestamp, end_timestamp=iv.end_timestamp,
+            duration_sec=iv.duration_sec, active_uids=iv.active_uids, gps_active=iv.gps_active,
+            source_section=iv.source_ref.section,
+            source_line_start=iv.source_ref.line_start,
+            source_line_end=iv.source_ref.line_end,
         ))
 
     snap = parsed.memory_snapshot

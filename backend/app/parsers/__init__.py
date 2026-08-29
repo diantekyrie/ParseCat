@@ -26,6 +26,11 @@ WANTED_SECTIONS = {
     # `dumpsys meminfo` -- the per-process blocks run 15,000+ lines, but
     # only the summary tables at the end are parsed.
     "meminfo",
+    # `dumpsys location` -- providers, per-app usage, and the GNSS KPI block.
+    # Added after a real miss: a GPS question returned an empty bundle
+    # because nothing here was parsed, even though every needed number was
+    # sitting in the capture.
+    "location",
 }
 
 __all__ = [

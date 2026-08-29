@@ -323,6 +323,92 @@ class ProcessKillEventRow(SQLModel, table=True):
     source_line_end: int
 
 
+class LocationSnapshotRow(SQLModel, table=True):
+    """`dumpsys location` state, one row per capture. The KPI columns are
+    since-boot aggregates and cannot be attributed to any time window."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    location_enabled: Optional[bool] = Field(default=None, index=True)
+    gnss_hardware_model: Optional[str]
+    location_failure_pct: Optional[float]
+    ttff_mean_sec: Optional[float]
+    ttff_stddev_sec: Optional[float]
+    accuracy_mean_m: Optional[float]
+    accuracy_stddev_m: Optional[float]
+    cn0_mean_dbhz: Optional[float]
+    cn0_threshold_dbhz: Optional[float]
+    cn0_time_above_threshold_min: Optional[float]
+    cn0_time_below_threshold_min: Optional[float]
+    constellations: Optional[str]
+    source_section: str
+    source_line_start: int
+    source_line_end: int
+
+
+class LocationProviderRow(SQLModel, table=True):
+    """One provider's last known fix. Latitude/longitude are a real physical
+    position and stay local -- callers use location.redacted_coords() before
+    any of this leaves the machine."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    name: str = Field(index=True)
+    last_fix_provider: Optional[str]
+    latitude: Optional[float]
+    longitude: Optional[float]
+    horizontal_accuracy_m: Optional[float]
+    satellites: Optional[int]
+    max_cn0: Optional[float]
+    mean_cn0: Optional[float]
+    source_section: str
+    source_line_start: int
+    source_line_end: int
+
+
+class LocationAppUsageRow(SQLModel, table=True):
+    """Per-app, per-provider location usage since boot. `locations` is the
+    count actually delivered, which is what reveals an app being served
+    more slowly than the rate it requested."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    provider: str = Field(index=True)
+    uid: int
+    package: str = Field(index=True)
+    tag: Optional[str]
+    min_interval: str
+    max_interval: str
+    total_duration: str
+    foreground_duration: str
+    locations: int
+    source_section: str
+    source_line_start: int
+    source_line_end: int
+
+
+class GnssSignalIntervalRow(SQLModel, table=True):
+    """A span holding one GPS reception classification.
+
+    "none" means no fix -- either still acquiring or GPS off -- and is NOT
+    a reading of bad reception, so it must never be counted as degraded.
+    Reception quality is also not position error: these logs never record
+    the coordinates an app actually received.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    quality: str = Field(index=True)
+    start_timestamp: str
+    end_timestamp: str
+    duration_sec: int
+    active_uids: Optional[str]
+    gps_active: bool
+    source_section: str
+    source_line_start: int
+    source_line_end: int
+
+
 class MemorySnapshotRow(SQLModel, table=True):
     """System-wide memory state from `dumpsys meminfo`, one row per capture.
 

@@ -443,6 +443,104 @@ class CdmPairingEvent:
 
 
 @dataclass
+class LocationProviderState:
+    """One location provider's last known fix.
+
+    `latitude`/`longitude` are a real physical position -- often someone's
+    home. They are kept locally for the UI; use location.redacted_coords()
+    before putting a fix into anything sent off-device.
+    """
+
+    name: str                        # "gps" | "network" | "fused" | "passive" | ...
+    last_fix_provider: Optional[str]  # provider named INSIDE the fix, may differ
+    latitude: Optional[float]
+    longitude: Optional[float]
+    horizontal_accuracy_m: Optional[float]
+    satellites: Optional[int]        # GPS fixes only; others carry no satellite bundle
+    max_cn0: Optional[float]
+    mean_cn0: Optional[float]
+    source_ref: SourceRef
+
+
+@dataclass
+class LocationAppUsage:
+    """How much location one app drew from one provider, since boot.
+
+    `locations` is the count actually DELIVERED, which is the interesting
+    number: an app requesting 1 Hz that received far fewer was not being
+    served at the rate it asked for.
+    """
+
+    provider: str
+    uid: int
+    package: str
+    tag: Optional[str]
+    min_interval: str                # kept as printed ("0s", "passive", ...)
+    max_interval: str
+    total_duration: str
+    foreground_duration: str
+    locations: int
+    source_ref: SourceRef
+
+
+@dataclass
+class GnssKpi:
+    """Since-boot GNSS aggregates from the KPI block.
+
+    These cover the whole uptime and CANNOT be attributed to any single
+    time window -- a caller reporting them must say so, or it implies a
+    precision the numbers do not have.
+    """
+
+    location_failure_pct: Optional[float]
+    location_reports: Optional[int]
+    ttff_reports: Optional[int]
+    ttff_mean_sec: Optional[float]
+    ttff_stddev_sec: Optional[float]
+    accuracy_reports: Optional[int]
+    accuracy_mean_m: Optional[float]
+    accuracy_stddev_m: Optional[float]
+    cn0_mean_dbhz: Optional[float]
+    cn0_stddev_dbhz: Optional[float]
+    cn0_threshold_dbhz: Optional[float]      # the good/poor boundary this build used
+    cn0_time_above_threshold_min: Optional[float]
+    cn0_time_below_threshold_min: Optional[float]
+    constellations: Optional[str]
+
+
+@dataclass
+class LocationSnapshot:
+    location_enabled: Optional[bool]
+    gnss_hardware_model: Optional[str]
+    providers: list["LocationProviderState"]
+    app_usage: list["LocationAppUsage"]
+    kpi: Optional["GnssKpi"]
+    source_ref: SourceRef
+
+
+@dataclass
+class GnssSignalInterval:
+    """A span during which GPS reception held one quality classification.
+
+    `quality` is Android's own label. "good"/"poor" are thresholded on the
+    top-4-average carrier-to-noise ratio; "none" means no fix -- either
+    still acquiring or GPS off -- and is NOT a reading of bad reception.
+
+    Reception quality is not position error. A poor interval means weak
+    satellite signal; it does not establish that any app received a wrong
+    position, which these logs never record.
+    """
+
+    quality: str                     # "good" | "poor" | "none"
+    start_timestamp: str
+    end_timestamp: str
+    duration_sec: int
+    active_uids: Optional[str]       # comma-joined uids holding GPS during the span
+    gps_active: bool
+    source_ref: SourceRef
+
+
+@dataclass
 class ProcessMemoryUsage:
     """One row of a `dumpsys meminfo` per-process ranking table. Which
     metric `memory_kb` holds depends on which table it came from (RSS or
@@ -605,6 +703,8 @@ class ParsedCapture:
     selinux_denials: list[SelinuxDenial] = field(default_factory=list)
     process_kills: list[ProcessKillEvent] = field(default_factory=list)
     memory_snapshot: Optional[MemorySnapshot] = None
+    location_snapshot: Optional[LocationSnapshot] = None
+    gnss_signal_intervals: list[GnssSignalInterval] = field(default_factory=list)
     memory_samples: list[ProcessMemorySample] = field(default_factory=list)
     device_info: Optional[DeviceInfo] = None
     parse_warnings: list[str] = field(default_factory=list)

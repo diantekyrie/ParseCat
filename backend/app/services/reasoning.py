@@ -31,6 +31,10 @@ from app.models.db_models import (
     DeviceInfoRow,
     PacketAnalysisRow,
     PacketCaptureSummaryRow,
+    GnssSignalIntervalRow,
+    LocationAppUsageRow,
+    LocationProviderRow,
+    LocationSnapshotRow,
     MemorySnapshotRow,
     ProcessKillEventRow,
     ProcessMemorySampleRow,
@@ -89,6 +93,16 @@ MEMORY_TRIGGER_RE = re.compile(
     r"ram|oom|lmk|pss|rss|cached)\b",
     re.IGNORECASE,
 )
+# Every noun a user reaches for when positioning misbehaves. "rubber band"
+# and "drift" are here because that is what people actually type -- the
+# words "GPS" and "geolocation" are the ones they use least.
+LOCATION_TRIGGER_RE = re.compile(
+    r"\b(?:gps|gnss|geolocat\w*|locat\w+|position\w*|navigat\w*|satellite\w*|"
+    r"map\w*|maps|drift\w*|teleport\w*|jump\w*|rubber-?band\w*|"
+    r"coordinate\w*|latitude|longitude|compass|geofenc\w*)\b",
+    re.IGNORECASE,
+)
+
 SELINUX_TRIGGER_RE = re.compile(
     r"\b(selinux|sepolicy|avc|denial|denied|permission|policy|audit|blocked)\w*\b", re.IGNORECASE
 )
@@ -202,6 +216,18 @@ numbers). Rules, no exceptions:
     Say a process "grew from X to Y". Report `monotonic: false` honestly
     as fluctuation, not as steady growth. If `pss_collected` is false,
     say PSS was not collected on this build; do not report it as 0.
+10f. If the bundle includes "location_snapshot_evidence", the KPI figures
+    are since-boot aggregates -- say so, and never attach them to a
+    specific hour. Coordinates are intentionally absent; do not ask for
+    them or speculate about where the device was.
+10g. If the bundle includes "gnss_signal_evidence", keep the three states
+    distinct: "none" is NO FIX (acquiring or GPS off), never bad
+    reception. Reception quality is NOT position error -- you may say
+    satellite signal was weak for a span, but you may NOT say an app
+    received a wrong position, because the logs do not record delivered
+    coordinates. Weak GPS indoors, underground, or among tall buildings
+    is expected physics: report it as environmental unless other evidence
+    says otherwise, and never call it a hardware malfunction.
 11. If the bundle includes a "device_context" object, that's real parsed
     device info (build fingerprint, kernel, security patch, etc.) -- open
     the report with a short "Device" line or table using it verbatim, not
@@ -385,6 +411,7 @@ def build_diagnosis_bundle(
     want_pairing = include_all_evidence or bool(PAIRING_TRIGGER_RE.search(question))
     want_selinux = include_all_evidence or bool(SELINUX_TRIGGER_RE.search(question))
     want_memory = include_all_evidence or bool(MEMORY_TRIGGER_RE.search(question))
+    want_location = include_all_evidence or bool(LOCATION_TRIGGER_RE.search(question))
 
     claims = []
     for ev in entities:
@@ -701,6 +728,117 @@ def build_diagnosis_bundle(
                 "growing_processes": growth[:10],
             }
 
+    if want_location:
+        # Two complementary sources. The dumpsys snapshot says who was using
+        # location and how the hardware performed since boot; the battery
+        # history says WHEN reception was good or poor. Only the second can
+        # be lined up against "it misbehaved at lunchtime".
+        location_confidence, location_corroboration = score_confidence(1, captures_checked)
+
+        loc_row = session.exec(
+            select(LocationSnapshotRow).where(LocationSnapshotRow.capture_id == capture_id)
+        ).first()
+        if loc_row is not None:
+            provider_rows = session.exec(
+                select(LocationProviderRow).where(LocationProviderRow.capture_id == capture_id)
+            ).all()
+            usage_rows = session.exec(
+                select(LocationAppUsageRow)
+                .where(LocationAppUsageRow.capture_id == capture_id)
+                .order_by(LocationAppUsageRow.locations.desc())
+            ).all()
+            bundle["location_snapshot_evidence"] = {
+                "confidence": location_confidence,
+                "corroboration": location_corroboration,
+                "note": (
+                    "Location state from `dumpsys location`. The KPI figures are "
+                    "aggregates over the ENTIRE time since the device last booted -- they "
+                    "cannot be attributed to any particular hour, and saying otherwise "
+                    "invents precision they do not have. `cn0_*` values are satellite "
+                    "carrier-to-noise ratios: higher is better, and the device classifies "
+                    "reception as good above `cn0_threshold_dbhz` and poor below it. "
+                    "Coordinates are deliberately omitted from this bundle -- the last "
+                    "known fix is the user's real physical location and the diagnostic "
+                    "value is in the accuracy radius and provider, not the latitude. "
+                    "`locations` per app is the count DELIVERED, so an app requesting 1 Hz "
+                    "that received far fewer was not served at the rate it asked for; that "
+                    "is a fact about delivery rate, NOT proof the positions were wrong."
+                ),
+                "location_enabled": loc_row.location_enabled,
+                "gnss_hardware_model": loc_row.gnss_hardware_model,
+                "kpi_since_boot": {
+                    "location_failure_pct": loc_row.location_failure_pct,
+                    "ttff_mean_sec": loc_row.ttff_mean_sec,
+                    "ttff_stddev_sec": loc_row.ttff_stddev_sec,
+                    "accuracy_mean_m": loc_row.accuracy_mean_m,
+                    "accuracy_stddev_m": loc_row.accuracy_stddev_m,
+                    "cn0_mean_dbhz": loc_row.cn0_mean_dbhz,
+                    "cn0_threshold_dbhz": loc_row.cn0_threshold_dbhz,
+                    "cn0_time_above_threshold_min": loc_row.cn0_time_above_threshold_min,
+                    "cn0_time_below_threshold_min": loc_row.cn0_time_below_threshold_min,
+                    "constellations": loc_row.constellations,
+                },
+                "providers": [
+                    {"name": pr.name, "last_fix_provider": pr.last_fix_provider,
+                     "horizontal_accuracy_m": pr.horizontal_accuracy_m,
+                     "satellites": pr.satellites, "mean_cn0": pr.mean_cn0,
+                     "coordinates": "omitted (sensitive; available locally)"}
+                    for pr in provider_rows
+                ],
+                "top_apps_by_locations_delivered": [
+                    {"package": u.package, "provider": u.provider,
+                     "foreground_duration": u.foreground_duration,
+                     "requested_interval": f"{u.min_interval}/{u.max_interval}",
+                     "locations_delivered": u.locations}
+                    for u in usage_rows
+                ][:12],
+                "source": {"section": loc_row.source_section,
+                           "line_start": loc_row.source_line_start,
+                           "line_end": loc_row.source_line_end},
+            }
+
+        interval_rows = session.exec(
+            select(GnssSignalIntervalRow)
+            .where(GnssSignalIntervalRow.capture_id.in_(sibling_capture_ids))
+        ).all()
+        if interval_rows:
+            degraded = [iv for iv in interval_rows if iv.quality == "poor"]
+            good = [iv for iv in interval_rows if iv.quality == "good"]
+            bundle["gnss_signal_evidence"] = {
+                "confidence": location_confidence,
+                "corroboration": location_corroboration,
+                "note": (
+                    "Time-resolved GPS reception from the batterystats history, across all "
+                    f"{captures_checked} capture(s) for this device. Three states, and the "
+                    "difference matters: \"good\" and \"poor\" are real reception readings "
+                    "thresholded on satellite carrier-to-noise ratio, while \"none\" means "
+                    "NO FIX -- either still acquiring or GPS switched off -- and must never "
+                    "be described as bad reception. CRITICAL: reception quality is not "
+                    "position error. A poor span means weak satellite signal; it does NOT "
+                    "establish that any app received an incorrect position, because these "
+                    "logs never record the coordinates delivered to an app. Weak reception "
+                    "indoors, underground, or between tall buildings is expected physics, "
+                    "not a device fault -- do not describe it as a malfunction. "
+                    "`active_uids` lists which apps held GPS open during the span, which is "
+                    "what connects a reception dip to something the user was doing."
+                ),
+                "total_intervals": len(interval_rows),
+                "degraded_intervals": len(degraded),
+                "total_degraded_sec": sum(iv.duration_sec for iv in degraded),
+                "total_good_sec": sum(iv.duration_sec for iv in good),
+                "degraded_spans": [
+                    {"start": iv.start_timestamp, "end": iv.end_timestamp,
+                     "duration_sec": iv.duration_sec, "active_uids": iv.active_uids,
+                     "gps_active": iv.gps_active,
+                     "confidence": location_confidence,
+                     **_capture_tag(iv.capture_id),
+                     "source": {"section": iv.source_section,
+                                "line_start": iv.source_line_start,
+                                "line_end": iv.source_line_end}}
+                    for iv in sorted(degraded, key=lambda a: -a.duration_sec)
+                ][:15],
+            }
+
     if want_selinux:
         # An SELinux denial with permissive=0 is a real, already-happened
         # functional failure: the kernel blocked the operation. permissive=1
@@ -863,6 +1001,8 @@ def build_diagnosis_bundle(
         "device_wide_battery_evidence": "battery consumption evidence",
         "device_wide_selinux_evidence": "SELinux policy denials",
         "device_wide_memory_evidence": "process kill / memory pressure evidence",
+        "location_snapshot_evidence": "location providers and GNSS performance (dumpsys location)",
+        "gnss_signal_evidence": "GPS reception quality over time (batterystats history)",
         "memory_snapshot_evidence": "system-wide RAM snapshot (dumpsys meminfo)",
         "memory_growth_evidence": "per-process memory sampled over time (am_pss)",
         "device_wide_pairing_evidence": "Bluetooth / Companion Device Manager pairing evidence",
@@ -904,6 +1044,14 @@ def _truncate_detail(detail: str | None) -> str | None:
 
 
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+
+
+def _duration(seconds: int) -> str:
+    """Human-readable span for finding text."""
+    if seconds < 60:
+        return f"{seconds}s"
+    m, sec = divmod(seconds, 60)
+    return f"{m}m {sec}s" if sec else f"{m}m"
 
 
 def _mb(kb: int | None) -> str:
@@ -1030,6 +1178,35 @@ def rank_findings(bundle: dict) -> list[dict]:
             f"{_mb(g.get('first_rss_kb'))} -> {_mb(g.get('last_rss_kb'))} "
             f"(peak {_mb(g.get('peak_rss_kb'))}) over {g.get('sample_count')} samples; {shape}",
             g)
+
+    loc = bundle.get("location_snapshot_evidence") or {}
+    if loc.get("location_enabled") is False:
+        # Unambiguous and actionable: nothing can get a position at all.
+        # This is the one location finding that is a real device-state fault
+        # rather than physics.
+        add("HIGH", "location", "Location services were turned off",
+            "The system location setting was disabled, so no app could obtain a "
+            "position from any provider", loc)
+
+    gnss = bundle.get("gnss_signal_evidence") or {}
+    for span in gnss.get("degraded_spans", []):
+        # Ranked purely on how long reception stayed weak while an app was
+        # actively asking for fixes. Severity stops at MEDIUM on purpose:
+        # weak GPS indoors or underground is expected physics, not a device
+        # fault, and a HIGH here would tell users to chase a hardware problem
+        # that isn't there.
+        secs = span.get("duration_sec") or 0
+        if secs < 60:
+            continue  # sub-minute dips are ordinary and would be pure noise
+        severity = "MEDIUM" if secs >= 300 else "LOW"
+        who = span.get("active_uids")
+        add(severity, "location",
+            f"GPS reception degraded for {_duration(secs)}",
+            f"{span.get('start')} to {span.get('end')}"
+            + (f", with uid(s) {who} holding GPS open" if who else "")
+            + " -- weak satellite signal, which is expected indoors or underground "
+              "and does not by itself mean any position was wrong",
+            span)
 
     selinux = bundle.get("device_wide_selinux_evidence") or {}
     for d in selinux.get("denials", []):

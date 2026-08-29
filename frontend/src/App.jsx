@@ -169,6 +169,15 @@ function CaptureTag({ filename }) {
 // Renders a kilobyte figure at a human scale. A null/undefined value means
 // the capture did not report the field, which is a different claim from
 // reporting zero -- so it shows as "unknown" rather than "0 MB".
+// Seconds as a readable span for the location tables.
+function formatDuration(seconds) {
+  if (seconds == null) return "unknown";
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return s ? `${m}m ${s}s` : `${m}m`;
+}
+
 function formatKb(kb) {
   if (kb === null || kb === undefined) return "unknown";
   if (kb >= 1024 * 1024) return `${(kb / 1024 / 1024).toFixed(1)} GB`;
@@ -740,6 +749,7 @@ export default function App() {
       wifi_events: summary.wifi_events.filter((row) => matchesQuery(row, appFilter) && timeMatches(row)),
       selinux_denials: (summary.selinux_denials || []).filter((row) => appMatches(row) && timeMatches(row)),
       process_kills: (summary.process_kills || []).filter((row) => appMatches(row) && timeMatches(row)),
+      gnss_degraded_spans: summary.gnss_degraded_spans || [],
       top_freeze_offenders: summary.top_freeze_offenders.filter(appMatches),
       media_sessions: summary.media_sessions.filter(appMatches),
       timeline: summary.timeline.filter((row) => (
@@ -1222,6 +1232,117 @@ export default function App() {
                           ))}
                         </tbody>
                       </table>
+                    </section>
+                  )}
+
+                  {(summary.location_snapshot || filtered.gnss_degraded_spans.length > 0) && (
+                    <section className="panel">
+                      <h2>Location &amp; GPS</h2>
+                      <p className="muted small">
+                        Two different things, and the difference matters. <strong>Reception quality</strong> below is
+                        Android&apos;s own good/poor classification, thresholded on satellite signal strength —
+                        it says how well the phone could hear satellites, <em>not</em> whether any app got a wrong
+                        position. Bugreports never record the coordinates delivered to an app. Weak reception
+                        indoors, underground, or between tall buildings is expected physics, not a fault.
+                      </p>
+                      {summary.location_snapshot && (
+                        <div className="stat-row">
+                          <StatCard
+                            label="Location services"
+                            value={summary.location_snapshot.location_enabled === false ? "off" : "on"}
+                            tone={summary.location_snapshot.location_enabled === false ? "warning" : "ok"}
+                          />
+                          <StatCard
+                            label="Avg position accuracy"
+                            value={
+                              summary.location_snapshot.accuracy_mean_m == null
+                                ? "unknown"
+                                : `${summary.location_snapshot.accuracy_mean_m.toFixed(1)} m`
+                            }
+                          />
+                          <StatCard
+                            label="Weak-signal time"
+                            value={
+                              summary.location_snapshot.cn0_time_below_threshold_min == null
+                                ? "unknown"
+                                : `${summary.location_snapshot.cn0_time_below_threshold_min.toFixed(1)} min`
+                            }
+                            tone={
+                              (summary.location_snapshot.cn0_time_below_threshold_min ?? 0) > 0
+                                ? "warning"
+                                : "ok"
+                            }
+                          />
+                          <StatCard
+                            label="Degraded spans"
+                            value={filtered.gnss_degraded_spans.length}
+                            tone={filtered.gnss_degraded_spans.length > 0 ? "warning" : "ok"}
+                          />
+                        </div>
+                      )}
+                      {summary.location_snapshot && (
+                        <p className="muted small">
+                          Figures above are aggregates since the device last booted — they cannot be pinned to any
+                          one hour. Signal is classified good above{" "}
+                          {summary.location_snapshot.cn0_threshold_dbhz ?? "?"} dB-Hz and poor below it.
+                          {summary.location_snapshot.constellations
+                            ? ` Constellations used in fixes: ${summary.location_snapshot.constellations}.`
+                            : ""}
+                        </p>
+                      )}
+
+                      {filtered.gnss_degraded_spans.length > 0 && (
+                        <>
+                          <h3 className="small">When reception was weak</h3>
+                          <table className="fact-table">
+                            <thead>
+                              <tr><th>From</th><th>To</th><th>Duration</th><th>Apps holding GPS (uid)</th><th>Cite</th></tr>
+                            </thead>
+                            <tbody>
+                              {filtered.gnss_degraded_spans.map((g, i) => (
+                                <tr key={i}>
+                                  <td className="small">{g.start_timestamp}</td>
+                                  <td className="small">{g.end_timestamp}</td>
+                                  <td className={g.duration_sec >= 300 ? "warn-text" : ""}>
+                                    {formatDuration(g.duration_sec)}
+                                  </td>
+                                  <td className="small">
+                                    {g.active_uids || <span className="muted">none recorded</span>}
+                                  </td>
+                                  <td><SourceTag source={g.source} /></td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </>
+                      )}
+
+                      {summary.location_snapshot && summary.location_snapshot.app_usage.length > 0 && (
+                        <>
+                          <h3 className="small">Location use by app</h3>
+                          <p className="muted small">
+                            <strong>Delivered</strong> is how many fixes the app actually received. An app asking for
+                            one per second that received far fewer was not served at the rate it requested — a fact
+                            about delivery, not proof the positions were wrong.
+                          </p>
+                          <table className="fact-table">
+                            <thead>
+                              <tr><th>App</th><th>Provider</th><th>Requested</th><th>Foreground</th><th>Delivered</th></tr>
+                            </thead>
+                            <tbody>
+                              {summary.location_snapshot.app_usage.slice(0, 12).map((u, i) => (
+                                <tr key={i}>
+                                  <td className="small">{u.package}</td>
+                                  <td className="small">{u.provider}</td>
+                                  <td className="small">{u.min_interval}/{u.max_interval}</td>
+                                  <td className="small">{u.foreground_duration}</td>
+                                  <td>{u.locations.toLocaleString()}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </>
+                      )}
                     </section>
                   )}
 

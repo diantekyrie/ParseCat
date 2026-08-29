@@ -693,3 +693,195 @@ def test_memory_snapshot_and_samples_present_on_real_capture(capture1):
         assert all(s.source_ref.section == "event_log" for s in capture1.memory_samples)
         # Never a fabricated zero -- unknown is None.
         assert all(s.pss_kb is None or s.pss_kb > 0 for s in capture1.memory_samples)
+
+
+LOCATION_LINES = """Location Manager State:
+  Location Settings:
+    Location Setting:
+      [u0] true
+      [u10] true
+  Location Providers:
+    network provider:
+      user 0:
+        last location=Location[network 37.737630,-122.430491 hAcc=16.568 et=+3d21h50m7s712ms alt=88.3]
+      user 10:
+        last location=Location[network 37.737630,-122.430491 hAcc=16.568 et=+3d21h50m7s712ms alt=88.3]
+    gps provider:
+      user 0:
+        last location=Location[gps 37.737705,-122.430285 hAcc=23.979591 et=+3d21h42m10s993ms alt=102.0 vAcc=14.0 {Bundle[{satellites=10, maxCn0=38, meanCn0=28}]}]
+      GNSS_KPI_START
+        Number of location reports: 1035
+        Percentage location failure: 3.961352657004831
+        Number of TTFF reports: 52
+        TTFF mean (sec): 40.69086538461537
+        TTFF standard deviation (sec): 148.29917886229808
+        Position accuracy mean (m): 18.106598828400166
+        Position accuracy standard deviation (m): 19.989182961405618
+        Top 4 Avg CN0 mean (dB-Hz): 34.21029830899155
+        Used-in-fix constellation types: GPS GLONASS GALILEO
+      GNSS_KPI_END
+      Power Metrics
+        Amount of time (while on battery) Top 4 Avg CN0 > 20.0 dB-Hz (min): 112.14281666666666
+        Amount of time (while on battery) Top 4 Avg CN0 <= 20.0 dB-Hz (min): 24.271116666666668
+  Historical Aggregate Location Provider Data:
+    gps:
+      10311/com.nianticlabs.pokemongo: min/max interval = 0s/1s, total/active/foreground duration = +15h13m41s259ms/+15h13m41s163ms/+40m41s545ms, locations = 163
+    fused:
+      10311/com.nianticlabs.pokemongo: min/max interval = 0s/1s, total/active/foreground duration = +15h13m41s889ms/+15h13m41s553ms/+40m41s586ms, locations = 925
+  GNSS Manager:
+    GNSS Hardware Model Name: S.LSI,K042,SPOTNAV_4.15.5
+""".splitlines()
+
+
+def test_location_dump_parses_providers_kpi_and_per_app_usage():
+    from app.parsers.location import parse_location_dump
+
+    section = Section(name="location", priority=None, line_start=1000,
+                      line_end=1000 + len(LOCATION_LINES) - 1,
+                      lines=LOCATION_LINES, kind="dumpsys")
+    snap = parse_location_dump(section)
+
+    assert snap.location_enabled is True
+    assert snap.gnss_hardware_model.startswith("S.LSI")
+
+    by_name = {p.name: p for p in snap.providers}
+    assert by_name["network"].latitude == 37.737630
+    assert by_name["network"].horizontal_accuracy_m == 16.568
+    # Only a GPS fix carries the satellite bundle; the others must stay None
+    # rather than inheriting a neighbouring provider's numbers.
+    assert by_name["network"].satellites is None
+    assert by_name["gps"].satellites == 10
+    assert by_name["gps"].mean_cn0 == 28.0
+
+    k = snap.kpi
+    assert k.location_failure_pct == 3.961352657004831
+    # A huge TTFF standard deviation next to a modest mean is the shape of
+    # "most fixes were fast, a few took minutes" -- both are kept so a
+    # caller cannot quote the mean alone and imply consistency.
+    assert k.ttff_mean_sec == 40.69086538461537
+    assert k.ttff_stddev_sec == 148.29917886229808
+    assert k.cn0_threshold_dbhz == 20.0
+    assert k.cn0_time_below_threshold_min == 24.271116666666668
+    assert k.constellations == "GPS GLONASS GALILEO"
+
+    usage = {(u.provider, u.package): u for u in snap.app_usage}
+    # Same app, same window, two providers, wildly different delivery counts.
+    assert usage[("gps", "com.nianticlabs.pokemongo")].locations == 163
+    assert usage[("fused", "com.nianticlabs.pokemongo")].locations == 925
+    assert usage[("gps", "com.nianticlabs.pokemongo")].min_interval == "0s"
+
+
+def test_coordinates_are_coarsened_before_leaving_the_device():
+    # A last known fix is someone's real physical location, very often their
+    # home. The diagnostic value is in the accuracy radius and provider, so
+    # precision is dropped rather than shipped to a third-party API.
+    from app.parsers.location import redacted_coords
+
+    assert redacted_coords(37.737630, -122.430491) == "~37.7, -122.4"
+    assert redacted_coords(None, None) == "unknown"
+    assert redacted_coords(37.737630, None) == "unknown"
+
+
+GNSS_HISTORY_LINES = """  08-28 12:14:50.819 094 ea902820 +gps +state=10311:"gnss"
+  08-28 12:16:31.401 094 e2902820 gps_signal_quality=poor
+  08-28 12:19:37.928 094 e2902820 gps_signal_quality=good
+  08-28 12:19:43.377 094 e2902820 gps_signal_quality=poor
+  08-28 12:37:23.454 087 ca402820 -gps gps_signal_quality=none -state=10311:"gnss"
+""".splitlines()
+
+
+def test_gnss_intervals_close_on_the_next_transition_and_track_who_held_gps():
+    from app.parsers.location import parse_gnss_signal_intervals
+
+    section = Section(name="batterystats", priority=None, line_start=700,
+                      line_end=704, lines=GNSS_HISTORY_LINES, kind="dumpsys")
+    intervals = parse_gnss_signal_intervals(section)
+
+    # Four transitions produce three closed intervals -- the final state has
+    # no end, so it is dropped rather than given an invented duration.
+    assert len(intervals) == 3
+    assert [i.quality for i in intervals] == ["poor", "good", "poor"]
+    assert intervals[0].duration_sec == 186          # 12:16:31 -> 12:19:37
+    assert intervals[2].duration_sec == 1060         # 12:19:43 -> 12:37:23
+    # The uid holding GPS is what connects a reception dip to a user action.
+    assert intervals[2].active_uids == "10311"
+    assert intervals[2].gps_active is True
+
+
+def test_no_fix_is_never_reported_as_degraded_reception():
+    # "none" means no fix -- acquiring, or GPS off. Counting it as bad
+    # reception would invent an outage at the start of every single session.
+    from app.services.reasoning import rank_findings
+
+    bundle = {"gnss_signal_evidence": {"degraded_spans": [], "total_intervals": 4}}
+    assert [f for f in rank_findings(bundle) if f["category"] == "location"] == []
+
+
+def test_gps_reception_findings_stay_below_high_and_ignore_brief_dips():
+    from app.services.reasoning import rank_findings
+
+    def span(secs):
+        return {"gnss_signal_evidence": {"degraded_spans": [{
+            "start": "08-28 12:19:43", "end": "08-28 12:37:23",
+            "duration_sec": secs, "active_uids": "10311", "gps_active": True,
+        }]}}
+
+    # Sub-minute dips are ordinary and would bury the real findings.
+    assert [f for f in rank_findings(span(30)) if f["category"] == "location"] == []
+
+    long = [f for f in rank_findings(span(1060)) if f["category"] == "location"][0]
+    # Weak GPS indoors is physics, not a fault. Severity is deliberately
+    # capped at MEDIUM so nobody is sent chasing broken hardware, and the
+    # text must not claim a wrong position was delivered.
+    assert long["severity"] == "MEDIUM"
+    assert "17m 40s" in long["title"]
+    assert "does not by itself mean any position was wrong" in long["detail"]
+
+    short = [f for f in rank_findings(span(90)) if f["category"] == "location"][0]
+    assert short["severity"] == "LOW"
+
+    disabled = rank_findings({"location_snapshot_evidence": {"location_enabled": False}})
+    # The one location finding that IS a device-state fault rather than physics.
+    assert disabled[0]["severity"] == "HIGH"
+
+
+def test_the_question_that_originally_returned_an_empty_bundle_now_triggers():
+    # Verbatim regression. This exact question produced an empty fact bundle
+    # and the answer "no evidence of a geolocation issue could be verified"
+    # while a 17m40s degraded-GPS span sat unparsed in the capture. The
+    # trigger has to survive the words a real person actually uses.
+    from app.services.reasoning import LOCATION_TRIGGER_RE
+
+    original = (
+        "While playing Pokemon Go in the lower floor of the Moscone Center I see "
+        "that my player kept running back and forth between spots without me "
+        "physically moving. I suspect it was a signal error with GPS but I'm not "
+        "sure. Tell me if there were any geolocation issues on the device on August 28."
+    )
+    assert LOCATION_TRIGGER_RE.search(original)
+
+    for phrasing in [
+        "was there a gps problem", "geolocation issues", "my location kept drifting",
+        "the map was jumping around", "it kept rubber-banding", "position was wrong",
+        "navigation was off", "how many satellites did it see", "location services",
+        "geofencing didn't fire", "my coordinates looked wrong", "gnss quality",
+    ]:
+        assert LOCATION_TRIGGER_RE.search(phrasing), phrasing
+
+    for unrelated in ["bluetooth pairing failed", "battery drained overnight",
+                      "the app crashed on startup"]:
+        assert not LOCATION_TRIGGER_RE.search(unrelated), unrelated
+
+
+def test_location_parsed_from_real_capture(capture1):
+    if capture1.location_snapshot is not None:
+        assert capture1.location_snapshot.providers
+        assert capture1.location_snapshot.source_ref.section == "location"
+    for iv in capture1.gnss_signal_intervals:
+        assert iv.quality in {"good", "poor", "none"}
+        # Found live in this fixture: the battery history stepped backwards
+        # 5 seconds mid-stream (a clock correction), which paired into a
+        # -5s interval. A negative duration summed into "total degraded
+        # seconds" would silently understate the total, so such pairs are
+        # dropped as discontinuities and must never reach a caller.
+        assert iv.duration_sec >= 0

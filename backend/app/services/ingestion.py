@@ -24,6 +24,7 @@ from app.parsers.media_session import parse_media_sessions
 from app.parsers.package_info import parse_packages
 from app.parsers.packet_analysis import analyze_packet_capture
 from app.parsers.pcap import parse_pcap
+from app.parsers.location import parse_gnss_signal_intervals, parse_location_dump
 from app.parsers.memory import parse_meminfo, parse_memory_samples
 from app.parsers.process_kills import parse_process_kills
 from app.parsers.section_extractor import extract_sections, extract_sections_from_text
@@ -189,6 +190,15 @@ def _parse_sections_into_capture(capture: ParsedCapture, sections: dict) -> Pars
 
     if "meminfo" in sections:
         capture.memory_snapshot = parse_meminfo(sections["meminfo"])
+
+    if "location" in sections:
+        capture.location_snapshot = parse_location_dump(sections["location"])
+
+    if "batterystats" in sections:
+        # gps_signal_quality transitions live in the batterystats HISTORY,
+        # not in dumpsys location -- they are the only time-resolved measure
+        # of GPS reception anywhere in a bugreport.
+        capture.gnss_signal_intervals = parse_gnss_signal_intervals(sections["batterystats"])
     if "event_log" not in sections:
         capture.parse_warnings.append("No 'EVENT LOG' section found (SELinux denials may be undercounted)")
 

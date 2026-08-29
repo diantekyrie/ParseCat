@@ -26,6 +26,10 @@ from app.models.db_models import (
     PackageFactRow,
     PacketAnalysisRow,
     PacketCaptureSummaryRow,
+    GnssSignalIntervalRow,
+    LocationAppUsageRow,
+    LocationProviderRow,
+    LocationSnapshotRow,
     MemorySnapshotRow,
     ProcessKillEventRow,
     ProcessMemorySampleRow,
@@ -98,6 +102,11 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
             select(func.count()).select_from(ProcessKillEventRow)
             .where(ProcessKillEventRow.capture_id == capture_id, ProcessKillEventRow.kind == "kill")
         ).one(),
+        "gnss_degraded_spans": session.exec(
+            select(func.count()).select_from(GnssSignalIntervalRow)
+            .where(GnssSignalIntervalRow.capture_id == capture_id,
+                   GnssSignalIntervalRow.quality == "poor")
+        ).one(),
         "memory_samples": session.exec(
             select(func.count()).select_from(ProcessMemorySampleRow)
             .where(ProcessMemorySampleRow.capture_id == capture_id)
@@ -155,6 +164,23 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
     ).all()
     process_kill_rows = session.exec(
         select(ProcessKillEventRow).where(ProcessKillEventRow.capture_id == capture_id)
+    ).all()
+    location_snapshot_row = session.exec(
+        select(LocationSnapshotRow).where(LocationSnapshotRow.capture_id == capture_id)
+    ).first()
+    location_provider_rows = session.exec(
+        select(LocationProviderRow).where(LocationProviderRow.capture_id == capture_id)
+    ).all()
+    location_usage_rows = session.exec(
+        select(LocationAppUsageRow)
+        .where(LocationAppUsageRow.capture_id == capture_id)
+        .order_by(LocationAppUsageRow.locations.desc())
+    ).all()
+    gnss_interval_rows = session.exec(
+        select(GnssSignalIntervalRow)
+        .where(GnssSignalIntervalRow.capture_id == capture_id,
+               GnssSignalIntervalRow.quality == "poor")
+        .order_by(GnssSignalIntervalRow.duration_sec.desc())
     ).all()
     memory_snapshot_row = session.exec(
         select(MemorySnapshotRow).where(MemorySnapshotRow.capture_id == capture_id)
@@ -329,6 +355,39 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
                 "reason": k.reason, "rss_kb": k.rss_kb, "proc_state": k.proc_state,
                 "source": _source(k.source_section, k.source_line_start, k.source_line_end),
             } for k in process_kill_rows
+        ],
+        "location_snapshot": (
+            {
+                **{k: v for k, v in location_snapshot_row.__dict__.items()
+                   if not k.startswith("_")
+                   and k not in ("id", "capture_id", "source_section",
+                                 "source_line_start", "source_line_end")},
+                "providers": [
+                    {"name": pr.name, "last_fix_provider": pr.last_fix_provider,
+                     "latitude": pr.latitude, "longitude": pr.longitude,
+                     "horizontal_accuracy_m": pr.horizontal_accuracy_m,
+                     "satellites": pr.satellites, "mean_cn0": pr.mean_cn0}
+                    for pr in location_provider_rows
+                ],
+                "app_usage": [
+                    {"package": u.package, "provider": u.provider, "uid": u.uid,
+                     "min_interval": u.min_interval, "max_interval": u.max_interval,
+                     "foreground_duration": u.foreground_duration,
+                     "locations": u.locations}
+                    for u in location_usage_rows
+                ],
+                "source": _source(location_snapshot_row.source_section,
+                                  location_snapshot_row.source_line_start,
+                                  location_snapshot_row.source_line_end),
+            } if location_snapshot_row else None
+        ),
+        "gnss_degraded_spans": [
+            {
+                "quality": iv.quality, "start_timestamp": iv.start_timestamp,
+                "end_timestamp": iv.end_timestamp, "duration_sec": iv.duration_sec,
+                "active_uids": iv.active_uids, "gps_active": iv.gps_active,
+                "source": _source(iv.source_section, iv.source_line_start, iv.source_line_end),
+            } for iv in gnss_interval_rows
         ],
         "memory_snapshot": (
             {

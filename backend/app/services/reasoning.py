@@ -19,7 +19,14 @@ from sqlmodel import select
 
 from app.llm import get_llm_client
 from app.models.db_models import (
+    AnrBlockingThreadRow,
+    AnrMainThreadSnapshotRow,
     AnrRow,
+    CpuLoadSnapshotRow,
+    KernelLogEventRow,
+    ProcessCpuUsageRow,
+    ThermalSensorReadingRow,
+    ThermalSnapshotRow,
     BatteryUidStatRow,
     BtHciEventRow,
     BtHciSummaryRow,
@@ -100,6 +107,18 @@ LOCATION_TRIGGER_RE = re.compile(
     r"\b(?:gps|gnss|geolocat\w*|locat\w+|position\w*|navigat\w*|satellite\w*|"
     r"map\w*|maps|drift\w*|teleport\w*|jump\w*|rubber-?band\w*|"
     r"coordinate\w*|latitude|longitude|compass|geofenc\w*)\b",
+    re.IGNORECASE,
+)
+
+# Kernel/thermal/cpu are bundled under one trigger, same pattern as
+# MEMORY_TRIGGER_RE covering kills+snapshot+growth -- a user asking about
+# any one of "it's slow", "it's hot", or "kernel panic" wants the same
+# platform-level evidence gathered together.
+PLATFORM_TRIGGER_RE = re.compile(
+    r"\b(?:kernel\w*|driver\w*|panic\w*|oops|dmesg|watchdog\w*|"
+    r"thermal\w*|overheat\w*|throttl\w*|temperature\w*|\btemp\b|hot|"
+    r"cpu\w*|schedul\w*|\blag\w*|sluggish\w*|unresponsive\w*|freez\w*|"
+    r"\bload\b|slow\w*)\b",
     re.IGNORECASE,
 )
 
@@ -228,6 +247,26 @@ numbers). Rules, no exceptions:
     coordinates. Weak GPS indoors, underground, or among tall buildings
     is expected physics: report it as environmental unless other evidence
     says otherwise, and never call it a hardware malfunction.
+10h. If the bundle includes "anr_blocking_threads_evidence" or
+    "anr_main_thread_evidence", these enrich an ANR already reported
+    above -- narrate them as "the trace/binder detail shows...", never as
+    an independent event. trace_<N> files could not be filename-matched
+    to a specific anr_* record, so describe what a trace showed without
+    asserting it caused a particular named ANR unless the bundle links them.
+10i. If the bundle includes "kernel_log_evidence", `boot_relative_sec` is
+    kernel uptime, NOT a wall-clock time -- never state a clock time for
+    these events. Most "warning"-priority lines are routine driver
+    chatter, not evidence of a fault; only "err" or worse, or anything
+    flagged panic-family, indicates a real problem.
+10j. If the bundle includes "thermal_evidence", quote `overall_status`
+    verbatim for throttling state; do not infer thermal pressure from raw
+    sensor temperatures yourself. "none" means not currently throttled
+    and is not worth reporting as a finding.
+10k. If the bundle includes "cpu_load_evidence", it is ONE point-in-time
+    snapshot, not a time series. Do not describe elevated load as an
+    ongoing or persistent problem -- say only what was busy at the moment
+    the bugreport was captured, and note that a spike before or after
+    this moment would not appear here.
 11. If the bundle includes a "device_context" object, that's real parsed
     device info (build fingerprint, kernel, security patch, etc.) -- open
     the report with a short "Device" line or table using it verbatim, not
@@ -412,6 +451,7 @@ def build_diagnosis_bundle(
     want_selinux = include_all_evidence or bool(SELINUX_TRIGGER_RE.search(question))
     want_memory = include_all_evidence or bool(MEMORY_TRIGGER_RE.search(question))
     want_location = include_all_evidence or bool(LOCATION_TRIGGER_RE.search(question))
+    want_platform = include_all_evidence or bool(PLATFORM_TRIGGER_RE.search(question))
 
     claims = []
     for ev in entities:
@@ -540,11 +580,74 @@ def build_diagnosis_bundle(
             ),
             "anrs": [
                 {"timestamp": a.timestamp, "package": a.package, "reason": a.reason,
+                 "timeout_ms": a.timeout_ms, "rss_kb": a.rss_kb,
                  "confidence": crash_confidence,
                  **_capture_tag(a.capture_id)}
                 for a in anr_count
             ],
         }
+
+        blocking_rows = session.exec(
+            select(AnrBlockingThreadRow).where(AnrBlockingThreadRow.capture_id.in_(sibling_capture_ids))
+        ).all()
+        if blocking_rows:
+            # Grouped by which anr_* file they came from -- each group is
+            # every binder thread of ONE ANR'd process caught mid-transaction
+            # at the moment Android declared the ANR. elapsed_ms is read
+            # directly off the transaction record, not inferred from timing.
+            by_file: dict[str, list] = {}
+            for bt in blocking_rows:
+                by_file.setdefault(bt.anr_filename, []).append(bt)
+            bundle["anr_blocking_threads_evidence"] = {
+                "confidence": crash_confidence,
+                "corroboration": crash_corroboration,
+                "note": (
+                    "Binder threads of an ANR'd process caught mid-transaction, from the "
+                    "'dumping pid' block Android writes into the ANR record itself. "
+                    "`elapsed_ms` is how long that specific transaction had been unanswered "
+                    "when the ANR fired -- this is what the process was actually stuck on, "
+                    "not a guess from thread state. Present only for the binder-starvation "
+                    "flavor of ANR (a stuck service/broadcast); not every ANR has this."
+                ),
+                "by_anr_file": {
+                    fname: sorted(
+                        [{"thread_id": bt.thread_id, "from_pid": bt.from_pid,
+                          "elapsed_ms": bt.elapsed_ms} for bt in rows],
+                        key=lambda r: -(r["elapsed_ms"] or 0),
+                    )[:10]
+                    for fname, rows in by_file.items()
+                },
+            }
+
+        trace_rows = session.exec(
+            select(AnrMainThreadSnapshotRow).where(AnrMainThreadSnapshotRow.capture_id.in_(sibling_capture_ids))
+        ).all()
+        if trace_rows:
+            # trace_<N> files are NOT filename-linked to any anr_* record in
+            # real captures observed -- reported as its own evidence rather
+            # than force-matched to a specific ANR event.
+            bundle["anr_main_thread_evidence"] = {
+                "confidence": crash_confidence,
+                "corroboration": crash_corroboration,
+                "note": (
+                    "The main thread's own state, read directly from a trace_<N> file (a full "
+                    "thread dump written for an ANR'd process) -- this says what the thread was "
+                    "actually doing, not a guess. These traces could not be linked to a specific "
+                    "anr_* record by filename, so report them as their own evidence: 'the trace "
+                    "shows...', not 'this ANR was caused by...'. `held_mutexes` empty string "
+                    "means the trace explicitly showed the thread holding nothing, which is "
+                    "different from this field being unknown."
+                ),
+                "snapshots": [
+                    {"pid": t.pid, "process": t.process, "state": t.state,
+                     "held_mutexes": t.held_mutexes,
+                     "top_frames": json.loads(t.top_frames_json),
+                     **_capture_tag(t.capture_id),
+                     "source": {"section": t.source_section, "line_start": t.source_line_start,
+                                "line_end": t.source_line_end}}
+                    for t in trace_rows
+                ],
+            }
 
     if want_wifi:
         # Wi-Fi connectivity is device-wide, not attributable to a named
@@ -839,6 +942,111 @@ def build_diagnosis_bundle(
                 ][:15],
             }
 
+    if want_platform:
+        platform_confidence, platform_corroboration = score_confidence(1, captures_checked)
+
+        kernel_rows = session.exec(
+            select(KernelLogEventRow).where(KernelLogEventRow.capture_id.in_(sibling_capture_ids))
+        ).all()
+        if kernel_rows:
+            err_or_worse = [k for k in kernel_rows if k.priority <= 3 or k.is_panic_family]
+            bundle["kernel_log_evidence"] = {
+                "confidence": platform_confidence,
+                "corroboration": platform_corroboration,
+                "note": (
+                    f"Kernel ring buffer lines at warning severity or worse, across all "
+                    f"{captures_checked} capture(s) for this device. `boot_relative_sec` is the "
+                    f"KERNEL's own timestamp (seconds since boot), NOT wall-clock time -- there "
+                    f"is no reliable way to convert it, so do not state a clock time for these "
+                    f"events, only their relative order and how far apart they were. Most "
+                    f"'warning'-priority lines are routine driver chatter (radio/wifi firmware "
+                    f"debug output logged at warning level by convention) and are NOT evidence "
+                    f"of a fault by themselves -- 'err' priority or worse, or anything flagged "
+                    f"`is_panic_family`, is what actually indicates a real driver/kernel problem."
+                ),
+                "total_warning_or_worse": len(kernel_rows),
+                "err_or_worse_count": len(err_or_worse),
+                "panic_family_count": sum(k.is_panic_family for k in kernel_rows),
+                "err_or_worse_events": [
+                    {"boot_relative_sec": k.boot_relative_sec, "priority_name": k.priority_name,
+                     "thread": k.thread, "message": k.message, "is_panic_family": k.is_panic_family,
+                     "confidence": platform_confidence,
+                     **_capture_tag(k.capture_id),
+                     "source": {"section": k.source_section, "line_start": k.source_line_start,
+                                "line_end": k.source_line_end}}
+                    for k in err_or_worse
+                ][:60],
+            }
+
+        thermal_row = session.exec(
+            select(ThermalSnapshotRow).where(ThermalSnapshotRow.capture_id == capture_id)
+        ).first()
+        if thermal_row is not None:
+            sensor_rows = session.exec(
+                select(ThermalSensorReadingRow).where(ThermalSensorReadingRow.capture_id == capture_id)
+            ).all()
+            bundle["thermal_evidence"] = {
+                "confidence": platform_confidence,
+                "corroboration": platform_corroboration,
+                "note": (
+                    "Point-in-time thermal state from `dumpsys thermalservice`. "
+                    "`overall_status_name` is Android's own already-computed throttling "
+                    "severity -- prefer it over eyeballing individual sensor temperatures, the "
+                    "same way meminfo's `status` field is preferred over raw free-RAM math. "
+                    "'none' means not currently throttled, which is the normal case and not "
+                    "itself worth reporting as a finding."
+                ),
+                "overall_status": thermal_row.overall_status_name,
+                "hottest_sensors": [
+                    {"name": r.name, "value_c": r.value_c, "type_name": r.type_name,
+                     "status_name": r.status_name}
+                    for r in sorted(sensor_rows, key=lambda r: -r.value_c)[:8]
+                ],
+                "throttled_sensors": [
+                    {"name": r.name, "value_c": r.value_c, "type_name": r.type_name,
+                     "status_name": r.status_name}
+                    for r in sensor_rows if r.status_code > 0
+                ],
+                "source": {"section": thermal_row.source_section,
+                           "line_start": thermal_row.source_line_start,
+                           "line_end": thermal_row.source_line_end},
+            }
+
+        cpu_row = session.exec(
+            select(CpuLoadSnapshotRow).where(CpuLoadSnapshotRow.capture_id == capture_id)
+        ).first()
+        if cpu_row is not None:
+            proc_rows = session.exec(
+                select(ProcessCpuUsageRow)
+                .where(ProcessCpuUsageRow.capture_id == capture_id)
+                .order_by(ProcessCpuUsageRow.cpu_pct.desc())
+            ).all()
+            bundle["cpu_load_evidence"] = {
+                "confidence": platform_confidence,
+                "corroboration": platform_corroboration,
+                "note": (
+                    "A `top`-style CPU snapshot at the MOMENT the bugreport was taken -- a "
+                    "single point-in-time reading, not a time series. It can show what was busy "
+                    "right then; it says nothing about a spike five minutes earlier or a minute "
+                    "later. Elevated load here does NOT by itself indicate a persistent "
+                    "performance problem -- do not report this as a finding on its own, only as "
+                    "context if the user is asking what was running at capture time. "
+                    "`total_pct` can exceed 100 on a multi-core device (e.g. 800% means up to 8 "
+                    "cores fully busy) and is kept exactly as printed."
+                ),
+                "total_pct": cpu_row.total_pct, "user_pct": cpu_row.user_pct,
+                "sys_pct": cpu_row.sys_pct, "idle_pct": cpu_row.idle_pct,
+                "iowait_pct": cpu_row.iowait_pct,
+                "threads_total": cpu_row.threads_total, "threads_running": cpu_row.threads_running,
+                "top_processes": [
+                    {"command": p.command, "user": p.user, "cpu_pct": p.cpu_pct, "state": p.state}
+                    for p in proc_rows[:10]
+                ],
+                "source": {"section": cpu_row.source_section,
+                           "line_start": cpu_row.source_line_start,
+                           "line_end": cpu_row.source_line_end},
+            }
+
     if want_selinux:
         # An SELinux denial with permissive=0 is a real, already-happened
         # functional failure: the kernel blocked the operation. permissive=1
@@ -1001,6 +1209,11 @@ def build_diagnosis_bundle(
         "device_wide_battery_evidence": "battery consumption evidence",
         "device_wide_selinux_evidence": "SELinux policy denials",
         "device_wide_memory_evidence": "process kill / memory pressure evidence",
+        "anr_blocking_threads_evidence": "ANR binder-transaction detail",
+        "anr_main_thread_evidence": "ANR main-thread trace snapshots",
+        "kernel_log_evidence": "kernel ring buffer (warning severity or worse)",
+        "thermal_evidence": "thermal sensor state and throttling status",
+        "cpu_load_evidence": "CPU load snapshot at capture time",
         "location_snapshot_evidence": "location providers and GNSS performance (dumpsys location)",
         "gnss_signal_evidence": "GPS reception quality over time (batterystats history)",
         "memory_snapshot_evidence": "system-wide RAM snapshot (dumpsys meminfo)",
@@ -1110,8 +1323,29 @@ def rank_findings(bundle: dict) -> list[dict]:
             + (f" ({t.get('signal_code')})" if t.get("signal_code") else "")
             + (f", top frame {t.get('top_frame')}" if t.get("top_frame") else ""), t)
     for a in crash.get("anrs", []):
-        add("CRITICAL", "anr", f"ANR in {a.get('package') or 'unknown package'}",
-            a.get("reason") or "no reason recorded", a)
+        detail = a.get("reason") or "no reason recorded"
+        if a.get("timeout_ms"):
+            detail += f"; timed out after {a['timeout_ms']:,}ms"
+        if a.get("rss_kb"):
+            detail += f"; process RSS {a['rss_kb']:,} kB at the time"
+        add("CRITICAL", "anr", f"ANR in {a.get('package') or 'unknown package'}", detail, a)
+
+    blocking = bundle.get("anr_blocking_threads_evidence") or {}
+    for fname, threads in blocking.get("by_anr_file", {}).items():
+        if not threads:
+            continue
+        # The longest-waiting transaction is what actually explains the ANR
+        # -- folded into one finding per ANR file rather than one finding
+        # per thread, since a starved process typically has many threads
+        # stuck on the same root cause and listing each separately would
+        # just be the same fact repeated.
+        worst = threads[0]
+        add("HIGH", "anr",
+            f"Binder thread starvation in ANR record {fname}",
+            f"longest-blocked thread waited {worst['elapsed_ms']:,}ms for a transaction "
+            f"from pid {worst.get('from_pid')}; {len(threads)} thread(s) were stuck when the "
+            f"ANR fired",
+            {"confidence": blocking.get("confidence"), "corroboration": blocking.get("corroboration")})
 
     wifi = bundle.get("device_wide_wifi_evidence") or {}
     for w in wifi.get("disconnections", []):
@@ -1146,6 +1380,41 @@ def rank_findings(bundle: dict) -> list[dict]:
             f"reason: {k.get('reason') or 'not recorded'}"
             + (f", oom_adj {k.get('oom_adj')}" if k.get("oom_adj") is not None else "")
             + (f", {rss} kB RSS" if rss else ""), k)
+
+    kernel = bundle.get("kernel_log_evidence") or {}
+    for k in kernel.get("err_or_worse_events", []):
+        # panic-family or the worst syslog priorities (emerg/alert/crit) are
+        # CRITICAL; plain "err" is MEDIUM -- a real driver-level failure
+        # worth surfacing, but most of these (suspend failures, DBI access
+        # while powered down) are transient and often self-recovering, so
+        # they don't warrant the same severity as an actual panic/oops.
+        severity = "CRITICAL" if k.get("is_panic_family") else "MEDIUM"
+        # detail deliberately excludes boot_relative_sec/thread -- those
+        # differ on every occurrence of an otherwise-identical driver
+        # message (found live: the same "Preventing invalid attempt to
+        # read DBI while powered down" line fired dozens of times and,
+        # with per-event timing baked into detail, produced 46 near-
+        # duplicate findings instead of collapsing via the shared
+        # (severity, category, title, detail) grouping key below). Timing
+        # for each occurrence is still available from the source citation.
+        add(severity, "kernel", f"Kernel: {k.get('message', '')[:80]}",
+            f"{k.get('priority_name', 'unknown')}-level kernel log line "
+            "(see source citation for boot-relative timing of each occurrence)", k)
+
+    thermal = bundle.get("thermal_evidence") or {}
+    status = (thermal.get("overall_status") or "").lower()
+    if status and status != "none":
+        # Ranked on Android's own already-computed throttling severity --
+        # same principle as meminfo's status field driving memory severity,
+        # never a temperature threshold invented here.
+        severity = {"light": "MEDIUM", "moderate": "MEDIUM", "severe": "HIGH",
+                    "critical": "CRITICAL", "emergency": "CRITICAL", "shutdown": "CRITICAL"}.get(status, "MEDIUM")
+        hottest = thermal.get("throttled_sensors") or thermal.get("hottest_sensors") or []
+        top = hottest[0] if hottest else {}
+        add(severity, "thermal", f"Device reported thermal status \"{thermal.get('overall_status')}\"",
+            (f"hottest throttled sensor: {top.get('name')} at {top.get('value_c'):.1f}\u00b0C ({top.get('type_name')})"
+             if top else "status reported without individual sensor detail"),
+            {"confidence": thermal.get("confidence"), "corroboration": thermal.get("corroboration")})
 
     snapshot = bundle.get("memory_snapshot_evidence") or {}
     ram = snapshot.get("ram") or {}

@@ -12,6 +12,9 @@ from sqlmodel import Session, func, select
 
 from app.models.db_models import (
     AnrRow,
+    CpuLoadSnapshotRow,
+    KernelLogEventRow,
+    ThermalSnapshotRow,
     BatteryUidStatRow,
     BtHciEventRow,
     BtHciSummaryRow,
@@ -101,6 +104,10 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
         "process_kills": session.exec(
             select(func.count()).select_from(ProcessKillEventRow)
             .where(ProcessKillEventRow.capture_id == capture_id, ProcessKillEventRow.kind == "kill")
+        ).one(),
+        "kernel_err_events": session.exec(
+            select(func.count()).select_from(KernelLogEventRow)
+            .where(KernelLogEventRow.capture_id == capture_id, KernelLogEventRow.priority <= 3)
         ).one(),
         "gnss_degraded_spans": session.exec(
             select(func.count()).select_from(GnssSignalIntervalRow)
@@ -356,6 +363,18 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
                 "source": _source(k.source_section, k.source_line_start, k.source_line_end),
             } for k in process_kill_rows
         ],
+        "thermal_status": (
+            session.exec(
+                select(ThermalSnapshotRow.overall_status_name)
+                .where(ThermalSnapshotRow.capture_id == capture_id)
+            ).first()
+        ),
+        "cpu_snapshot_present": (
+            session.exec(
+                select(func.count()).select_from(CpuLoadSnapshotRow)
+                .where(CpuLoadSnapshotRow.capture_id == capture_id)
+            ).one() > 0
+        ),
         "location_snapshot": (
             {
                 **{k: v for k, v in location_snapshot_row.__dict__.items()

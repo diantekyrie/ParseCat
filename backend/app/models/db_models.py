@@ -196,6 +196,114 @@ class AnrRow(SQLModel, table=True):
     pid: Optional[int]
     package: Optional[str] = Field(default=None, index=True)
     reason: Optional[str]
+    # Only present on the binder-starvation flavor of ANR file -- None means
+    # this file didn't carry the fields, not that they were zero.
+    timeout_ms: Optional[int] = None
+    rss_kb: Optional[int] = None
+
+
+class AnrBlockingThreadRow(SQLModel, table=True):
+    """One binder thread caught mid-transaction when an ANR fired --
+    direct evidence of what the process was stuck waiting on."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    anr_filename: str = Field(index=True)
+    thread_id: int
+    from_pid: Optional[int]
+    to_pid: Optional[int]
+    elapsed_ms: Optional[int]
+    source_section: str
+    source_line_start: int
+    source_line_end: int
+
+
+class AnrMainThreadSnapshotRow(SQLModel, table=True):
+    """The ANR'd process's main thread, read directly off a trace_<N> file.
+    top_frames_json is a JSON list of the first few stack lines."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    pid: int
+    process: str = Field(index=True)
+    state: Optional[str]
+    held_mutexes: Optional[str]
+    top_frames_json: str
+    source_section: str
+    source_line_start: int
+    source_line_end: int
+
+
+class KernelLogEventRow(SQLModel, table=True):
+    """One warning-or-worse kernel ring buffer line. boot_relative_sec is
+    the kernel's own timestamp (seconds since boot) -- NOT wall-clock
+    time; no reliable anchor exists to convert it."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    boot_relative_sec: float
+    priority: int = Field(index=True)
+    priority_name: str
+    thread: Optional[str]
+    message: str
+    is_panic_family: bool = Field(default=False, index=True)
+    source_section: str
+    source_line_start: int
+    source_line_end: int
+
+
+class ThermalSnapshotRow(SQLModel, table=True):
+    """Point-in-time thermal state, one row per capture."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    overall_status_code: Optional[int]
+    overall_status_name: Optional[str] = Field(default=None, index=True)
+    source_section: str
+    source_line_start: int
+    source_line_end: int
+
+
+class ThermalSensorReadingRow(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    name: str
+    value_c: float
+    type_code: int
+    type_name: str = Field(index=True)
+    status_code: int
+    status_name: str = Field(index=True)
+
+
+class CpuLoadSnapshotRow(SQLModel, table=True):
+    """Aggregate `top`-style CPU load at capture time, one row per
+    capture. A single point-in-time reading, not a time series."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    total_pct: Optional[float]
+    user_pct: Optional[float]
+    sys_pct: Optional[float]
+    idle_pct: Optional[float]
+    iowait_pct: Optional[float]
+    irq_pct: Optional[float]
+    softirq_pct: Optional[float]
+    threads_total: Optional[int]
+    threads_running: Optional[int]
+    source_section: str
+    source_line_start: int
+    source_line_end: int
+
+
+class ProcessCpuUsageRow(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    pid: int
+    tid: int
+    user: str
+    cpu_pct: float
+    state: str
+    command: str = Field(index=True)
 
 
 class BtHciSummaryRow(SQLModel, table=True):

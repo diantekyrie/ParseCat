@@ -31,6 +31,10 @@ WANTED_SECTIONS = {
     # because nothing here was parsed, even though every needed number was
     # sitting in the capture.
     "location",
+    # Kernel ring buffer, thermal state, and CPU load -- the platform-level
+    # gaps a coverage audit found: driver faults, throttling, and scheduling
+    # pressure were all invisible before this.
+    "kernel_log", "thermalservice", "cpu_info",
 }
 
 __all__ = [

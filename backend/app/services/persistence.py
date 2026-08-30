@@ -11,7 +11,14 @@ from datetime import datetime
 from sqlmodel import Session, select
 
 from app.models.db_models import (
+    AnrBlockingThreadRow,
+    AnrMainThreadSnapshotRow,
     AnrRow,
+    CpuLoadSnapshotRow,
+    KernelLogEventRow,
+    ProcessCpuUsageRow,
+    ThermalSensorReadingRow,
+    ThermalSnapshotRow,
     BatteryUidStatRow,
     BtHciEventRow,
     BtHciSummaryRow,
@@ -196,7 +203,70 @@ def persist_capture(
         session.add(AnrRow(
             capture_id=capture.id, filename=a.filename, timestamp=a.timestamp,
             subject=a.subject, pid=a.pid, package=a.package, reason=a.reason,
+            timeout_ms=a.timeout_ms, rss_kb=a.rss_kb,
         ))
+        for bt in a.blocking_threads:
+            session.add(AnrBlockingThreadRow(
+                capture_id=capture.id, anr_filename=a.filename,
+                thread_id=bt.thread_id, from_pid=bt.from_pid, to_pid=bt.to_pid,
+                elapsed_ms=bt.elapsed_ms,
+                source_section=bt.source_ref.section,
+                source_line_start=bt.source_ref.line_start,
+                source_line_end=bt.source_ref.line_end,
+            ))
+
+    for snap in parsed.anr_main_thread_snapshots:
+        session.add(AnrMainThreadSnapshotRow(
+            capture_id=capture.id, pid=snap.pid, process=snap.process,
+            state=snap.state, held_mutexes=snap.held_mutexes,
+            top_frames_json=json.dumps(snap.top_frames),
+            source_section=snap.source_ref.section,
+            source_line_start=snap.source_ref.line_start,
+            source_line_end=snap.source_ref.line_end,
+        ))
+
+    for ev in parsed.kernel_log_events:
+        session.add(KernelLogEventRow(
+            capture_id=capture.id, boot_relative_sec=ev.boot_relative_sec,
+            priority=ev.priority, priority_name=ev.priority_name, thread=ev.thread,
+            message=ev.message, is_panic_family=ev.is_panic_family,
+            source_section=ev.source_ref.section,
+            source_line_start=ev.source_ref.line_start,
+            source_line_end=ev.source_ref.line_end,
+        ))
+
+    th = parsed.thermal_snapshot
+    if th is not None:
+        session.add(ThermalSnapshotRow(
+            capture_id=capture.id, overall_status_code=th.overall_status_code,
+            overall_status_name=th.overall_status_name,
+            source_section=th.source_ref.section,
+            source_line_start=th.source_ref.line_start,
+            source_line_end=th.source_ref.line_end,
+        ))
+        for sensor in th.sensors:
+            session.add(ThermalSensorReadingRow(
+                capture_id=capture.id, name=sensor.name, value_c=sensor.value_c,
+                type_code=sensor.type_code, type_name=sensor.type_name,
+                status_code=sensor.status_code, status_name=sensor.status_name,
+            ))
+
+    cpu = parsed.cpu_load_snapshot
+    if cpu is not None:
+        session.add(CpuLoadSnapshotRow(
+            capture_id=capture.id, total_pct=cpu.total_pct, user_pct=cpu.user_pct,
+            sys_pct=cpu.sys_pct, idle_pct=cpu.idle_pct, iowait_pct=cpu.iowait_pct,
+            irq_pct=cpu.irq_pct, softirq_pct=cpu.softirq_pct,
+            threads_total=cpu.threads_total, threads_running=cpu.threads_running,
+            source_section=cpu.source_ref.section,
+            source_line_start=cpu.source_ref.line_start,
+            source_line_end=cpu.source_ref.line_end,
+        ))
+        for proc in cpu.top_processes:
+            session.add(ProcessCpuUsageRow(
+                capture_id=capture.id, pid=proc.pid, tid=proc.tid, user=proc.user,
+                cpu_pct=proc.cpu_pct, state=proc.state, command=proc.command,
+            ))
 
     if parsed.bt_hci_summary is not None:
         s = parsed.bt_hci_summary

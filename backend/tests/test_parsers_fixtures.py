@@ -885,3 +885,228 @@ def test_location_parsed_from_real_capture(capture1):
         # seconds" would silently understate the total, so such pairs are
         # dropped as discontinuities and must never reach a caller.
         assert iv.duration_sec >= 0
+
+
+ANR_STARVATION_TEXT = """Subject: executing service com.example.app/com.example.app.FooService, waited 20001ms
+Timeout: 20000
+TimeoutStart: 47486966
+RssHwmKb: 380840
+RssKb: 181044
+
+----- dumping pid: 7382 at 47506976
+proc 7382
+context binder
+  thread 7394: l 02 need_return 0 tr 0
+    incoming transaction 20037633: 0000000000000000 from 14767:14871 to 7382:7394 code 20 flags 12 pri 3:130 r1 elapsed 22526ms node 20037184 size 128:0 offset fffffffffffff588
+  thread 7396: l 01 need_return 0 tr 0
+    incoming transaction 19970678: 0000000000000000 from 12821:12913 to 7382:7396 code 20 flags 12 pri 0:120 r1 elapsed 71260ms node 19970602 size 128:0 offset fffffffffffffd68
+"""
+
+
+def test_anr_starvation_file_parses_timeout_rss_and_blocking_threads():
+    from app.parsers.anr import parse_anr
+
+    a = parse_anr("anr_2026-08-27-08-38-51-875", ANR_STARVATION_TEXT)
+
+    assert a.timeout_ms == 20000
+    # RssKb, not RssHwmKb -- the current reading, not the high-water mark.
+    assert a.rss_kb == 181044
+    assert len(a.blocking_threads) == 2
+    worst = max(a.blocking_threads, key=lambda t: t.elapsed_ms)
+    assert worst.elapsed_ms == 71260
+    assert worst.from_pid == 12821
+    assert worst.thread_id == 7396
+
+
+ANR_TRACE_TEXT = """----- pid 14329 at 2026-08-28 10:45:45.655310253-0700 -----
+Cmd line: com.google.android.GoogleCamera
+suspend all histogram:	Sum: 6.534ms
+DALVIK THREADS (2):
+"main" prio=5 tid=1 Native
+  | group="main" sCount=1 ucsCount=0 flags=1 obj=0x73028df0 self=0xb400
+  | sysTid=14329 nice=0 cgrp=default sched=1073741827/0 handle=0x79b3
+  | state=S schedstat=( 4738732106 21577848334 31183 ) utm=297 stm=176 core=1 HZ=100
+  | stack=0x7ff781c000-0x7ff781e000 stackSize=8188KB
+  | held mutexes=
+  native: #00 pc 000e714c  /apex/com.android.runtime/lib64/bionic/libc.so (__epoll_pwait+12)
+  native: #01 pc 00016dc8  /system/lib64/libutils.so (android::Looper::pollOnce+248)
+DumpLatencyMs: 6.97638
+
+"Binder:14329_2" prio=5 tid=9 Native
+  | state=S
+  native: #00 pc 00000000 /system/lib64/libbinder.so (irrelevant+0)
+DumpLatencyMs: 1.0
+
+----- pid 999 at 2026-08-28 10:45:45.655310253-0700 -----
+Cmd line: com.example.other
+DALVIK THREADS (1):
+"main" prio=5 tid=1 Waiting
+  | state=S
+  at java.lang.Object.wait(Native method)
+  - waiting on <0x0e7231e9> (a java.lang.Object)
+DumpLatencyMs: 2.0
+"""
+
+
+def test_anr_trace_dump_keeps_only_the_main_thread_per_pid():
+    from app.parsers.anr import parse_anr_trace_dump
+
+    snaps = parse_anr_trace_dump("trace_02", ANR_TRACE_TEXT)
+
+    # Two pids in the file, 3 total threads, but only the "main" thread of
+    # each pid matters for an ANR -- "Binder:14329_2" must NOT appear.
+    assert len(snaps) == 2
+    by_pid = {s.pid: s for s in snaps}
+    assert by_pid[14329].process == "com.google.android.GoogleCamera"
+    assert by_pid[14329].state == "Native"
+    # Android prints "held mutexes=" with nothing after it when the thread
+    # holds nothing -- that is a real empty string, not an unknown value.
+    assert by_pid[14329].held_mutexes == ""
+    assert any("epoll_pwait" in f for f in by_pid[14329].top_frames)
+
+    assert by_pid[999].state == "Waiting"
+    assert any("waiting on" in f for f in by_pid[999].top_frames)
+
+
+KERNEL_LOG_LINES = """<6>[83852.874840][ T4249] google-ufshcd 3c400000.ufs: applying calibration took 4214 usec
+<4>[83852.892915][T30206] [08:21:52.481696][dhd][wlan]dhdpcie_resume_dev: Enter
+<3>[83858.955847][T23105] alarmtimer alarmtimer.4.auto: PM: failed to suspend: error -16
+<3>[83858.955847][T23105] alarmtimer alarmtimer.4.auto: PM: failed to suspend: error -16
+<2>[83900.000000][T00001] Kernel panic - not syncing: Fatal exception
+""".splitlines()
+
+
+def test_kernel_log_keeps_warning_or_worse_and_flags_panic_family():
+    from app.parsers.kernel import parse_kernel_log
+
+    section = Section(name="kernel_log", priority=None, line_start=1,
+                      line_end=len(KERNEL_LOG_LINES), lines=KERNEL_LOG_LINES, kind="log")
+    events = parse_kernel_log(section)
+
+    # The <6> info-level calibration line is routine chatter and dropped;
+    # the <4> warning-level wifi line, both <3> err lines, and the <2>
+    # panic line are all kept.
+    assert len(events) == 4
+    assert events[0].priority_name == "warning"
+    assert events[0].boot_relative_sec == 83852.892915
+    assert events[1].priority_name == "err"
+    assert events[1].is_panic_family is False
+    assert events[3].priority_name == "crit"
+    assert events[3].is_panic_family is True
+    assert "Kernel panic" in events[3].message
+
+
+THERMAL_LINES = """Thermal Status: 2
+Cached temperatures:
+	Temperature{mValue=51.000004, mType=0, mName=LITTLE, mStatus=0}
+	Temperature{mValue=63.000004, mType=0, mName=BIG, mStatus=3}
+	Temperature{mValue=32.199543, mType=-1, mName=VT-FORECAST-NOW, mStatus=0}
+""".splitlines()
+
+
+def test_thermal_snapshot_decorates_codes_without_dropping_them():
+    from app.parsers.thermal import parse_thermal_snapshot
+
+    section = Section(name="thermalservice", priority=None, line_start=1,
+                      line_end=len(THERMAL_LINES), lines=THERMAL_LINES, kind="dumpsys")
+    snap = parse_thermal_snapshot(section)
+
+    assert snap.overall_status_code == 2
+    assert snap.overall_status_name == "moderate"
+    assert len(snap.sensors) == 3
+    big = next(s for s in snap.sensors if s.name == "BIG")
+    assert big.type_name == "cpu"
+    assert big.status_name == "severe"
+    # An unmapped/vendor-custom sensor keeps its raw code visible via the
+    # label rather than silently vanishing or being guessed at.
+    unk = next(s for s in snap.sensors if s.name == "VT-FORECAST-NOW")
+    assert unk.type_code == -1
+    assert unk.type_name == "unknown"
+
+
+CPU_INFO_LINES = """Threads: 8422 total,   8 running, 8414 sleeping,   0 stopped,   0 zombie
+  Mem:    11563M total,    11267M used,      296M free,        2M buffers
+ Swap:     5781M total,     4937M used,      844M free,     1364M cached
+800%cpu  66%user   0%nice 190%sys 503%idle  15%iow  18%irq   8%sirq   0%host
+  PID   TID USER         PR  NI[%CPU]S VIRT  RES PCY CMD             NAME
+16272 16272 shell         0 -20 57.3 R  10G  11M  fg top             top
+ 7779  7779 root          0 -20 11.4 I    0    0  fg kworker/1:6H-kverityd [kworker/1:6H-kverityd]
+ 1799  2087 system       20   0  6.5 S  25G 552M  fg batterystats-ha system_server
+""".splitlines()
+
+
+def test_cpu_snapshot_parses_aggregate_and_sorts_top_processes():
+    from app.parsers.cpu import parse_cpu_snapshot
+
+    section = Section(name="cpu_info", priority=None, line_start=1,
+                      line_end=len(CPU_INFO_LINES), lines=CPU_INFO_LINES, kind="dumpsys")
+    snap = parse_cpu_snapshot(section)
+
+    assert snap.threads_total == 8422
+    assert snap.threads_running == 8
+    # Aggregate can exceed 100% on a multi-core device -- kept as printed.
+    assert snap.total_pct == 800.0
+    assert snap.idle_pct == 503.0
+    assert len(snap.top_processes) == 3
+    assert snap.top_processes[0].command == "top"
+    assert snap.top_processes[0].cpu_pct == 57.3
+    # Sorted descending by %CPU regardless of the order they appeared.
+    assert [p.cpu_pct for p in snap.top_processes] == sorted(
+        (p.cpu_pct for p in snap.top_processes), reverse=True)
+
+
+def test_kernel_thermal_cpu_findings_respect_their_severity_rules():
+    from app.services.reasoning import rank_findings
+
+    # A plain "err" kernel line is MEDIUM; panic-family is CRITICAL.
+    bundle = {"kernel_log_evidence": {"err_or_worse_events": [
+        {"message": "failed to suspend: error -16", "boot_relative_sec": 1.0,
+         "is_panic_family": False},
+        {"message": "Kernel panic - not syncing", "boot_relative_sec": 2.0,
+         "is_panic_family": True},
+    ]}}
+    findings = {f["title"]: f for f in rank_findings(bundle) if f["category"] == "kernel"}
+    assert any(f["severity"] == "MEDIUM" for f in findings.values())
+    assert any(f["severity"] == "CRITICAL" for f in findings.values())
+
+    # Thermal severity comes from Android's own status field, not a
+    # temperature threshold invented here -- "none" produces no finding.
+    none_bundle = {"thermal_evidence": {"overall_status": "none"}}
+    assert [f for f in rank_findings(none_bundle) if f["category"] == "thermal"] == []
+
+    severe_bundle = {"thermal_evidence": {
+        "overall_status": "severe",
+        "throttled_sensors": [{"name": "BIG", "value_c": 63.0, "type_name": "cpu"}],
+    }}
+    sev = [f for f in rank_findings(severe_bundle) if f["category"] == "thermal"][0]
+    assert sev["severity"] == "HIGH"
+    assert "BIG" in sev["detail"]
+
+    # A CPU snapshot alone -- however busy -- never produces a finding on
+    # its own; it is a single point-in-time reading, not a persistent state.
+    cpu_bundle = {"cpu_load_evidence": {"total_pct": 800.0, "idle_pct": 0.0}}
+    assert [f for f in rank_findings(cpu_bundle) if f["category"] == "cpu"] == []
+
+
+def test_platform_trigger_matches_the_words_a_real_person_would_use():
+    from app.services.reasoning import PLATFORM_TRIGGER_RE
+
+    for phrasing in ["kernel panic", "my phone is running hot", "thermal throttling",
+                      "why is it so slow and unresponsive", "cpu load", "driver crashed",
+                      "the device keeps freezing", "watchdog bark"]:
+        assert PLATFORM_TRIGGER_RE.search(phrasing), phrasing
+    for unrelated in ["bluetooth pairing failed", "battery drained overnight"]:
+        assert not PLATFORM_TRIGGER_RE.search(unrelated), unrelated
+
+
+def test_anr_and_platform_facts_present_on_real_capture(capture1):
+    for a in capture1.anrs:
+        # timeout_ms/rss_kb are only present on the binder-starvation flavor
+        # -- None is a valid, honest answer, not a parse failure.
+        assert a.timeout_ms is None or a.timeout_ms > 0
+    for ev in capture1.kernel_log_events:
+        assert ev.priority <= 4 or ev.is_panic_family
+    if capture1.thermal_snapshot is not None:
+        assert capture1.thermal_snapshot.sensors
+    if capture1.cpu_load_snapshot is not None:
+        assert capture1.cpu_load_snapshot.threads_total is not None

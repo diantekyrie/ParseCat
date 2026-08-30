@@ -1161,6 +1161,20 @@ export default function App() {
                       <StatCard label="Wi-Fi disconnections" value={c.wifi_disconnections} tone="default" />
                       <StatCard label="SELinux denials" value={c.selinux_denials ?? 0} tone={(c.selinux_enforced_denials ?? 0) > 0 ? "warning" : "default"} />
                       <StatCard label="Processes killed" value={c.process_kills ?? 0} tone={(c.process_kills ?? 0) > 0 ? "warning" : "default"} />
+                      <StatCard
+                        label="Kernel errors (err+)"
+                        value={c.kernel_err_events ?? 0}
+                        tone={(c.kernel_err_events ?? 0) > 0 ? "warning" : "default"}
+                      />
+                      <StatCard
+                        label="Thermal status"
+                        value={summary.thermal_status ?? "n/a"}
+                        tone={
+                          summary.thermal_status && summary.thermal_status !== "none"
+                            ? "warning"
+                            : "default"
+                        }
+                      />
                       <StatCard label="Freeze events" value={c.freeze_events} tone="default" />
                       <StatCard label="Unfreeze events" value={c.unfreeze_events} tone="default" />
                       <StatCard label="Packages" value={c.packages} tone="default" />

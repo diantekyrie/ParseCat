@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 
 from app.parsers import WANTED_SECTIONS, ParsedCapture
-from app.parsers.anr import parse_anr
+from app.parsers.anr import parse_anr, parse_anr_trace_dump
 from app.parsers.audio_focus import parse_audio_focus
 from app.parsers.battery_stats import parse_battery_uid_stats
 from app.parsers.bt_hci import parse_bt_hci_log
@@ -24,7 +24,10 @@ from app.parsers.media_session import parse_media_sessions
 from app.parsers.package_info import parse_packages
 from app.parsers.packet_analysis import analyze_packet_capture
 from app.parsers.pcap import parse_pcap
+from app.parsers.cpu import parse_cpu_snapshot
+from app.parsers.kernel import parse_kernel_log
 from app.parsers.location import parse_gnss_signal_intervals, parse_location_dump
+from app.parsers.thermal import parse_thermal_snapshot
 from app.parsers.memory import parse_meminfo, parse_memory_samples
 from app.parsers.process_kills import parse_process_kills
 from app.parsers.section_extractor import extract_sections, extract_sections_from_text
@@ -112,6 +115,24 @@ def parse_anrs(zf: zipfile.ZipFile) -> list:
     return out
 
 
+def parse_anr_trace_dumps(zf: zipfile.ZipFile) -> list:
+    """trace_<N> files -- full DALVIK THREADS dumps written for an ANR'd
+    process. No reliable filename links a trace_N to its anr_* record (none
+    observed in real captures), so these are gathered as their own
+    self-standing evidence rather than force-matched to one."""
+    out = []
+    for info in zf.infolist():
+        name = info.filename
+        if not name.startswith(ANR_PREFIX):
+            continue
+        base = name[len(ANR_PREFIX):]
+        if "/" in base or not base.startswith("trace_"):
+            continue
+        text = zf.read(name).decode("utf-8", errors="replace")
+        out.extend(parse_anr_trace_dump(base, text))
+    return out
+
+
 def _parse_sections_into_capture(capture: ParsedCapture, sections: dict) -> ParsedCapture:
     """Run every section parser over already-extracted bugreport sections."""
     if "audio" in sections:
@@ -194,6 +215,15 @@ def _parse_sections_into_capture(capture: ParsedCapture, sections: dict) -> Pars
     if "location" in sections:
         capture.location_snapshot = parse_location_dump(sections["location"])
 
+    if "kernel_log" in sections:
+        capture.kernel_log_events = parse_kernel_log(sections["kernel_log"])
+
+    if "thermalservice" in sections:
+        capture.thermal_snapshot = parse_thermal_snapshot(sections["thermalservice"])
+
+    if "cpu_info" in sections:
+        capture.cpu_load_snapshot = parse_cpu_snapshot(sections["cpu_info"])
+
     if "batterystats" in sections:
         # gps_signal_quality transitions live in the batterystats HISTORY,
         # not in dumpsys location -- they are the only time-resolved measure
@@ -225,6 +255,7 @@ def parse_bugreport_zip(zip_path: str | Path) -> ParsedCapture:
         sections = extract_sections(zf, WANTED_SECTIONS)
         capture.tombstones = parse_tombstones(zf)
         capture.anrs = parse_anrs(zf)
+        capture.anr_main_thread_snapshots = parse_anr_trace_dumps(zf)
 
         names = set(zf.namelist())
         bt_hci_path = next(

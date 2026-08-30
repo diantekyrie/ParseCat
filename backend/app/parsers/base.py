@@ -221,6 +221,133 @@ class AnrFacts:
     pid: Optional[int]
     package: Optional[str]
     reason: Optional[str]       # e.g. "failed to complete startup", "Input dispatching timed out"
+    # Fields below are only present on the binder-starvation flavor of ANR
+    # file (a service/broadcast ANR waiting on binder), not on every ANR --
+    # None means the file didn't carry them, not that they were zero.
+    timeout_ms: Optional[int]
+    rss_kb: Optional[int]          # RssKb at time of ANR -- was the process itself under memory pressure
+    blocking_threads: list["AnrBlockingThread"] = field(default_factory=list)
+
+
+@dataclass
+class AnrBlockingThread:
+    """One binder thread of the ANR'd process caught mid-transaction, from
+    the '----- dumping pid: N' block inside an anr_<timestamp> file.
+
+    `elapsed_ms` is how long that specific incoming transaction had been
+    sitting unanswered when the ANR fired -- direct evidence of what the
+    process was stuck waiting on, not an inference.
+    """
+
+    thread_id: int
+    from_pid: Optional[int]
+    to_pid: Optional[int]
+    elapsed_ms: Optional[int]
+    source_ref: SourceRef
+
+
+@dataclass
+class AnrMainThreadSnapshot:
+    """The main thread's state at the moment a trace_<N> file (a full
+    DALVIK THREADS dump, same format as vm_traces_just_now) was written.
+
+    This is the file that answers "what was the main thread actually
+    doing" for an ANR -- `state` and `top_frames` are read directly off
+    the trace, not inferred. `held_mutexes` is non-empty only when the
+    trace itself printed one; Android's dump omits the line entirely when
+    a thread holds nothing, which is NOT the same as failing to check.
+    """
+
+    pid: int
+    process: str
+    state: Optional[str]          # e.g. "S" (sleeping), "R" (running), "Native", "Blocked"
+    held_mutexes: Optional[str]   # raw text after "held mutexes=", if present
+    top_frames: list[str]         # first few stack lines, most-recent first
+    source_ref: SourceRef
+
+
+@dataclass
+class KernelLogEvent:
+    """One line from the kernel ring buffer (`dmesg`-style /proc/kmsg dump).
+
+    `boot_relative_sec` is the timestamp the kernel itself prints --
+    seconds since boot, NOT wall-clock time. Converting it to wall time
+    would require a boot-time anchor this parser doesn't have, so it is
+    kept in its native form rather than invented; a caller who needs wall
+    time has to correlate it against another source that has both.
+    """
+
+    boot_relative_sec: float
+    priority: int            # syslog priority 0 (emerg) .. 7 (debug); lower is worse
+    priority_name: str
+    thread: Optional[str]
+    message: str
+    is_panic_family: bool    # True for panic/oops/BUG/Kernel-panic signatures, regardless of priority
+    source_ref: SourceRef
+
+
+@dataclass
+class ThermalSensorReading:
+    """One temperature sensor from `dumpsys thermalservice`'s cached
+    readings. `type_name`/`status_name` decorate the raw integer codes
+    Android's IThermal HAL defines -- the raw code always rides along, so
+    an unmapped or future code degrades to a label like 'type_11' instead
+    of silently vanishing or being guessed at."""
+
+    name: str
+    value_c: float
+    type_code: int
+    type_name: str
+    status_code: int          # 0=NONE .. 6=SHUTDOWN per IThermal ThrottlingSeverity
+    status_name: str
+
+
+@dataclass
+class ThermalSnapshot:
+    """Point-in-time thermal state. `overall_status` is the system-wide
+    throttling severity Android itself has already decided on -- prefer it
+    over eyeballing individual sensor values, the same way meminfo's
+    `status` field is preferred over raw free-RAM math."""
+
+    overall_status_code: Optional[int]
+    overall_status_name: Optional[str]
+    sensors: list["ThermalSensorReading"]
+    source_ref: SourceRef
+
+
+@dataclass
+class ProcessCpuUsage:
+    """One row of the `top`-style process table in `dumpsys cpuinfo`, a
+    point-in-time snapshot at bugreport time -- NOT a time series, so it
+    can show what was busy right then and nothing about a window before
+    or after."""
+
+    pid: int
+    tid: int
+    user: str
+    cpu_pct: float
+    state: str        # single-letter top state: R/S/D/I/Z/T
+    command: str
+    source_ref: SourceRef
+
+
+@dataclass
+class CpuLoadSnapshot:
+    """Aggregate CPU load line from `dumpsys cpuinfo`, plus its top
+    processes by %CPU. A single point-in-time reading, same caveat as
+    ProcessCpuUsage above."""
+
+    total_pct: Optional[float]
+    user_pct: Optional[float]
+    sys_pct: Optional[float]
+    idle_pct: Optional[float]
+    iowait_pct: Optional[float]
+    irq_pct: Optional[float]
+    softirq_pct: Optional[float]
+    threads_total: Optional[int]
+    threads_running: Optional[int]
+    top_processes: list["ProcessCpuUsage"]
+    source_ref: SourceRef
 
 
 @dataclass
@@ -693,6 +820,10 @@ class ParsedCapture:
     crash_events: list[CrashEvent] = field(default_factory=list)
     tombstones: list[TombstoneFacts] = field(default_factory=list)
     anrs: list[AnrFacts] = field(default_factory=list)
+    anr_main_thread_snapshots: list[AnrMainThreadSnapshot] = field(default_factory=list)
+    kernel_log_events: list[KernelLogEvent] = field(default_factory=list)
+    thermal_snapshot: Optional[ThermalSnapshot] = None
+    cpu_load_snapshot: Optional[CpuLoadSnapshot] = None
     bt_hci_summary: Optional[BtHciSummary] = None
     packet_capture_summary: Optional[PacketCaptureSummary] = None
     packet_analysis: Optional[PacketAnalysis] = None

@@ -1708,7 +1708,19 @@ export default function App() {
         .layout { display: grid; grid-template-columns: 300px 1fr; gap: 20px; padding: 20px 28px; align-items: start; }
         .sidebar { display: flex; flex-direction: column; gap: 16px; position: sticky; top: 20px; }
         .main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
-        .panel { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; padding: 16px 18px; }
+        .panel {
+          background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; padding: 16px 18px;
+          /* .panel is a flex child of .main, which defaults flex items to
+             min-width: auto -- refusing to shrink below their widest
+             content (a long stack frame, kernel message, or build
+             fingerprint in a .fact-table). Without this, that content
+             pushed .panel wider than the viewport and took the whole page
+             with it instead of scrolling in place. overflow-x also
+             happens to relax the min-width:auto default in most browsers,
+             but min-width: 0 is set explicitly rather than relying on that. */
+          min-width: 0;
+          overflow-x: auto;
+        }
         .panel h2 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent); }
         .panel h3 { margin: 16px 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
         label { display: block; margin-bottom: 12px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
@@ -1797,8 +1809,11 @@ export default function App() {
         .stat-ok .stat-value { color: var(--green); }
 
         .fact-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        .fact-table th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; padding: 6px 8px; border-bottom: 1px solid var(--panel-border); }
-        .fact-table td { padding: 6px 8px; border-top: 1px solid #1c2433; }
+        .fact-table th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; padding: 6px 8px; border-bottom: 1px solid var(--panel-border); white-space: nowrap; }
+        /* A single giant unbroken token (a full stack frame path, a build
+           fingerprint) still wraps here rather than forcing the panel's
+           scrollbar wider than it needs to be for one long cell. */
+        .fact-table td { padding: 6px 8px; border-top: 1px solid #1c2433; overflow-wrap: anywhere; }
         .src { color: var(--blue); font-family: ui-monospace, monospace; font-size: 11px; white-space: nowrap; }
 
         .timeline { display: flex; flex-direction: column; gap: 2px; max-height: 340px; overflow-y: auto; }

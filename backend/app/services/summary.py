@@ -10,6 +10,15 @@ import json
 
 from sqlmodel import Session, func, select
 
+# Same ladder as Android's own IThermal ThrottlingSeverity enum (see
+# app/parsers/thermal.py's STATUS_NAMES) -- higher means worse. Used only
+# to pick the single worst status across a device's merged captures, never
+# to invent a severity from a temperature ourselves.
+_THERMAL_SEVERITY_RANK = {
+    "none": 0, "light": 1, "moderate": 2, "severe": 3,
+    "critical": 4, "emergency": 5, "shutdown": 6,
+}
+
 from app.models.db_models import (
     AnrRow,
     CpuLoadSnapshotRow,
@@ -503,6 +512,22 @@ def build_merged_summary(session: Session, capture_ids: list[int]) -> dict:
     top_battery_consumers, timeline, media_sessions, focus_stack = [], [], [], []
     bt_hci_summaries, packet_capture_summaries, packet_analyses = [], [], []
     freeze_offenders_by_pkg: dict[str, dict] = {}
+    gnss_degraded_spans: list[dict] = []
+    # Snapshot-shaped facts (one value per capture, not a count and not a
+    # list) were falling out of the merged summary entirely -- found live:
+    # a real capture's Overview page showed "Thermal status: n/a" for a
+    # device this session had just confirmed was genuinely thermally
+    # throttled (severe, 43.3C), because build_merged_summary only ever
+    # merged `counts` and a handful of named lists, silently dropping
+    # thermal_status/location_snapshot/memory_snapshot/cpu_snapshot_present
+    # -- present in every single-capture summary, absent from every
+    # device-level (merged) one, which is the view the app lands on right
+    # after upload. Same bug, four fields, all fixed together below rather
+    # than patched one at a time as each is separately noticed missing.
+    thermal_statuses: list[tuple[int, str]] = []   # (severity rank, name) pairs
+    latest_location_snapshot = latest_memory_snapshot = None
+    latest_ingested_at = None
+    cpu_snapshot_present = False
 
     for cap in per_capture:
         cid, fname = cap["capture_id"], cap["original_filename"]
@@ -532,6 +557,21 @@ def build_merged_summary(session: Session, capture_ids: list[int]) -> dict:
             entry = freeze_offenders_by_pkg.setdefault(o["package"], {"package": o["package"], "freezes": 0, "unfreezes": 0})
             entry["freezes"] += o["freezes"]
             entry["unfreezes"] += o["unfreezes"]
+        gnss_degraded_spans.extend(_tag_rows(cap["gnss_degraded_spans"], cid, fname))
+        if cap["thermal_status"]:
+            thermal_statuses.append((_THERMAL_SEVERITY_RANK.get(cap["thermal_status"], -1), cap["thermal_status"]))
+        if cap["cpu_snapshot_present"]:
+            cpu_snapshot_present = True
+        # Snapshots are point-in-time, not summable across captures -- the
+        # most recent one is what "what does this device look like right
+        # now" should mean, same as picking the last-known-fix provider
+        # elsewhere rather than averaging historical readings together.
+        if cap["location_snapshot"] and (latest_ingested_at is None or cap["ingested_at"] > latest_ingested_at):
+            latest_location_snapshot = cap["location_snapshot"]
+        if cap["memory_snapshot"] and (latest_ingested_at is None or cap["ingested_at"] > latest_ingested_at):
+            latest_memory_snapshot = cap["memory_snapshot"]
+        if latest_ingested_at is None or cap["ingested_at"] > latest_ingested_at:
+            latest_ingested_at = cap["ingested_at"]
 
     timeline.sort(key=lambda e: e["timestamp"])
     top_battery_consumers.sort(key=lambda b: b["total_mah"], reverse=True)
@@ -562,4 +602,13 @@ def build_merged_summary(session: Session, capture_ids: list[int]) -> dict:
         "timeline": timeline,
         "media_sessions": media_sessions,
         "focus_stack": focus_stack,
+        "gnss_degraded_spans": gnss_degraded_spans,
+        # Worst status across all merged captures, not the newest -- a
+        # device that was severely throttled once and fine every other
+        # time is still a device worth flagging, unlike thermal_status's
+        # single-capture meaning (that capture's own reading).
+        "thermal_status": max(thermal_statuses)[1] if thermal_statuses else None,
+        "location_snapshot": latest_location_snapshot,
+        "memory_snapshot": latest_memory_snapshot,
+        "cpu_snapshot_present": cpu_snapshot_present,
     }

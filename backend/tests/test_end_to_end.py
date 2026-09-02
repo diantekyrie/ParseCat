@@ -17,7 +17,7 @@ from app.services.correlation import package_history_across_device
 from app.services.ingestion import parse_bugreport_zip
 from app.services.persistence import persist_capture
 from app.services.reasoning import diagnose, diagnose_investigation
-from app.services.summary import build_capture_summary
+from app.services.summary import build_capture_summary, build_merged_summary
 from app.services.verification import verify_question_entities
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -504,3 +504,30 @@ def test_crash_evidence_is_gathered_for_a_plural_crashes_question(session):
     assert len(bundle["device_wide_crash_evidence"]["java_crashes"]) == 1
     categories = {e["category"] for e in bundle["evidence_sources"]}
     assert "crash / ANR / native-crash evidence" in categories
+
+
+def test_merged_summary_carries_snapshot_fields_the_single_capture_view_has(session):
+    # Found live: a real device's Overview page showed "Thermal status: n/a"
+    # for a capture this same session had just confirmed was genuinely
+    # thermally throttled (severe). build_merged_summary only ever merged
+    # `counts` and a handful of named lists, silently dropping
+    # thermal_status/location_snapshot/memory_snapshot/cpu_snapshot_present/
+    # gnss_degraded_spans -- present in every single-capture summary,
+    # absent from the device-level (merged) one the app actually lands on
+    # right after upload. Guards all five at once, since they all broke
+    # via the exact same omission.
+    capture = _ingest(session, "frankel-pixel", CAPTURE_1)
+    single = build_capture_summary(session, capture.id)
+    merged = build_merged_summary(session, [capture.id])
+
+    for field in ("thermal_status", "location_snapshot", "memory_snapshot",
+                  "cpu_snapshot_present", "gnss_degraded_spans"):
+        assert field in merged, f"{field!r} missing from merged summary entirely"
+
+    # With exactly one capture merged, the single-capture and merged views
+    # must agree -- there's no aggregation ambiguity to resolve yet.
+    assert merged["thermal_status"] == single["thermal_status"]
+    assert merged["cpu_snapshot_present"] == single["cpu_snapshot_present"]
+    assert (merged["location_snapshot"] is not None) == (single["location_snapshot"] is not None)
+    assert (merged["memory_snapshot"] is not None) == (single["memory_snapshot"] is not None)
+    assert len(merged["gnss_degraded_spans"]) == len(single["gnss_degraded_spans"])

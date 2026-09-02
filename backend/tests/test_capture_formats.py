@@ -5,8 +5,61 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.models.db_models import Capture, Investigation, InvestigationCaptureLink, PacketCaptureSummaryRow
 from app.parsers.pcap import parse_pcap
 from app.parsers.base import ParsedCapture
+from app.services.ingestion import _decode_txt_upload, parse_bugreport_txt
 from app.services.persistence import persist_capture
 from app.services.summary import build_capture_summary
+
+
+def test_decode_txt_upload_sniffs_utf16_bom():
+    # Found live: a real `adb logcat -v threadtime > out.txt` capture came
+    # through as UTF-16 LE with a BOM -- PowerShell's `>` redirect defaults
+    # to that encoding on Windows, not UTF-8. Decoding it as UTF-8 with
+    # errors="replace" doesn't raise; it silently mangles every other byte
+    # into a replacement character, so the failure never surfaces as an
+    # error, only as an empty, unexplained result downstream.
+    text = "09-02 01:31:53.866  1145  1145 D keystore2: hello"
+    utf16le = b"\xff\xfe" + text.encode("utf-16-le")
+    utf16be = b"\xfe\xff" + text.encode("utf-16-be")
+    utf8_bom = b"\xef\xbb\xbf" + text.encode("utf-8")
+    plain_utf8 = text.encode("utf-8")
+
+    assert _decode_txt_upload(utf16le) == text
+    assert _decode_txt_upload(utf16be) == text
+    assert _decode_txt_upload(utf8_bom) == text
+    assert _decode_txt_upload(plain_utf8) == text
+
+
+def test_plain_logcat_txt_gets_one_clear_diagnosis_not_ten_warnings(tmp_path):
+    # A raw `adb logcat -v threadtime` dump has no "DUMP OF SERVICE .../
+    # ------ SECTION ------" markers anywhere -- those only exist in a full
+    # bugreport. Before this fix, that produced 10+ generic "no X section
+    # found" warnings (one per section ParseCat looks for) with nothing
+    # explaining WHY none were found. It also silently swallowed the
+    # entire file into an unterminated "preamble" section (PREAMBLE has no
+    # delimiter of its own, so it never stops accumulating lines without a
+    # real header to end it on) -- not empty, but not useful data either,
+    # and both cases need the same single, clear diagnosis.
+    logcat_lines = "\n".join(
+        f"09-02 01:31:5{i}.866  1145  1145 D keystore2: some debug line {i}"
+        for i in range(10)
+    )
+    p = tmp_path / "logcat.txt"
+    p.write_bytes(b"\xff\xfe" + logcat_lines.encode("utf-16-le"))
+
+    capture = parse_bugreport_txt(p)
+    assert len(capture.parse_warnings) == 1
+    assert "plain logcat capture" in capture.parse_warnings[0]
+    assert "adb bugreport" in capture.parse_warnings[0]
+
+
+def test_unrecognizable_txt_gets_a_different_diagnosis_than_logcat(tmp_path):
+    p = tmp_path / "not_a_bugreport.txt"
+    p.write_text("just some random notes, not a log file at all\nsecond line\n")
+
+    capture = parse_bugreport_txt(p)
+    assert len(capture.parse_warnings) == 1
+    assert "logcat" not in capture.parse_warnings[0]
+    assert "No recognized bugreport section markers" in capture.parse_warnings[0]
 
 
 def _classic_pcap() -> bytes:

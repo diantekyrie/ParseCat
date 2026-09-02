@@ -5,6 +5,7 @@ ParsedCapture / persisted rows, never re-parses raw text.
 """
 from __future__ import annotations
 
+import re
 import zipfile
 from pathlib import Path
 
@@ -30,7 +31,7 @@ from app.parsers.location import parse_gnss_signal_intervals, parse_location_dum
 from app.parsers.thermal import parse_thermal_snapshot
 from app.parsers.memory import parse_meminfo, parse_memory_samples
 from app.parsers.process_kills import parse_process_kills
-from app.parsers.section_extractor import extract_sections, extract_sections_from_text
+from app.parsers.section_extractor import PREAMBLE, extract_sections, extract_sections_from_text
 from app.parsers.selinux import parse_selinux_denials
 from app.parsers.tombstone import parse_tombstone
 from app.parsers.wifi import parse_wifi_events
@@ -295,11 +296,81 @@ def parse_bugreport_zip(zip_path: str | Path) -> ParsedCapture:
     return capture
 
 
+def _decode_txt_upload(raw: bytes) -> str:
+    """Sniffs a BOM before assuming UTF-8.
+
+    Found live: a real logcat capture (`adb logcat -v threadtime > out.txt`
+    on Windows) came through as UTF-16 LE with a BOM -- PowerShell's `>`
+    redirect defaults to that encoding, not UTF-8. Decoding it as UTF-8
+    with errors="replace" doesn't raise, it just silently turns every
+    other byte into a null/replacement character, so the file "parses"
+    into a wall of "no section found" warnings with zero explanation of
+    why. A bugreport zip's internal .txt entry is always plain UTF-8 (it's
+    written by dumpstate on-device, never touched by a Windows shell), so
+    this only matters for raw .txt uploads -- but for those, guessing
+    wrong is a silent failure, not a loud one.
+    """
+    # The explicit "utf-16-le"/"-be" codecs decode the BOM as a literal
+    # U+FEFF character rather than stripping it (only the generic "utf-16"
+    # auto-detecting codec does that) -- the BOM bytes are sliced off
+    # before decoding so it never leaks into the first line of output.
+    if raw[:2] == b"\xff\xfe":
+        return raw[2:].decode("utf-16-le", errors="replace")
+    if raw[:2] == b"\xfe\xff":
+        return raw[2:].decode("utf-16-be", errors="replace")
+    if raw[:3] == b"\xef\xbb\xbf":
+        return raw[3:].decode("utf-8", errors="replace")
+    return raw.decode("utf-8", errors="replace")
+
+
+# Standard `logcat -v threadtime` line shape, used only to tell a plain
+# logcat capture apart from an actually-malformed upload when neither has
+# any bugreport section markers.
+_THREADTIME_LINE_RE = re.compile(r"^\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\s+\d+\s+\d+\s+[VDIWEF]\s")
+
+
 def parse_bugreport_txt(txt_path: str | Path) -> ParsedCapture:
-    with Path(txt_path).open("r", encoding="utf-8", errors="replace", newline="\n") as f:
-        text = f.read()
+    text = _decode_txt_upload(Path(txt_path).read_bytes())
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     capture = ParsedCapture()
     sections = extract_sections_from_text(text, WANTED_SECTIONS)
+
+    # PREAMBLE has no delimiter of its own -- it just never stops
+    # accumulating lines until the first real section-header line appears.
+    # A raw logcat capture has no such header anywhere, so the ENTIRE file
+    # ends up swallowed into a single unterminated "preamble" section --
+    # not empty, but not useful data either, and the two cases need the
+    # same diagnosis.
+    if not sections or set(sections) == {PREAMBLE}:
+        # A real capture triggered this: a plain `adb logcat -v threadtime`
+        # dump (no "DUMP OF SERVICE .../------ SECTION ------" markers at
+        # all, because those only exist in a full bugreport). Cascading
+        # into 10+ generic "no X section found" warnings would bury the
+        # actual, single reason nothing was parsed -- so that path is
+        # short-circuited with one diagnostic message instead.
+        sample = text.splitlines()[:200]
+        looks_like_logcat = sample and sum(
+            1 for l in sample if _THREADTIME_LINE_RE.match(l)
+        ) / len(sample) > 0.5
+        if looks_like_logcat:
+            capture.parse_warnings.append(
+                "This looks like a plain logcat capture (log lines only, no bugreport "
+                "sections) -- ParseCat's memory/thermal/battery/SELinux/process-kill "
+                "parsers all read `dumpsys`/event-log sections that only exist in a full "
+                "bugreport. Run `adb bugreport` instead of `adb logcat` for full analysis. "
+                "Note that even a full bugreport only surfaces SELinux/kill/memory-sample "
+                "facts from the EVENT LOG buffer, which plain `adb logcat` (default "
+                "buffers) does not include either way -- `-b all` would, if a raw logcat "
+                "capture is what you need."
+            )
+        else:
+            capture.parse_warnings.append(
+                "No recognized bugreport section markers found in this file at all -- "
+                "it may not be a bugreport .txt (an `adb bugreport` zip's flattened "
+                "internal .txt, or dumpstate's own output), or the file may be corrupted."
+            )
+        return capture
+
     capture.parse_warnings.append("Raw .txt upload: ZIP-only tombstone, ANR, and Bluetooth HCI files are not available")
     return _parse_sections_into_capture(capture, sections)
 

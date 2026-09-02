@@ -45,7 +45,6 @@ LOG_SECTION_NAME_MAP = {"SYSTEM LOG": "system_log", "SYSTEM PROPERTIES": "system
 # starts.
 PREAMBLE = "preamble"
 
-MAIN_ENTRY_RE = re.compile(r"^bugreport-.*\.txt$")
 
 
 @dataclass
@@ -59,17 +58,32 @@ class Section:
 
 
 def find_main_bugreport_entry(zf: zipfile.ZipFile) -> zipfile.ZipInfo:
-    """The flattened bugreport txt is the top-level bugreport-*.txt entry.
+    """The flattened bugreport txt is a top-level `.txt` entry.
 
-    There are other .txt files inside FS/ and proto/ trees; the real one is
-    at the archive root and is by far the largest.
+    Its FILENAME is not portable across OEMs even though its CONTENT format
+    is -- `dumpstate` itself is AOSP code and every real capture seen (Pixel
+    and Samsung) uses the identical "DUMP OF SERVICE ..." / "------ ... ------"
+    delimiters, but which wrapper renames the output file differs. Pixel/
+    stock AOSP names it `bugreport-<device>-<build>-<date>.txt`; a real
+    Samsung One UI capture (BP4A.251205.006) instead named it
+    `dumpstate-<date>.txt` -- same content, different name, and matching
+    only the Pixel pattern raised "No top-level bugreport-*.txt entry found"
+    on an otherwise perfectly parseable file.
+
+    Rather than grow a per-OEM prefix whitelist that the next unseen device
+    would just fail again, this picks the largest top-level `.txt` entry
+    outright. In every real capture seen the flattened report dwarfs its
+    top-level siblings by two to three orders of magnitude (174MB vs 238KB
+    for Samsung's own `dumpstate_board.txt` and 19KB for `dumpstate_log.txt`
+    in that same capture) -- size alone is a reliable, OEM-agnostic signal,
+    and it costs nothing that a name-based check couldn't also provide.
     """
     candidates = [
         info for info in zf.infolist()
-        if "/" not in info.filename and MAIN_ENTRY_RE.match(info.filename)
+        if "/" not in info.filename and info.filename.endswith(".txt")
     ]
     if not candidates:
-        raise ValueError("No top-level bugreport-*.txt entry found in zip")
+        raise ValueError("No top-level .txt entry found in zip")
     return max(candidates, key=lambda i: i.file_size)
 
 

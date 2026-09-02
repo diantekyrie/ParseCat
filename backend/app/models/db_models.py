@@ -268,7 +268,9 @@ class ThermalSensorReadingRow(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     capture_id: int = Field(foreign_key="capture.id", index=True)
     name: str
-    value_c: float
+    # None when the HAL reported a sentinel-for-no-reading value (a real
+    # capture had GPU/TPU at -3.4028235E38) rather than a real temperature.
+    value_c: Optional[float]
     type_code: int
     type_name: str = Field(index=True)
     status_code: int

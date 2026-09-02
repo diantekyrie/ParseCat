@@ -1000,7 +1000,10 @@ def build_diagnosis_bundle(
                 "hottest_sensors": [
                     {"name": r.name, "value_c": r.value_c, "type_name": r.type_name,
                      "status_name": r.status_name}
-                    for r in sorted(sensor_rows, key=lambda r: -r.value_c)[:8]
+                    # A None reading (HAL sentinel-for-no-data, not a real
+                    # temperature) sorts last rather than crashing the sort
+                    # or, worse, sorting first as if it were the hottest.
+                    for r in sorted(sensor_rows, key=lambda r: -(r.value_c if r.value_c is not None else float("-inf")))[:8]
                 ],
                 "throttled_sensors": [
                     {"name": r.name, "value_c": r.value_c, "type_name": r.type_name,
@@ -1411,9 +1414,16 @@ def rank_findings(bundle: dict) -> list[dict]:
                     "critical": "CRITICAL", "emergency": "CRITICAL", "shutdown": "CRITICAL"}.get(status, "MEDIUM")
         hottest = thermal.get("throttled_sensors") or thermal.get("hottest_sensors") or []
         top = hottest[0] if hottest else {}
+        # top.get("value_c") is None when the HAL reported a sentinel-for-
+        # no-data value rather than a real temperature -- reported as
+        # "reading unavailable", never formatted as a fabricated number.
+        detail = "status reported without individual sensor detail"
+        if top:
+            value = top.get("value_c")
+            temp_str = f"{value:.1f}\u00b0C" if value is not None else "reading unavailable"
+            detail = f"hottest throttled sensor: {top.get('name')} at {temp_str} ({top.get('type_name')})"
         add(severity, "thermal", f"Device reported thermal status \"{thermal.get('overall_status')}\"",
-            (f"hottest throttled sensor: {top.get('name')} at {top.get('value_c'):.1f}\u00b0C ({top.get('type_name')})"
-             if top else "status reported without individual sensor detail"),
+            detail,
             {"confidence": thermal.get("confidence"), "corroboration": thermal.get("corroboration")})
 
     snapshot = bundle.get("memory_snapshot_evidence") or {}

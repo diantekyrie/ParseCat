@@ -295,7 +295,12 @@ class ThermalSensorReading:
     of silently vanishing or being guessed at."""
 
     name: str
-    value_c: float
+    # None when the HAL reported a sentinel-for-no-reading value rather
+    # than a real temperature (a real capture had GPU/TPU at -3.4028235E38,
+    # the float32 near-min sentinel some thermal HALs use for "no data") --
+    # converted to None rather than surfaced as a literal, physically
+    # impossible temperature.
+    value_c: Optional[float]
     type_code: int
     type_name: str
     status_code: int          # 0=NONE .. 6=SHUTDOWN per IThermal ThrottlingSeverity

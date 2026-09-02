@@ -21,6 +21,11 @@ from app.services.ingestion import parse_bugreport_zip
 FIXTURES = Path(__file__).parent / "fixtures"
 CAPTURE_1 = FIXTURES / "bugreport_2026-08-13.zip"
 CAPTURE_2 = FIXTURES / "bugreport_2026-08-19.zip"
+# A real Samsung Galaxy S25 (SM-S931U, One UI, BP4A.251205.006) capture --
+# the only cross-OEM fixture in the suite. Every other fixture is Pixel,
+# so this is the sole guard against a parser that quietly only works on
+# Google's own hardware.
+SAMSUNG_CAPTURE = FIXTURES / "samsung_bugreport.zip"
 
 pytestmark = pytest.mark.skipif(
     not CAPTURE_1.exists(), reason="real bugreport fixtures not present"
@@ -30,6 +35,13 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def capture1():
     return parse_bugreport_zip(CAPTURE_1)
+
+
+@pytest.fixture(scope="module")
+def samsung_capture():
+    if not SAMSUNG_CAPTURE.exists():
+        pytest.skip("Samsung bugreport fixture not present")
+    return parse_bugreport_zip(SAMSUNG_CAPTURE)
 
 
 def test_no_parse_warnings(capture1):
@@ -1110,3 +1122,120 @@ def test_anr_and_platform_facts_present_on_real_capture(capture1):
         assert capture1.thermal_snapshot.sensors
     if capture1.cpu_load_snapshot is not None:
         assert capture1.cpu_load_snapshot.threads_total is not None
+
+
+def test_find_main_bugreport_entry_is_not_tied_to_pixel_naming(tmp_path):
+    # Found live on a real Samsung One UI capture (BP4A.251205.006): the
+    # flattened bugreport was named "dumpstate-<date>.txt", not
+    # "bugreport-<device>-<build>-<date>.txt" -- same DUMP OF SERVICE /
+    # ------ SECTION ------ content format, different wrapper filename.
+    # Matching only the Pixel pattern raised "No top-level bugreport-*.txt
+    # entry found" on an otherwise perfectly parseable file.
+    import zipfile
+    from app.parsers.section_extractor import find_main_bugreport_entry
+
+    zpath = tmp_path / "samsung_style.zip"
+    with zipfile.ZipFile(zpath, "w") as zf:
+        zf.writestr("dumpstate_board.txt", "x" * 500)      # Samsung sibling file
+        zf.writestr("dumpstate_log.txt", "y" * 200)         # Samsung sibling file
+        zf.writestr("dumpstate-2026-09-02-00-34-45.txt", "z" * 50_000)  # the real one
+        zf.writestr("FS/data/anr/trace_02", "w" * 100_000)  # bigger, but not top-level
+
+    with zipfile.ZipFile(zpath) as zf:
+        entry = find_main_bugreport_entry(zf)
+    assert entry.filename == "dumpstate-2026-09-02-00-34-45.txt"
+
+
+THERMAL_DUAL_BLOCK_LINES = """Thermal Status: 3
+Cached temperatures:
+	Temperature{mValue=45.2, mType=3, mName=SKIN, mStatus=3}
+	Temperature{mValue=53.8, mType=0, mName=AP, mStatus=0}
+HAL Ready: true
+Current temperatures from HAL:
+	Temperature{mValue=43.3, mType=3, mName=SKIN, mStatus=3}
+	Temperature{mValue=50.7, mType=0, mName=AP, mStatus=0}
+Current cooling devices from HAL:
+""".splitlines()
+
+
+def test_thermal_snapshot_prefers_hal_current_and_never_doubles_a_sensor():
+    # Found live on a real Samsung capture: dumpsys thermalservice prints
+    # every sensor TWICE -- once under "Cached temperatures" and again
+    # under "Current temperatures from HAL" -- with slightly different
+    # values each time (43.3 vs 45.2 for the same SKIN sensor here). The
+    # original parser matched "Temperature{...}" anywhere in the section,
+    # silently double-counting every sensor and letting a stale cached
+    # reading collide with the current one in "hottest_sensors".
+    from app.parsers.thermal import parse_thermal_snapshot
+
+    section = Section(name="thermalservice", priority=None, line_start=1,
+                      line_end=len(THERMAL_DUAL_BLOCK_LINES),
+                      lines=THERMAL_DUAL_BLOCK_LINES, kind="dumpsys")
+    snap = parse_thermal_snapshot(section)
+
+    assert len(snap.sensors) == 2
+    assert len({s.name for s in snap.sensors}) == 2      # no duplicate names
+    skin = next(s for s in snap.sensors if s.name == "SKIN")
+    # The HAL-current reading is kept, not the cached one.
+    assert skin.value_c == 43.3
+
+
+def test_thermal_sentinel_value_is_unavailable_not_a_literal_temperature():
+    # Found live on a real Pixel capture: GPU and TPU both reported
+    # mValue=-3.4028235E38 -- the float32 near-min value some thermal HALs
+    # use as a sentinel for "no reading available". Treating this as a
+    # real temperature would let a finding claim a device's GPU was at
+    # roughly negative 3*10^38 degrees, which is exactly the kind of
+    # absurd, trust-destroying output a diagnosis tool cannot afford.
+    from app.parsers.thermal import parse_thermal_snapshot
+
+    lines = """Thermal Status: 0
+Current temperatures from HAL:
+	Temperature{mValue=-3.4028235E38, mType=1, mName=GPU, mStatus=0}
+	Temperature{mValue=46.0, mType=0, mName=CPU0, mStatus=0}
+""".splitlines()
+    section = Section(name="thermalservice", priority=None, line_start=1,
+                      line_end=len(lines), lines=lines, kind="dumpsys")
+    snap = parse_thermal_snapshot(section)
+
+    gpu = next(s for s in snap.sensors if s.name == "GPU")
+    assert gpu.value_c is None
+    cpu = next(s for s in snap.sensors if s.name == "CPU0")
+    assert cpu.value_c == 46.0
+
+
+def test_thermal_finding_reports_sentinel_as_unavailable_not_a_number():
+    from app.services.reasoning import rank_findings
+
+    bundle = {"thermal_evidence": {
+        "overall_status": "severe",
+        "throttled_sensors": [{"name": "GPU", "value_c": None, "type_name": "gpu"}],
+    }}
+    finding = [f for f in rank_findings(bundle) if f["category"] == "thermal"][0]
+    assert "reading unavailable" in finding["detail"]
+    assert "None" not in finding["detail"]
+
+
+def test_samsung_capture_parses_with_the_same_parsers_as_pixel(samsung_capture):
+    # Confirms the AOSP-platform-layer bet: crash/memory/kernel/location/
+    # cpu parsers are OEM-agnostic because they read core framework
+    # services Samsung inherits rather than rewrites. Not every category
+    # is expected to have data (a device can simply have zero SELinux
+    # denials in one capture window) -- this only asserts that whatever
+    # WAS found parses into sane values, not that every category is
+    # non-empty.
+    assert samsung_capture.device_info.manufacturer == "samsung"
+    assert samsung_capture.device_info.hardware  # e.g. "qcom" -- OEM chipset, just confirms the field populated
+
+    for a in samsung_capture.anrs:
+        assert a.timeout_ms is None or a.timeout_ms > 0
+    for ev in samsung_capture.kernel_log_events:
+        assert ev.priority <= 4 or ev.is_panic_family
+    if samsung_capture.thermal_snapshot is not None:
+        names = [s.name for s in samsung_capture.thermal_snapshot.sensors]
+        assert len(names) == len(set(names))  # the dual-block bug, guarded permanently
+    if samsung_capture.location_snapshot is not None:
+        assert samsung_capture.location_snapshot.providers
+    for iv in samsung_capture.gnss_signal_intervals:
+        assert iv.quality in {"good", "poor", "none"}
+        assert iv.duration_sec >= 0

@@ -220,6 +220,24 @@ function Timeline({ events }) {
   );
 }
 
+// Code-computed capture_coverage.statement from the diagnose/scan bundle.
+// Template text only -- never invent a covered range in the UI.
+function CoverageNotice({ coverage }) {
+  if (!coverage || !coverage.statement) return null;
+  const tone =
+    coverage.relation === "outside" || coverage.relation === "in_gap"
+      ? "coverage-gap"
+      : coverage.relation === "inside"
+        ? "coverage-ok"
+        : "coverage-info";
+  return (
+    <div className={`coverage-notice ${tone}`} data-coverage-relation={coverage.relation || ""}>
+      <strong>Capture coverage</strong>
+      <p>{coverage.statement}</p>
+    </div>
+  );
+}
+
 function TriageControls({
   appFilter,
   setAppFilter,
@@ -913,6 +931,7 @@ export default function App() {
 
                 {scan && (
                   <div className="ask-result">
+                    <CoverageNotice coverage={scan.bundle.capture_coverage} />
                     <h3>Scan findings</h3>
                     <FindingsList findings={scan.bundle.ranked_findings} />
                     {scan.report ? (
@@ -958,6 +977,7 @@ export default function App() {
 
                 {diagnosis && (
                   <div className="ask-result">
+                    <CoverageNotice coverage={diagnosis.bundle.capture_coverage} />
                     {diagnosis.bundle.claims.length === 0 && (
                       <p className="muted">No app named in the question matched a known package — nothing to verify.</p>
                     )}
@@ -973,6 +993,7 @@ export default function App() {
                     {(diagnosis.followUps || []).map((turn, i) => (
                       <div className="follow-up-turn" key={i}>
                         <h3>Follow-up: {turn.question}</h3>
+                        <CoverageNotice coverage={turn.bundle && turn.bundle.capture_coverage} />
                         {turn.report ? (
                           <div className="report">{renderMarkdown(turn.report)}</div>
                         ) : (
@@ -1034,6 +1055,9 @@ export default function App() {
 
                 {invDiagnosis && (
                   <div className="ask-result">
+                    {(invDiagnosis.bundle.captures || []).map((cap) => (
+                      <CoverageNotice key={`cov-${cap.capture_id}`} coverage={cap.capture_coverage} />
+                    ))}
                     {invDiagnosis.bundle.captures.map((cap) => (
                       <div key={cap.capture_id}>
                         {cap.claims.map((cl) => (
@@ -1060,6 +1084,7 @@ export default function App() {
                     {(invDiagnosis.followUps || []).map((turn, i) => (
                       <div className="follow-up-turn" key={i}>
                         <h3>Follow-up: {turn.question}</h3>
+                        <CoverageNotice coverage={turn.bundle && turn.bundle.capture_coverage} />
                         {turn.report ? (
                           <div className="report">{renderMarkdown(turn.report)}</div>
                         ) : (
@@ -1808,6 +1833,11 @@ export default function App() {
         .timeline-dot { width: 8px; height: 8px; border-radius: 50%; }
         .timeline-ts { color: var(--muted); font-family: ui-monospace, monospace; }
 
+        .coverage-notice { border: 1px solid var(--panel-border); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; background: #0e1420; font-size: 13px; }
+        .coverage-notice p { margin: 6px 0 0; }
+        .coverage-notice.coverage-gap { border-color: var(--amber); }
+        .coverage-notice.coverage-ok { border-color: var(--green); }
+        .coverage-notice.coverage-info { border-color: var(--blue); }
         .claim-card { border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px; margin-bottom: 12px; background: #0e1420; }
         .claim-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
         .badge { color: #10131a; font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 10px; }

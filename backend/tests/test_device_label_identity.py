@@ -14,6 +14,7 @@ from app.parsers.base import DeviceInfo, ParsedCapture
 from app.services.persistence import (
     DeviceIdentityMismatchError,
     UNVERIFIED_DEVICE_IDENTITY_WARNING,
+    UNVERIFIED_EXISTING_DEVICE_IDENTITY_WARNING,
     persist_capture,
 )
 
@@ -101,3 +102,29 @@ def test_all_null_device_info_persists_with_warning(session):
     assert len(session.exec(select(Capture)).all()) == 2
     assert UNVERIFIED_DEVICE_IDENTITY_WARNING in unverifiable.parse_warnings
     assert UNVERIFIED_DEVICE_IDENTITY_WARNING in capture.parse_warnings.split("\n")
+
+
+def test_unverifiable_existing_capture_warns_instead_of_silently_merging(session):
+    # PC-ingestion-004: the asymmetric counterpart to PC-ingestion-003.
+    # Found on review of #16: the mismatch loop only fires when BOTH sides
+    # have a comparable value. If the label's first upload has NO device_info
+    # at all (e.g. it was a .pcap), the loop has nothing to compare a later,
+    # fully-identified, genuinely different device against -- so it returned
+    # silently and merged with no warning, reproducing the exact #14 failure
+    # (two physical devices sharing one label) this whole check exists to
+    # prevent, just entered from the other side.
+    unidentified_first = ParsedCapture()
+    unidentified_first.device_info = DeviceInfo()  # e.g. a .pcap upload
+    persist_capture(session, "Pixel", "pcap-first.zip", unidentified_first)
+
+    real_device = _capture_with_identity(
+        serial="serial-a", build_fingerprint="fingerprint-a",
+        manufacturer="Maker", model="Model-A",
+    )
+    capture = persist_capture(session, "Pixel", "real-device.zip", real_device)
+
+    # Persisted, not blocked -- we cannot PROVE a mismatch when the existing
+    # side has nothing to compare, only that it's unverifiable.
+    assert len(session.exec(select(Capture)).all()) == 2
+    assert UNVERIFIED_EXISTING_DEVICE_IDENTITY_WARNING in real_device.parse_warnings
+    assert UNVERIFIED_EXISTING_DEVICE_IDENTITY_WARNING in capture.parse_warnings.split("\n")

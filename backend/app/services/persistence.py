@@ -63,6 +63,24 @@ UNVERIFIED_DEVICE_IDENTITY_WARNING = (
     "build_fingerprint, manufacturer, or model to compare; persisted anyway."
 )
 
+# The asymmetric counterpart to the warning above. Found on review: the
+# mismatch loop only fires when BOTH the incoming capture and an existing
+# row have a value for the same field. If every existing capture on a label
+# has no identity info at all (e.g. the label's first upload was a .pcap,
+# which never carries device_info), the loop has nothing to compare against
+# for any field, so it silently returns -- and a genuinely different
+# physical device then merges into that label with no warning at all. That
+# is the exact failure this whole check exists to prevent, just entered
+# from the other side (unverifiable EXISTING data instead of unverifiable
+# INCOMING data).
+UNVERIFIED_EXISTING_DEVICE_IDENTITY_WARNING = (
+    "Cannot verify device identity for this label: no existing capture on "
+    "file has a serial, build_fingerprint, manufacturer, or model to "
+    "compare against; persisted anyway. If this and prior captures are not "
+    "actually the same physical device, corroboration across them will be "
+    "wrong."
+)
+
 
 class DeviceIdentityMismatchError(Exception):
     """Refuse persist when a device_label already holds different hardware."""
@@ -128,6 +146,17 @@ def check_device_label_identity(session: Session, device_label: str, parsed: Par
     existing_rows = session.exec(
         select(DeviceInfoRow).where(DeviceInfoRow.capture_id.in_(existing_capture_ids))
     ).all()
+
+    # If NO existing row has a value for ANY identity field, there is
+    # nothing to compare the incoming capture against -- warn rather than
+    # silently persisting as if identity were verified. This is checked
+    # before the per-field loop so it fires even when every existing row's
+    # identity dict is completely empty (the loop below would otherwise
+    # just never find a match and exit with mismatched == [], which reads
+    # identically to "confirmed identical" from the caller's side).
+    if not any(_identity_values(row) for row in existing_rows):
+        parsed.parse_warnings.append(UNVERIFIED_EXISTING_DEVICE_IDENTITY_WARNING)
+        return
 
     mismatched: list[str] = []
     for field in DEVICE_IDENTITY_FIELDS:

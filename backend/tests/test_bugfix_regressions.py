@@ -152,6 +152,84 @@ def test_score_confidence_does_not_upgrade_on_empty_sibling_captures():
     assert score_confidence(1, 2)[0] == "MEDIUM"  # old call shape still defined
 
 
+def test_package_entity_confidence_not_inflated_by_empty_sibling_capture():
+    """Two captures on file, evidence in only one: package-entity confidence stays LOW.
+
+    The device-wide path is covered by evidence_confidence; this is the
+    PackageHistory / build_entity_claim path that still used len(captures).
+    """
+    from sqlmodel import Session, SQLModel, create_engine
+
+    from app.models.db_models import Capture, Device, FocusEventRow
+    from app.services.correlation import package_history_across_device
+    from app.services.reasoning import build_entity_claim, score_confidence
+    from app.services.verification import EntityVerification
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        device = Device(label="synth-device")
+        session.add(device)
+        session.commit()
+        session.refresh(device)
+
+        with_evidence = Capture(device_id=device.id, original_filename="with-evidence.zip")
+        empty_sibling = Capture(device_id=device.id, original_filename="empty-sibling.zip")
+        session.add(with_evidence)
+        session.add(empty_sibling)
+        session.commit()
+        session.refresh(with_evidence)
+        session.refresh(empty_sibling)
+
+        session.add(FocusEventRow(
+            capture_id=with_evidence.id,
+            timestamp="01-01 00:00:00.000",
+            event_type="request",
+            package="com.example.player",
+            uid=None,
+            pid=None,
+            usage=None,
+            request_result=None,
+            loss_code=None,
+            detail="request",
+            source_section="audio",
+            source_line_start=1,
+            source_line_end=1,
+        ))
+        session.commit()
+
+        history = package_history_across_device(session, "synth-device", "com.example.player")
+        assert len(history.target_sdk_by_capture) == 2  # both captures were searched
+        assert history.captures_checked == 1  # only the one that contributed a row
+        assert history.ever_requested_focus is True
+        assert history.focus_request_count == 1
+
+        ev = EntityVerification(
+            package="com.example.player",
+            matched_how="literal_package_id",
+            is_top_of_focus_stack=False,
+            media_session_active=None,
+            media_session_playback_state=None,
+            media_session_position_ms=None,
+            media_session_source=None,
+            latest_focus_event=None,
+            target_sdk=None,
+            target_sdk_source=None,
+            crash_events=[],
+            freeze_count=0,
+            unfreeze_count=0,
+            tombstones=[],
+            anrs=[],
+            battery=None,
+            corroborating_fact_count=1,
+        )
+        claim = build_entity_claim(ev, history)
+        assert claim["confidence"] == "LOW"
+        assert claim["cross_capture_history"]["captures_checked"] == 1
+        # Old len(captures) scoring would have upgraded this to MEDIUM.
+        assert score_confidence(1, 2)[0] == "MEDIUM"
+
+
 def test_device_context_allowlist_excludes_serial():
     assert "serial" not in DEVICE_CONTEXT_LLM_FIELDS
     assert "build_fingerprint" in DEVICE_CONTEXT_LLM_FIELDS

@@ -256,6 +256,22 @@ def test_incident_window_dated_vs_same_clock_time():
             "window": 30,
             "expect": True,
         },
+        # Known limit: dated ordinals do not year-wrap (Dec 31 vs Jan 1 looks ~31 days).
+        {
+            "id": "dated-year-wrap-known-limit",
+            "timestamp": "01-01 00:10",
+            "center": "12-31 23:50",
+            "window": 30,
+            "expect": False,
+        },
+        # Mixed dated vs time-only compares are always outside the window (acceptable FN).
+        {
+            "id": "mixed-dated-vs-time-only-false-negative",
+            "timestamp": "01-01 23:50",
+            "center": "23:50",
+            "window": 30,
+            "expect": False,
+        },
     ]
     uri = js.resolve().as_uri()
     script = (

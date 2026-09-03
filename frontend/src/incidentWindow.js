@@ -2,12 +2,18 @@
  *
  * Dated stamps (ISO or MM-DD) compare calendar minutes and do not wrap at 24h.
  * Time-only stamps may wrap midnight, because they have no date to order by.
+ *
+ * Known limit (same as location.py GNSS year-wrap): dated ordinals do not
+ * year-wrap -- Dec 31 vs Jan 1 looks ~31 days apart, not 1. Mixed dated vs
+ * time-only compares are a false negative (always outside the window); that
+ * is acceptable for #9's false-positive fix.
  */
 export function timestampOrderMinutes(timestamp) {
   if (!timestamp) return null;
   const s = String(timestamp);
   const iso = s.match(/(\d{4})-(\d{2})-(\d{2})[T ](\d{1,2}):(\d{2})/);
   if (iso) {
+    // Year (iso[1]) is intentionally unused in the ordinal; see known limit above.
     return { dated: true, minutes: (Number(iso[2]) * 31 + Number(iso[3])) * 1440 + Number(iso[4]) * 60 + Number(iso[5]) };
   }
   const md = s.match(/\b(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})/);

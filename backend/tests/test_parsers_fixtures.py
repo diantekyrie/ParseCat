@@ -1120,9 +1120,13 @@ def test_anr_and_platform_facts_present_on_real_capture(capture1):
         assert ev.priority <= 4 or ev.is_panic_family
     if capture1.thermal_snapshot is not None:
         assert capture1.thermal_snapshot.sensors
-    if capture1.cpu_load_snapshot is not None:
-        # AOSP dumpsys cpuinfo TOTAL has no Threads: N total line.
-        assert capture1.cpu_load_snapshot.total_pct is not None
+    # #2: real AOSP dumpsys cpuinfo TOTAL line must populate CpuLoadSnapshot
+    # (process rows stay unmapped -- no invented tid/user/state).
+    assert capture1.cpu_load_snapshot is not None, (
+        "cpu_load_snapshot missing; dumpsys TOTAL line should parse"
+    )
+    # AOSP dumpsys cpuinfo TOTAL has no Threads: N total line.
+    assert capture1.cpu_load_snapshot.total_pct is not None
 
 
 def test_find_main_bugreport_entry_is_not_tied_to_pixel_naming(tmp_path):

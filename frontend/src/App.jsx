@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
+// Dated incident ordinals do not year-wrap (Dec 31 vs Jan 1 looks ~31 days); see incidentWindow.js.
 import { matchesIncidentWindow } from "./incidentWindow";
 
 const SEVERITY_COLOR = { critical: "var(--red)", warning: "var(--amber)", info: "var(--blue)" };

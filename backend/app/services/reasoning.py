@@ -393,6 +393,7 @@ def build_entity_claim(ev: EntityVerification, history: PackageHistory | None) -
     if history is not None:
         claim["cross_capture_history"] = {
             "captures_checked": history.captures_checked,
+            "captures_on_file": history.captures_on_file,
             "ever_requested_audio_focus": history.ever_requested_focus,
             "focus_request_count_all_captures": history.focus_request_count,
             "target_sdk_by_capture": history.target_sdk_by_capture,

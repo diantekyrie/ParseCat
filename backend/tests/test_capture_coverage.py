@@ -8,9 +8,9 @@ from __future__ import annotations
 import pytest
 from sqlmodel import Session, SQLModel, create_engine
 
-from app.models.db_models import Capture, Device, FocusEventRow
+from app.models.db_models import Capture, Device, FocusEventRow, Investigation, InvestigationCaptureLink
 from app.services.coverage import parse_question_date
-from app.services.reasoning import build_diagnosis_bundle, diagnose, scan_capture
+from app.services.reasoning import build_diagnosis_bundle, diagnose, diagnose_investigation, scan_capture
 
 
 GAP_WORDING = ("gap", "outside", "hole", "out of range", "out-of-range", "not cover")
@@ -168,6 +168,44 @@ def test_no_date_in_question_does_not_fake_a_coverage_warning(session):
     assert coverage["statement"] is None
     cats = [e["category"] for e in bundle["evidence_sources"]]
     assert "capture date coverage" not in cats
+
+
+def test_investigation_path_discloses_per_capture_coverage_not_top_level(session):
+    """Follow-up to #17 review: capture_coverage in an investigation bundle
+    lives nested inside EACH captures[i] entry, not at the top level --
+    this is the exact multi-device path the original issue (#15) was
+    reported from, and it previously had zero test coverage.
+    """
+    device_a = _device(session, "device-a")
+    device_b = _device(session, "device-b")
+    cap_a = _capture(session, device_a, "device-a-aug19.zip")
+    cap_b = _capture(session, device_b, "device-b-aug20.zip")
+    _focus(session, cap_a.id, "08-19 12:00:00")
+    _focus(session, cap_b.id, "08-20 12:00:00")
+
+    investigation = Investigation(label="synthetic-investigation")
+    session.add(investigation)
+    session.commit()
+    session.refresh(investigation)
+    session.add(InvestigationCaptureLink(investigation_id=investigation.id, capture_id=cap_a.id))
+    session.add(InvestigationCaptureLink(investigation_id=investigation.id, capture_id=cap_b.id))
+    session.commit()
+
+    result = diagnose_investigation(session, investigation.id, "Where was GPS on Aug 28?")
+    bundle = result["bundle"]
+
+    # No top-level capture_coverage -- rule 16 exists precisely because this
+    # shape differs from the single-capture case rule 12b describes.
+    assert "capture_coverage" not in bundle
+    assert len(bundle["captures"]) == 2
+    for entry in bundle["captures"]:
+        coverage = entry["capture_coverage"]
+        assert coverage["question_date"] == "08-28"
+        assert coverage["relation"] == "outside"
+        stmt = coverage["statement"]
+        assert stmt
+        assert "08-28" in stmt
+        assert "outside" in stmt.lower()
 
 
 def test_scan_without_a_question_date_has_no_coverage_warning(session):

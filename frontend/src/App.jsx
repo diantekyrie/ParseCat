@@ -376,7 +376,17 @@ function ClaimCard({ claim, deviceLabel }) {
       </table>
       {claim.cross_capture_history && (
         <div className="history">
-          Checked across {claim.cross_capture_history.captures_checked} capture(s). Ever requested audio focus:{" "}
+          {/* captures_checked is how many captures actually had matching evidence for this
+              package -- NOT how many exist on file (captures_on_file). Showing only
+              captures_checked reads as "we only looked at N," when the other
+              captures_on_file - captures_checked captures were genuinely checked and
+              correctly found to have nothing to report. */}
+          Checked {claim.cross_capture_history.captures_checked} of{" "}
+          {claim.cross_capture_history.captures_on_file} capture(s) on file
+          {claim.cross_capture_history.captures_on_file > claim.cross_capture_history.captures_checked
+            ? ` (${claim.cross_capture_history.captures_on_file - claim.cross_capture_history.captures_checked} had no evidence for this package)`
+            : ""}
+          . Ever requested audio focus:{" "}
           {String(claim.cross_capture_history.ever_requested_audio_focus)} ({claim.cross_capture_history.focus_request_count_all_captures} total).
         </div>
       )}

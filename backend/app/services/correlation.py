@@ -17,7 +17,17 @@ from app.models.db_models import Capture, Device, FocusEventRow, ForegroundServi
 @dataclass
 class PackageHistory:
     package: str
+    # Captures that actually contributed evidence for this package -- NOT
+    # every capture on file. A capture with zero matching rows is still
+    # genuinely checked, it just had nothing to report; conflating the two
+    # numbers is exactly what made "Checked across N capture(s)" misleading
+    # once N stopped meaning "captures on file" (see captures_on_file below).
     captures_checked: int
+    # Total captures on file for this device, regardless of whether any of
+    # them had evidence for this specific package. Kept alongside
+    # captures_checked so a caller can render "checked N of M" instead of
+    # implying only N captures exist or were examined.
+    captures_on_file: int
     ever_requested_focus: bool
     focus_request_count: int
     target_sdk_by_capture: dict[int, int | None]
@@ -87,6 +97,7 @@ def package_history_across_device(session: Session, device_label: str, package: 
     return PackageHistory(
         package=package,
         captures_checked=_evidence_capture_count(focus_rows, fact_rows, fgs_rows),
+        captures_on_file=len(captures),
         ever_requested_focus=request_count > 0,
         focus_request_count=request_count,
         target_sdk_by_capture=target_sdk_by_capture,

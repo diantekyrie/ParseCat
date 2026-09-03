@@ -201,6 +201,11 @@ def test_package_entity_confidence_not_inflated_by_empty_sibling_capture():
         history = package_history_across_device(session, "synth-device", "com.example.player")
         assert len(history.target_sdk_by_capture) == 2  # both captures were searched
         assert history.captures_checked == 1  # only the one that contributed a row
+        # captures_on_file must stay the true total (2) alongside the narrower
+        # captures_checked (1) -- collapsing them is what made "Checked across
+        # N capture(s)" read as "we only looked at N" instead of "we checked
+        # all M, N had evidence."
+        assert history.captures_on_file == 2
         assert history.ever_requested_focus is True
         assert history.focus_request_count == 1
 
@@ -226,6 +231,7 @@ def test_package_entity_confidence_not_inflated_by_empty_sibling_capture():
         claim = build_entity_claim(ev, history)
         assert claim["confidence"] == "LOW"
         assert claim["cross_capture_history"]["captures_checked"] == 1
+        assert claim["cross_capture_history"]["captures_on_file"] == 2
         # Old len(captures) scoring would have upgraded this to MEDIUM.
         assert score_confidence(1, 2)[0] == "MEDIUM"
 

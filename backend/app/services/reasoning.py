@@ -51,6 +51,7 @@ from app.models.db_models import (
     WifiEventRow,
 )
 from app.services.correlation import PackageHistory, package_history_across_device
+from app.services.coverage import build_capture_coverage
 from app.services.verification import EntityVerification, verify_question_entities
 
 MULTI_CAPTURE_TRIGGER_RE = re.compile(
@@ -278,9 +279,20 @@ numbers). Rules, no exceptions:
     near the end of the report as a short "Evidence checked" list so the
     reader can see what was and wasn't looked at, using its "category" and
     "detail" fields verbatim.
+12b. If the bundle includes a top-level "capture_coverage" object, that is
+    a deterministic, code-computed record of which calendar dates the
+    loaded captures actually cover -- not written by you. If it has a
+    non-null "statement" field, quote that text verbatim at the start of
+    "## Direct answer" (before your 1-3 sentence answer). Never invent a
+    covered range, a gap, or an out-of-range claim that is not in this
+    object. If "statement" is null or absent, do not warn about coverage.
+    If "relation" is "inside", the requested date WAS covered; do not
+    imply a coverage gap. If "question_date_parse" is "unparsed", say the
+    date could not be parsed and make no coverage claim.
 13. Structure every report with these sections, in this order, using
     markdown headings (##):
-    - "## Direct answer" -- 1-3 sentences answering the literal question
+    - "## Direct answer" -- if capture_coverage.statement is present, open
+      with it verbatim, then 1-3 sentences answering the literal question
       first, before any supporting detail.
     - "## Findings" -- the verified facts, organized by category (named
       app claims, crash/ANR, Wi-Fi, battery, pairing, packet analysis --
@@ -542,6 +554,12 @@ def build_diagnosis_bundle(
         return {"capture_id": row_capture_id}
 
     bundle["captures"] = dict(capture_filenames) or {capture_id: None}
+
+    # Deterministic coverage of loaded captures vs. any date in the question.
+    # The LLM may quote capture_coverage.statement; it must not invent ranges.
+    bundle["capture_coverage"] = build_capture_coverage(
+        session, sibling_captures, question,
+    )
 
     if want_crash:
         # Device-wide crash evidence, surfaced regardless of whether it's
@@ -1258,6 +1276,17 @@ def build_diagnosis_bundle(
                 ),
                 "detail": f"checked across {captures_checked} capture(s) on file for this device",
             })
+    coverage = bundle.get("capture_coverage") or {}
+    if coverage.get("statement"):
+        evidence_sources.append({
+            "category": "capture date coverage",
+            "reason": (
+                "question named a calendar date"
+                if coverage.get("question_date_parse") == "parsed"
+                else "question looked date-specific but the date could not be parsed"
+            ),
+            "detail": coverage["statement"],
+        })
     bundle["evidence_sources"] = evidence_sources
 
     return bundle

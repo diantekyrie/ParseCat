@@ -146,7 +146,7 @@ def parse_location_dump(section: Section) -> LocationSnapshot | None:
 
     for i, raw in enumerate(section.lines):
         abs_line = section.line_start + i
- mar
+
         if raw.strip().startswith("Location Setting:"):
             location_enabled = None  # values follow on subsequent "[u0] true" lines
         m = re.match(r"^\s*\[u\d+\]\s+(true|false)\s*$", raw)

@@ -2,7 +2,8 @@
 one longitudinal history, not disposable single uploads. A finding like
 "app X has never requested audio focus" is checked against every capture on
 file for the device, not just whichever file happens to be in the current
-request -- and the answer says how many captures it was checked against.
+request. Confidence uses how many of those captures actually contributed
+evidence for the package, not how many captures sit on file.
 """
 from __future__ import annotations
 
@@ -32,6 +33,15 @@ def captures_for_device(session: Session, device_label: str) -> list[Capture]:
     ))
 
 
+def _evidence_capture_count(*row_groups) -> int:
+    """Distinct captures that actually contributed rows, not captures-on-file.
+
+    Mirrors reasoning.evidence_confidence's capture_id count; kept local so
+    this module does not import reasoning (reasoning already imports us).
+    """
+    return len({row.capture_id for group in row_groups for row in group})
+
+
 def package_history_across_device(session: Session, device_label: str, package: str) -> PackageHistory:
     """The check that would have turned "Disney+ apparently didn't request
     audio focus in this file" into a corroborated, multi-capture finding
@@ -43,36 +53,40 @@ def package_history_across_device(session: Session, device_label: str, package: 
     request_count = 0
     target_sdk_by_capture: dict[int, int | None] = {}
     hosted_fgs = False
+    focus_rows: list[FocusEventRow] = []
+    fact_rows: list[PackageFactRow] = []
+    fgs_rows: list[ForegroundServiceRow] = []
 
     if capture_ids:
-        events = session.exec(
+        focus_rows = list(session.exec(
             select(FocusEventRow).where(
                 FocusEventRow.capture_id.in_(capture_ids),
                 FocusEventRow.package == package,
-                FocusEventRow.event_type == "request",
             )
-        ).all()
-        request_count = len(events)
+        ).all())
+        request_count = sum(1 for e in focus_rows if e.event_type == "request")
 
-        for cid in capture_ids:
-            row = session.exec(
-                select(PackageFactRow).where(
-                    PackageFactRow.capture_id == cid, PackageFactRow.package == package
-                )
-            ).first()
-            target_sdk_by_capture[cid] = row.target_sdk if row else None
+        fact_rows = list(session.exec(
+            select(PackageFactRow).where(
+                PackageFactRow.capture_id.in_(capture_ids),
+                PackageFactRow.package == package,
+            )
+        ).all())
+        target_sdk_by_capture = {cid: None for cid in capture_ids}
+        for row in fact_rows:
+            target_sdk_by_capture[row.capture_id] = row.target_sdk
 
-        fgs_row = session.exec(
+        fgs_rows = list(session.exec(
             select(ForegroundServiceRow).where(
                 ForegroundServiceRow.capture_id.in_(capture_ids),
                 ForegroundServiceRow.package == package,
             )
-        ).first()
-        hosted_fgs = fgs_row is not None
+        ).all())
+        hosted_fgs = bool(fgs_rows)
 
     return PackageHistory(
         package=package,
-        captures_checked=len(captures),
+        captures_checked=_evidence_capture_count(focus_rows, fact_rows, fgs_rows),
         ever_requested_focus=request_count > 0,
         focus_request_count=request_count,
         target_sdk_by_capture=target_sdk_by_capture,

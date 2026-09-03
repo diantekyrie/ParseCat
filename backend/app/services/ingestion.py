@@ -249,6 +249,41 @@ def _parse_sections_into_capture(capture: ParsedCapture, sections: dict) -> Pars
     return capture
 
 
+def _bt_hci_from_zip(zf: zipfile.ZipFile, names: set[str]):
+    """Find a classic btsnoop HCI log by directory scan + magic bytes.
+
+    Filename is OEM/build-specific. Prefer known names and non-.last
+    copies, but accept any file under BT_HCI_LOG_DIR that actually parses.
+    """
+    dir_entries = [
+        n for n in names
+        if n.startswith(BT_HCI_LOG_DIR)
+        and n != BT_HCI_LOG_DIR
+        and "/" not in n[len(BT_HCI_LOG_DIR):]
+    ]
+    if not dir_entries:
+        return None, "No Bluetooth HCI snoop log found"
+
+    def sort_key(path: str):
+        base = path[len(BT_HCI_LOG_DIR):]
+        is_last = base.endswith(".last")
+        try:
+            pref = BT_HCI_LOG_CANDIDATES.index(base)
+        except ValueError:
+            pref = len(BT_HCI_LOG_CANDIDATES)
+        return (is_last, pref, base)
+
+    last_bad = None
+    for path in sorted(dir_entries, key=sort_key):
+        summary = parse_bt_hci_log(zf.read(path))
+        if summary is not None:
+            return summary, None
+        last_bad = path
+    return None, (
+        f"Found '{last_bad}' but it did not match the expected btsnoop binary format"
+    )
+
+
 def parse_bugreport_zip(zip_path: str | Path) -> ParsedCapture:
     capture = ParsedCapture()
 
@@ -259,18 +294,9 @@ def parse_bugreport_zip(zip_path: str | Path) -> ParsedCapture:
         capture.anr_main_thread_snapshots = parse_anr_trace_dumps(zf)
 
         names = set(zf.namelist())
-        bt_hci_path = next(
-            (BT_HCI_LOG_DIR + name for name in BT_HCI_LOG_CANDIDATES if BT_HCI_LOG_DIR + name in names),
-            None,
-        )
-        if bt_hci_path is not None:
-            capture.bt_hci_summary = parse_bt_hci_log(zf.read(bt_hci_path))
-            if capture.bt_hci_summary is None:
-                capture.parse_warnings.append(
-                    f"Found '{bt_hci_path}' but it did not match the expected btsnoop binary format"
-                )
-        else:
-            capture.parse_warnings.append("No Bluetooth HCI snoop log found")
+        capture.bt_hci_summary, bt_warn = _bt_hci_from_zip(zf, names)
+        if bt_warn:
+            capture.parse_warnings.append(bt_warn)
 
         history_freezes, history_crashes, history_cdm = parse_logcat_history(zf)
 
@@ -379,9 +405,11 @@ def parse_pcap_file(path: str | Path) -> ParsedCapture:
     capture = ParsedCapture()
     capture.packet_capture_summary = parse_pcap(Path(path).read_bytes())
     try:
+        warnings: list[str] = []
         capture.packet_analysis = analyze_packet_capture(
-            Path(path), capture.packet_capture_summary.linktype
+            Path(path), capture.packet_capture_summary.linktype, warnings=warnings
         )
+        capture.parse_warnings.extend(warnings)
     except Exception as exc:  # noqa: BLE001 -- protocol analysis is additive; a
         # failure here must not lose the container-metadata summary above.
         capture.parse_warnings.append(f"Packet-level protocol analysis failed: {exc}")

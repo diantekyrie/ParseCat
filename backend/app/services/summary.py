@@ -7,6 +7,8 @@ persisted at ingestion time -- nothing here re-parses the bugreport.
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime
 
 from sqlmodel import Session, func, select
 
@@ -18,6 +20,34 @@ _THERMAL_SEVERITY_RANK = {
     "none": 0, "light": 1, "moderate": 2, "severe": 3,
     "critical": 4, "emergency": 5, "shutdown": 6,
 }
+
+_LOGCAT_TS_RE = re.compile(
+    r"^(?:(\d{4})-)?(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?"
+)
+
+
+def _timeline_sort_key(ts: str):
+    """Comparable key for mixed logcat (MM-DD HH:MM:SS.mmm) and ISO HCI stamps.
+
+    Year is used when present (HCI) so ordering is real; yearless logcat
+    stamps compare on month/day/time only. Empty/unparseable values sort last.
+    """
+    if not ts:
+        return (1, 0, 0, 0, 0, 0, 0, 0)
+    s = str(ts).replace("Z", "")
+    m = _LOGCAT_TS_RE.match(s)
+    if m:
+        year = int(m.group(1)) if m.group(1) else 0
+        frac = (m.group(7) or "0").ljust(6, "0")[:6]
+        # Year last so mixed ISO (has year) and logcat (yearless) order by
+        # month/day/time instead of all yearless stamps sorting first.
+        return (0, int(m.group(2)), int(m.group(3)),
+                int(m.group(4)), int(m.group(5)), int(m.group(6)), int(frac), year)
+    try:
+        dt = datetime.fromisoformat(s)
+        return (0, dt.month, dt.day, dt.hour, dt.minute, dt.second, dt.microsecond, dt.year)
+    except ValueError:
+        return (1, 0, 0, 0, 0, 0, 0, 0)
 
 from app.models.db_models import (
     AnrRow,
@@ -273,7 +303,7 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
             "label": f"killed {k.process}" + (f": {k.reason}" if k.reason else ""),
             "source": _source(k.source_section, k.source_line_start, k.source_line_end),
         })
-    timeline.sort(key=lambda e: e["timestamp"])
+    timeline.sort(key=lambda e: _timeline_sort_key(e["timestamp"]))
 
     media_session_rows = session.exec(
         select(MediaSessionRow).where(MediaSessionRow.capture_id == capture_id)
@@ -573,7 +603,7 @@ def build_merged_summary(session: Session, capture_ids: list[int]) -> dict:
         if latest_ingested_at is None or cap["ingested_at"] > latest_ingested_at:
             latest_ingested_at = cap["ingested_at"]
 
-    timeline.sort(key=lambda e: e["timestamp"])
+    timeline.sort(key=lambda e: _timeline_sort_key(e["timestamp"]))
     top_battery_consumers.sort(key=lambda b: b["total_mah"], reverse=True)
     top_freeze_offenders = sorted(
         freeze_offenders_by_pkg.values(), key=lambda o: o["freezes"] + o["unfreezes"], reverse=True

@@ -331,14 +331,15 @@ def _analyze_dot11_fallback(path: Path) -> PacketAnalysis:
         [PacketIdentitySignal("ssid", k, v) for k, v in ssid_counts.items()]
         + [PacketIdentitySignal("bssid", k, v) for k, v in bssid_counts.items()]
     )
+    typed = sum(frame_counts.values())
 
     return PacketAnalysis(
         backend="fallback",
         packets_analyzed=packets_analyzed,
         link_layer="802.11",
         frame_type_breakdown=[PacketFrameTypeStat(k, v) for k, v in sorted(frame_counts.items(), key=lambda kv: -kv[1])],
-        retry_count=retry_count,
-        retry_rate_pct=(round(100 * retry_count / packets_analyzed, 2) if packets_analyzed else None),
+        retry_count=retry_count if typed else None,
+        retry_rate_pct=(round(100 * retry_count / typed, 2) if typed else None),
         rssi_min_dbm=min(rssis) if rssis else None,
         rssi_max_dbm=max(rssis) if rssis else None,
         rssi_avg_dbm=(round(sum(rssis) / len(rssis), 1) if rssis else None),
@@ -423,7 +424,9 @@ def _analyze_ethernet_fallback(path: Path) -> PacketAnalysis:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def analyze_packet_capture(path: Path, linktype: int) -> PacketAnalysis | None:
+def analyze_packet_capture(
+    path: Path, linktype: int, warnings: list[str] | None = None,
+) -> PacketAnalysis | None:
     link_layer = is_supported_link_layer_pcap(linktype)
     if link_layer == "unknown":
         return None
@@ -431,8 +434,9 @@ def analyze_packet_capture(path: Path, linktype: int) -> PacketAnalysis | None:
     if tshark_available():
         try:
             return analyze_with_tshark(path, link_layer)
-        except Exception:  # noqa: BLE001 -- fall back rather than fail the whole upload
-            pass
+        except Exception as exc:  # noqa: BLE001 -- fall back rather than fail the whole upload
+            if warnings is not None:
+                warnings.append(f"tshark packet analysis failed, using fallback: {exc}")
 
     if link_layer == "802.11":
         return _analyze_dot11_fallback(path)

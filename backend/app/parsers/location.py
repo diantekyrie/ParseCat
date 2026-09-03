@@ -310,7 +310,14 @@ def parse_gnss_signal_intervals(section: Section) -> list[GnssSignalInterval]:
 
     intervals: list[GnssSignalInterval] = []
     for (start, quality, line, uids, on), (end, _q, _l, _u, _o) in zip(events, events[1:]):
-        if end < start:
+        end_cmp = end
+        # strptime("%m-%d ...") always uses year 1900, so Dec 31 -> Jan 1
+        # looks like a negative duration. That's a year wrap, not a clock
+        # correction; keep the printed MM-DD strings and only add a year
+        # for the duration math.
+        if end < start and start.month == 12 and end.month == 1:
+            end_cmp = end.replace(year=start.year + 1)
+        if end_cmp < start:
             # The battery history is not strictly monotonic. A real capture
             # stepped backwards 5 seconds mid-history (18:37:39 -> 18:37:34),
             # almost certainly a clock correction landing between two
@@ -323,7 +330,7 @@ def parse_gnss_signal_intervals(section: Section) -> list[GnssSignalInterval]:
             quality=quality,
             start_timestamp=start.strftime("%m-%d %H:%M:%S"),
             end_timestamp=end.strftime("%m-%d %H:%M:%S"),
-            duration_sec=int((end - start).total_seconds()),
+            duration_sec=int((end_cmp - start).total_seconds()),
             active_uids=uids,
             gps_active=bool(on),
             source_ref=SourceRef(section.name, line, line),

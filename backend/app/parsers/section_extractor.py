@@ -39,6 +39,13 @@ LOG_SECTION_END_RE = re.compile(r"^------ .* was the duration of '(.+?)' ------\
 # for dumpsys sections.
 LOG_SECTION_NAME_MAP = {"SYSTEM LOG": "system_log", "SYSTEM PROPERTIES": "system_properties"}
 
+# dumpstate prints the dumpsys service name, which is not always the
+# canonical key we store sections under. cpuinfo is the real service
+# name; parsers and WANTED_SECTIONS use cpu_info.
+DUMPSYS_NAME_MAP = {
+    "cpuinfo": "cpu_info",
+}
+
 # Pseudo-section name for the plain-text header block before the first
 # delimited section (Build/Build fingerprint/Bootloader/Uptime/etc.) -- it
 # has no delimiter of its own, it just ends where the first real section
@@ -115,15 +122,17 @@ def extract_sections_from_stream(text_stream, wanted_names: set[str]) -> dict[st
 
         if current is None:
             m = DUMPSYS_START_RE.match(stripped)
-            if m and m.group(2) in wanted_names:
-                current = Section(
-                    name=m.group(2),
-                    priority=m.group(1),
-                    line_start=line_no + 1,
-                    line_end=line_no + 1,
-                    kind="dumpsys",
-                )
-                continue
+            if m:
+                mapped = DUMPSYS_NAME_MAP.get(m.group(2), m.group(2))
+                if mapped in wanted_names:
+                    current = Section(
+                        name=mapped,
+                        priority=m.group(1),
+                        line_start=line_no + 1,
+                        line_end=line_no + 1,
+                        kind="dumpsys",
+                    )
+                    continue
 
             m2 = LOG_SECTION_START_RE.match(stripped)
             if m2:

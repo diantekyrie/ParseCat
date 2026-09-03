@@ -1,4 +1,6 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
+// Dated incident ordinals do not year-wrap (Dec 31 vs Jan 1 looks ~31 days); see incidentWindow.js.
+import { matchesIncidentWindow } from "./incidentWindow";
 
 const SEVERITY_COLOR = { critical: "var(--red)", warning: "var(--amber)", info: "var(--blue)" };
 const CONFIDENCE_COLOR = { HIGH: "var(--green)", MEDIUM: "var(--amber)", LOW: "var(--orange)", UNCONFIRMED: "var(--muted)" };
@@ -24,22 +26,6 @@ function searchable(value) {
 function matchesQuery(value, query) {
   const q = query.trim().toLowerCase();
   return !q || searchable(value).includes(q);
-}
-
-function timestampMinutes(timestamp) {
-  if (!timestamp) return null;
-  const match = String(timestamp).match(/\b(\d{1,2}):(\d{2})(?::\d{2}(?:\.\d+)?)?\b/);
-  if (!match) return null;
-  return Number(match[1]) * 60 + Number(match[2]);
-}
-
-function matchesIncidentWindow(timestamp, center, windowMinutes) {
-  if (!center) return true;
-  const eventMinutes = timestampMinutes(timestamp);
-  const centerMinutes = timestampMinutes(center);
-  if (eventMinutes === null || centerMinutes === null) return false;
-  const direct = Math.abs(eventMinutes - centerMinutes);
-  return Math.min(direct, 1440 - direct) <= windowMinutes;
 }
 
 function downloadText(filename, text, type = "text/plain") {

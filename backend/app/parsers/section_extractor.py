@@ -142,11 +142,12 @@ def extract_sections_from_stream(text_stream, wanted_names: set[str]) -> dict[st
                         name=mapped,
                         priority=None,
                         line_start=line_no + 1,
-                        line_end=line_end + 1 if False else line_no + 1,
+                        line_end=line_no + 1,
                         kind="log",
                     )
             continue
 
+        # We are inside a wanted section; watch for its end marker.
         end_matched = (
             DUMPSYS_END_RE.match(stripped) if current.kind == "dumpsys"
             else LOG_SECTION_END_RE.match(stripped)
@@ -154,8 +155,17 @@ def extract_sections_from_stream(text_stream, wanted_names: set[str]) -> dict[st
         if end_matched:
             current.line_end = line_no - 1
             if current.kind == "dumpsys":
+                # Keep the LAST occurrence: a fast CRITICAL/HIGH pass
+                # prints early, the full un-prioritized dump later.
                 results[current.name] = current
             elif current.name not in results:
+                # Keep the FIRST occurrence for log-style sections. A
+                # bugreport can print a second, heavily time-filtered
+                # "SYSTEM LOG" near the very end (e.g. a `-T <recent
+                # timestamp>` trailer covering only the last few
+                # seconds) reusing the same section name -- that's a
+                # small subset, not a fuller version, so overwriting
+                # with it would silently drop the real data.
                 results[current.name] = current
             current = None
             continue
@@ -163,6 +173,7 @@ def extract_sections_from_stream(text_stream, wanted_names: set[str]) -> dict[st
         current.lines.append(stripped)
 
     if current is not None:
+        # File ended mid-section (shouldn't happen in a well-formed bugreport).
         current.line_end = line_no
         results[current.name] = current
 
@@ -179,5 +190,11 @@ def extract_sections(zf: zipfile.ZipFile, wanted_names: set[str]) -> dict[str, S
     """
     entry = find_main_bugreport_entry(zf)
     with zf.open(entry) as raw:
+        # newline="\n": split ONLY on '\n', matching how every other tool
+        # (grep, the line numbers cited in a hand-inspected bugreport, etc.)
+        # counts lines. Universal-newlines mode (the default) also treats a
+        # bare '\r' as a line break, and bugreports embed plenty of stray
+        # '\r' bytes from native crash/tombstone dumps -- that silently
+        # drifts every subsequent line number and misattributes citations.
         text_stream = io.TextIOWrapper(raw, encoding="utf-8", errors="replace", newline="\n")
         return extract_sections_from_stream(text_stream, wanted_names)

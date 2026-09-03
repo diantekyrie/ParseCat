@@ -30,8 +30,8 @@ LOG_LINE_RE = re.compile(
 )
 FATAL_RE = re.compile(r"^FATAL EXCEPTION: (?P<thread>.+)$")
 PROCESS_RE = re.compile(r"^Process: (?P<pkg>[\w.\-:]+), PID: (?P<pid>\d+)$")
-EXCEPTION_RE = re.compile(r"^([\w.$]*Exception[\w.$]*|Error): ?(.*)$")
-CAUSED_BY_RE = re.compile(r"^Caused by: ([\w.$]*Exception[\w.$]*|Error): ?(.*)$")
+EXCEPTION_RE = re.compile(r"^([\w.$]*(?:Exception|Error)[\w.$]*): ?(.*)$")
+CAUSED_BY_RE = re.compile(r"^Caused by: ([\w.$]*(?:Exception|Error)[\w.$]*): ?(.*)$")
 FRAME_RE = re.compile(r"^\s*at (.+)$")
 
 MAX_BLOCK_LINES = 500  # generous cap on one crash's stack trace + all "Caused by:" links

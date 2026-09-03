@@ -12,7 +12,11 @@ from app.db import get_session
 from app.llm import list_providers
 from app.models.db_models import Capture, Device, Investigation, InvestigationCaptureLink
 from app.services.ingestion import parse_capture_file
-from app.services.persistence import persist_capture
+from app.services.persistence import (
+    DeviceIdentityMismatchError,
+    persist_capture,
+    UNVERIFIED_DEVICE_IDENTITY_WARNING,
+)
 from app.services.reasoning import diagnose, diagnose_investigation, scan_capture
 from app.services.summary import build_capture_summary, build_merged_summary, capture_severity
 
@@ -67,16 +71,24 @@ def upload_capture(
         tmp_path.unlink(missing_ok=True)
 
     clean_investigation_label = investigation_label.strip() if investigation_label else None
-    capture = persist_capture(
-        session, device_label, file.filename, parsed,
-        investigation_label=clean_investigation_label or None,
-    )
+    try:
+        capture = persist_capture(
+            session, device_label, file.filename, parsed,
+            investigation_label=clean_investigation_label or None,
+        )
+    except DeviceIdentityMismatchError as exc:
+        raise HTTPException(status_code=409, detail=exc.as_api_detail()) from exc
 
+    identity_warning = next(
+        (w for w in parsed.parse_warnings if w == UNVERIFIED_DEVICE_IDENTITY_WARNING),
+        None,
+    )
     return {
         "capture_id": capture.id,
         "device_label": device_label,
         "investigation_label": clean_investigation_label,
         "parse_warnings": parsed.parse_warnings,
+        "identity_warning": identity_warning,
         "facts_found": {
             "focus_stack_entries": len(parsed.focus_stack),
             "focus_events": len(parsed.focus_events),

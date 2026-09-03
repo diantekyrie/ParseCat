@@ -50,7 +50,98 @@ from app.models.db_models import (
     TombstoneRow,
     WifiEventRow,
 )
-from app.parsers.base import ParsedCapture
+from app.parsers.base import DeviceInfo, ParsedCapture
+
+
+# Hardware identity compared at persist time so two physical devices cannot
+# silently share a device_label (and then corroborate across captures).
+# Parsers stay ground truth; this is ingestion identity, not narration.
+DEVICE_IDENTITY_FIELDS = ("serial", "build_fingerprint", "manufacturer", "model")
+
+UNVERIFIED_DEVICE_IDENTITY_WARNING = (
+    "Cannot verify device identity for this label: capture has no serial, "
+    "build_fingerprint, manufacturer, or model to compare; persisted anyway."
+)
+
+
+class DeviceIdentityMismatchError(Exception):
+    """Refuse persist when a device_label already holds different hardware."""
+
+    def __init__(self, device_label: str, mismatched_fields: list[str]):
+        self.device_label = device_label
+        self.mismatched_fields = list(mismatched_fields)
+        self.error = "device_identity_mismatch"
+        message = (
+            "This capture's hardware identity does not match captures already "
+            "stored under this device label "
+            f"(mismatched fields: {', '.join(self.mismatched_fields)}). "
+            "Upload under a different label."
+        )
+        super().__init__(message)
+
+    def as_api_detail(self) -> dict:
+        # Field names only -- never echo serials or fingerprints.
+        return {
+            "error": self.error,
+            "message": str(self),
+            "mismatched_fields": self.mismatched_fields,
+            "device_label": self.device_label,
+        }
+
+
+def _identity_values(info: DeviceInfo | DeviceInfoRow | None) -> dict[str, str]:
+    if info is None:
+        return {}
+    values: dict[str, str] = {}
+    for field in DEVICE_IDENTITY_FIELDS:
+        raw = getattr(info, field, None)
+        if isinstance(raw, str):
+            stripped = raw.strip()
+            if stripped:
+                values[field] = stripped
+    return values
+
+
+def check_device_label_identity(session: Session, device_label: str, parsed: ParsedCapture) -> None:
+    """Compare incoming hardware identity against captures already on this label.
+
+    Mismatch of any overlapping identity field refuses persist. Incoming
+    capture with no comparable identity warns and still persists, because
+    blocking would drop partial dumps. A new label has nothing to compare.
+    """
+    device = session.exec(select(Device).where(Device.label == device_label)).first()
+    if device is None:
+        return
+
+    existing_capture_ids = session.exec(
+        select(Capture.id).where(Capture.device_id == device.id)
+    ).all()
+    if not existing_capture_ids:
+        return
+
+    incoming = _identity_values(parsed.device_info)
+    if not incoming:
+        # PC-ingestion-003: cannot compare; persist with a visible warning.
+        parsed.parse_warnings.append(UNVERIFIED_DEVICE_IDENTITY_WARNING)
+        return
+
+    existing_rows = session.exec(
+        select(DeviceInfoRow).where(DeviceInfoRow.capture_id.in_(existing_capture_ids))
+    ).all()
+
+    mismatched: list[str] = []
+    for field in DEVICE_IDENTITY_FIELDS:
+        incoming_value = incoming.get(field)
+        if not incoming_value:
+            continue
+        for row in existing_rows:
+            existing_value = _identity_values(row).get(field)
+            if existing_value and existing_value != incoming_value:
+                mismatched.append(field)
+                break
+
+    if mismatched:
+        raise DeviceIdentityMismatchError(device_label, mismatched)
 
 
 def get_or_create_device(session: Session, device_label: str) -> Device:
@@ -83,6 +174,7 @@ def persist_capture(
     captured_at: datetime | None = None,
     investigation_label: str | None = None,
 ) -> Capture:
+    check_device_label_identity(session, device_label, parsed)
     device = get_or_create_device(session, device_label)
 
     capture = Capture(

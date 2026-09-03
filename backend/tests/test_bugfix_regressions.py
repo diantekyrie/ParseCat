@@ -4,8 +4,11 @@ These do not need the gitignored real bugreport zips.
 """
 from __future__ import annotations
 
+import json
 import struct
+import subprocess
 import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 
 from app.parsers.crash_events import parse_crash_events
@@ -207,3 +210,103 @@ def test_tshark_failure_records_warning_and_falls_back(tmp_path, monkeypatch):
     assert result.backend == "fallback"
     assert warnings
     assert "tshark" in warnings[0].lower()
+
+
+
+def test_incident_window_dated_vs_same_clock_time():
+    """#9: dated stamps compare calendar days; same clock time on another day must not match.
+
+    Runs the actual frontend helper via node so this cannot drift from a Python reimplementation.
+    """
+    js = Path(__file__).resolve().parents[2] / "frontend" / "src" / "incidentWindow.js"
+    assert js.is_file(), js
+    cases = [
+        {
+            "id": "dated-same-clock-time",
+            "timestamp": "01-02 23:50",
+            "center": "01-01 23:50",
+            "window": 30,
+            "expect": False,
+        },
+        {
+            "id": "dated-jan2-0010-vs-jan1-2350-default-window",
+            "timestamp": "01-02 00:10",
+            "center": "01-01 23:50",
+            "window": 15,
+            "expect": False,
+        },
+        {
+            "id": "iso-same-clock-time",
+            "timestamp": "2026-01-02T23:50:00",
+            "center": "2026-01-01T23:50:00",
+            "window": 30,
+            "expect": False,
+        },
+        {
+            "id": "time-only-midnight-wrap",
+            "timestamp": "00:10",
+            "center": "23:50",
+            "window": 30,
+            "expect": True,
+        },
+        {
+            "id": "dated-calendar-midnight-within-30",
+            "timestamp": "01-02 00:10",
+            "center": "01-01 23:50",
+            "window": 30,
+            "expect": True,
+        },
+    ]
+    uri = js.resolve().as_uri()
+    script = (
+        "import { matchesIncidentWindow } from "
+        + json.dumps(uri)
+        + ";\n"
+        + "const cases = "
+        + json.dumps(cases)
+        + ";\n"
+        + "const out = cases.map(c => ({id: c.id, expect: c.expect, "
+        + "got: matchesIncidentWindow(c.timestamp, c.center, c.window)}));\n"
+        + "process.stdout.write(JSON.stringify(out));\n"
+    )
+    proc = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    results = json.loads(proc.stdout)
+    for row in results:
+        assert row["got"] is row["expect"], row
+
+
+DUMPSYS_CPUINFO_LINES = """\
+Load: 7.95 / 7.91 / 5.75
+CPU usage from 165681ms to 23595ms ago (2026-01-02 22:39:48.090 to 2026-01-02 22:42:10.176):
+  98% 1234/kswapd0: 27% user + 70% kernel
+  38% 1000/system_server: 21% user + 17% kernel / faults: 10 minor 1 major
+54% TOTAL: 19% user + 30% kernel + 1.5% iowait + 2.9% irq + 0.5% softirq
+""".splitlines()
+
+
+def test_cpu_snapshot_parses_dumpsys_total_without_inventing_process_fields():
+    from app.parsers.cpu import parse_cpu_snapshot
+
+    section = Section(
+        name="cpu_info", priority=None, line_start=1,
+        line_end=len(DUMPSYS_CPUINFO_LINES), lines=DUMPSYS_CPUINFO_LINES, kind="dumpsys",
+    )
+    snap = parse_cpu_snapshot(section)
+    assert snap is not None
+    assert snap.total_pct == 54.0
+    assert snap.user_pct == 19.0
+    assert snap.sys_pct == 30.0
+    assert snap.iowait_pct == 1.5
+    assert snap.irq_pct == 2.9
+    assert snap.softirq_pct == 0.5
+    assert snap.idle_pct is None
+    assert snap.threads_total is None
+    assert snap.threads_running is None
+    # dumpsys rows lack tid/user/state; do not invent ProcessCpuUsage fields
+    assert snap.top_processes == []

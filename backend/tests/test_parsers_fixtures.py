@@ -1121,7 +1121,8 @@ def test_anr_and_platform_facts_present_on_real_capture(capture1):
     if capture1.thermal_snapshot is not None:
         assert capture1.thermal_snapshot.sensors
     if capture1.cpu_load_snapshot is not None:
-        assert capture1.cpu_load_snapshot.threads_total is not None
+        # AOSP dumpsys cpuinfo TOTAL has no Threads: N total line.
+        assert capture1.cpu_load_snapshot.total_pct is not None
 
 
 def test_find_main_bugreport_entry_is_not_tied_to_pixel_naming(tmp_path):

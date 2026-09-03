@@ -1712,6 +1712,17 @@ INVESTIGATION_SYSTEM_PROMPT = SYSTEM_PROMPT + """
     "device_context" and "evidence_sources" (rules 11-12) -- when rendering
     the "## Device" and "## Evidence checked" sections, show them per
     capture/device, not merged into one.
+16. Rule 12b's "capture_coverage" object is NOT top-level in this bundle --
+    here it lives nested inside EACH entry of "captures" (captures[i].
+    capture_coverage), one per capture, because each capture has its own
+    date range. If the question names or implies a specific date, check
+    every capture entry's own capture_coverage and disclose per capture
+    whether that date falls inside/outside/in-gap for THAT capture's
+    range -- do not look for a single bundle-wide range, and do not skip
+    coverage disclosure just because it isn't at the top level. Quote each
+    capture's capture_coverage.statement verbatim the same way rule 12b
+    requires for the single-capture case; never invent or merge ranges
+    across captures.
 """
 
 

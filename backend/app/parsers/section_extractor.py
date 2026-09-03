@@ -30,8 +30,8 @@ from dataclasses import dataclass, field
 DUMPSYS_START_RE = re.compile(r"^DUMP OF SERVICE(?: (CRITICAL|HIGH))? ([\w./+\-]+):\s*$")
 DUMPSYS_END_RE = re.compile(r"^--------- .* was the duration of dumpsys ")
 
-LOG_SECTION_START_RE = re.compile(r"^------ ([\w .'\\-]+?)(?: \\(.*\\))? ------\\s*$")
-LOG_SECTION_END_RE = re.compile(r"^------ .* was the duration of '(.+?)' ------\\s*$")
+LOG_SECTION_START_RE = re.compile(r"^------ ([\w .'\-]+?)(?: \(.*\))? ------\s*$")
+LOG_SECTION_END_RE = re.compile(r"^------ .* was the duration of '(.+?)' ------\s*$")
 
 # Canonical names we use for log sections, mapped from their bugreport
 # display name (case/spacing as printed) to the lowercase key we key

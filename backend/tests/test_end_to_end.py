@@ -166,7 +166,19 @@ def test_wifi_question_surfaces_device_wide_disconnection_evidence(session):
     result = diagnose(session, capture.id, "frankel-pixel", "Did Wi-Fi drop or disconnect?")
     evidence = result["bundle"]["device_wide_wifi_evidence"]
     assert len(evidence["disconnections"]) == 3
-    assert any(d["ssid"] == "amzn-www" and d["reason_code"] == 3 for d in evidence["disconnections"])
+    assert evidence.get("confidence")
+    assert any(d.get("reason_code") == 3 for d in evidence["disconnections"])
+    for d in evidence["disconnections"]:
+        # Diagnose bundle is LLM-bound: identifiers must not ride this path (#22).
+        assert "ssid" not in d
+        assert "bssid" not in d
+        assert "mac_address" not in d
+        assert "reason_code" in d
+        assert "reason_name" in d
+
+    # SSID remains available locally for UI/summary, just not on the LLM payload.
+    summary = build_capture_summary(session, capture.id)
+    assert any(e.get("ssid") == "amzn-www" for e in summary["wifi_events"])
 
 
 def test_bt_hci_summary_persisted_and_queryable(session):
@@ -393,8 +405,15 @@ def test_ranked_findings_severity_is_computed_and_repeats_are_grouped():
     assert findings[1]["category"] == "wifi"
 
     # A device-initiated disconnect is routine -> LOW, not HIGH.
-    local = [f for f in findings if "net-b" in f["title"]]
+    # Titles no longer name SSID: ranked_findings ride the same LLM payload on scan.
+    local = [f for f in findings if f["category"] == "wifi" and "locally initiated" in f["title"]]
     assert len(local) == 1 and local[0]["severity"] == "LOW"
+    for f in findings:
+        blob = f"{f.get('title', '')} {f.get('detail', '')}"
+        assert "net-a" not in blob and "net-b" not in blob
+        assert "ssid" not in blob.lower()
+        assert "bssid" not in blob.lower()
+        assert "mac_address" not in blob.lower()
 
     # Five identical BT events collapse to one finding counted five times.
     bt = [f for f in findings if f["category"] == "bluetooth"]

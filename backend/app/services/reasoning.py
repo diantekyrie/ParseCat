@@ -198,9 +198,10 @@ numbers). Rules, no exceptions:
     fallback backend does not decode deauth/disassoc reason codes or
     detect TCP retransmissions -- never state a reason code or
     retransmission fact unless a packet_analysis entry actually contains
-    one). Frame counts, RSSI range, retry rate, SSIDs/BSSIDs, and any
-    listed anomalies in packet_analysis are real per-packet facts, not
-    inferred. If "device_wide_pairing_evidence" includes a
+    one). Frame counts, RSSI range, retry rate, and any listed anomalies
+    in packet_analysis are real per-packet facts, not inferred. SSID/BSSID
+    identity signals and anomaly MAC/BSSID fields are intentionally absent
+    from this LLM-bound packet_analysis (kept in local SQLite for UI only). If "device_wide_pairing_evidence" includes a
     "current_associations" list, that's the CDM service's OWN
     current-state record of each paired device at the moment ITS capture
     was taken -- not reconstructed from log messages, so it's the most
@@ -361,6 +362,32 @@ DEVICE_CONTEXT_LLM_FIELDS = (
     "kernel", "cpu_abi", "hardware", "build_type", "uptime", "timezone",
     "crypto_state", "verified_boot_state", "debuggable",
 )
+
+# Network / pairing identifiers may live in local SQLite for the UI, but must
+# not ride Diagnose / Scan / Investigation LLM JSON (same bar as serial via
+# DEVICE_CONTEXT_LLM_FIELDS — see #6 / #22). Applied at evidence-row build time
+# so every consumer of build_diagnosis_bundle inherits the strip.
+LLM_EVIDENCE_REDACT_KEYS = frozenset({
+    "ssid",
+    "bssid",
+    "mac_address",
+    "mac_or_ip",  # packet_analysis anomaly BSSID/MAC equivalent
+})
+
+LLM_IDENTITY_SIGNAL_REDACT_KINDS = frozenset({"ssid", "bssid"})
+
+
+def _llm_safe_evidence_row(row: dict) -> dict:
+    """Drop network-identifier keys from one LLM-bound evidence row."""
+    return {k: v for k, v in row.items() if k not in LLM_EVIDENCE_REDACT_KEYS}
+
+
+def _llm_safe_identity_signals(signals: list) -> list:
+    """Keep non-identifier packet identity signals (e.g. dns_query) only."""
+    return [
+        s for s in signals
+        if not (isinstance(s, dict) and s.get("kind") in LLM_IDENTITY_SIGNAL_REDACT_KINDS)
+    ]
 
 
 def build_entity_claim(ev: EntityVerification, history: PackageHistory | None) -> dict:
@@ -709,12 +736,14 @@ def build_diagnosis_bundle(
                 f"code and which capture it came from."
             ),
             "disconnections": [
-                {"timestamp": w.timestamp, "ssid": w.ssid, "bssid": w.bssid,
-                 "reason_code": w.reason_code, "reason_name": w.reason_name,
-                 "locally_generated": w.locally_generated,
-                 "confidence": wifi_confidence,
-                 **_capture_tag(w.capture_id),
-                 "source": {"section": w.source_section, "line_start": w.source_line_start, "line_end": w.source_line_end}}
+                _llm_safe_evidence_row({
+                    "timestamp": w.timestamp, "ssid": w.ssid, "bssid": w.bssid,
+                    "reason_code": w.reason_code, "reason_name": w.reason_name,
+                    "locally_generated": w.locally_generated,
+                    "confidence": wifi_confidence,
+                    **_capture_tag(w.capture_id),
+                    "source": {"section": w.source_section, "line_start": w.source_line_start, "line_end": w.source_line_end},
+                })
                 for w in disconnections
             ],
         }
@@ -1157,12 +1186,14 @@ def build_diagnosis_bundle(
                 "the raw text is in `detail`."
             ),
             "events": [
-                {"timestamp": e.timestamp, "level": e.level, "tag": e.tag, "kind": e.kind,
-                 "mac_address": e.mac_address, "display_name": e.display_name,
-                 "package_name": e.package_name, "association_id": e.association_id,
-                 "detail": _truncate_detail(e.detail), "confidence": pairing_confidence,
-                 **_capture_tag(e.capture_id),
-                 "source": {"section": e.source_section, "line_start": e.source_line_start, "line_end": e.source_line_end}}
+                _llm_safe_evidence_row({
+                    "timestamp": e.timestamp, "level": e.level, "tag": e.tag, "kind": e.kind,
+                    "mac_address": e.mac_address, "display_name": e.display_name,
+                    "package_name": e.package_name, "association_id": e.association_id,
+                    "detail": _truncate_detail(e.detail), "confidence": pairing_confidence,
+                    **_capture_tag(e.capture_id),
+                    "source": {"section": e.source_section, "line_start": e.source_line_start, "line_end": e.source_line_end},
+                })
                 for e in pairing_events
             ],
         }
@@ -1180,15 +1211,17 @@ def build_diagnosis_bundle(
         ).all()
         if associations:
             bundle["device_wide_pairing_evidence"]["current_associations"] = [
-                {"association_id": a.association_id, "mac_address": a.mac_address,
-                 "display_name": a.display_name, "package_name": a.package_name,
-                 "device_profile": a.device_profile, "revoked": a.revoked, "pending": a.pending,
-                 "trusted": a.trusted, "time_approved": a.time_approved,
-                 "last_time_connected": a.last_time_connected,
-                 "currently_connected": a.currently_connected,
-                 "confidence": pairing_confidence,
-                 **_capture_tag(a.capture_id),
-                 "source": {"section": a.source_section, "line_start": a.source_line_start, "line_end": a.source_line_end}}
+                _llm_safe_evidence_row({
+                    "association_id": a.association_id, "mac_address": a.mac_address,
+                    "display_name": a.display_name, "package_name": a.package_name,
+                    "device_profile": a.device_profile, "revoked": a.revoked, "pending": a.pending,
+                    "trusted": a.trusted, "time_approved": a.time_approved,
+                    "last_time_connected": a.last_time_connected,
+                    "currently_connected": a.currently_connected,
+                    "confidence": pairing_confidence,
+                    **_capture_tag(a.capture_id),
+                    "source": {"section": a.source_section, "line_start": a.source_line_start, "line_end": a.source_line_end},
+                })
                 for a in associations
             ]
         bt_rows = session.exec(
@@ -1240,8 +1273,12 @@ def build_diagnosis_bundle(
                  "rssi_min_dbm": pa_row.rssi_min_dbm, "rssi_max_dbm": pa_row.rssi_max_dbm,
                  "rssi_avg_dbm": pa_row.rssi_avg_dbm, **_capture_tag(pa_row.capture_id),
                  "frame_type_breakdown": json.loads(pa_row.frame_type_breakdown_json),
-                 "identity_signals": json.loads(pa_row.identity_signals_json),
-                 "anomalies": json.loads(pa_row.anomalies_json),
+                 "identity_signals": _llm_safe_identity_signals(
+                     json.loads(pa_row.identity_signals_json)
+                 ),
+                 "anomalies": [
+                     _llm_safe_evidence_row(a) for a in json.loads(pa_row.anomalies_json)
+                 ],
                  "note": pa_row.note}
                 for pa_row in pa_rows
             ]
@@ -1406,8 +1443,10 @@ def rank_findings(bundle: dict) -> list[dict]:
         # A disconnect the device asked for is routine; one it did not is the
         # interesting case (AP kicked us, or the link failed).
         locally = w.get("locally_generated")
+        # SSID deliberately omitted: ranked_findings ride the same LLM bundle
+        # on the scan path, and ssid is stripped from LLM-bound wifi rows (#22).
         add("HIGH" if locally is False else "LOW", "wifi",
-            f"Wi-Fi disconnect from {w.get('ssid') or 'unknown SSID'}"
+            "Wi-Fi disconnect"
             + ("" if locally is False else " (locally initiated)"),
             f"802.11 reason {w.get('reason_code')} ({w.get('reason_name')})", w)
 

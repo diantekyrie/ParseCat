@@ -1,0 +1,78 @@
+name: CI
+
+# Required checks (see branch protection): backend-tests, frontend-build.
+#
+# HONEST LIMITATION, read before trusting a green run: the richest part of
+# the backend test suite (tests/test_parsers_fixtures.py,
+# tests/test_end_to_end.py) is gated behind real bugreport fixtures
+# (backend/tests/fixtures/*.zip) that are deliberately gitignored -- they
+# are real device captures (this project's own Pixel and Galaxy S25), and
+# committing them or stashing them as CI secrets would defeat the entire
+# point of keeping them out of the repo. Those files do not exist on this
+# runner, so every test gated behind `pytestmark = pytest.mark.skipif(not
+# CAPTURE_1.exists(), ...)` is silently skipped here -- confirmed locally:
+# 35 of 113 tests actually run without the fixtures, the other 78 skip.
+# CI passing means the synthetic/regression suite is green, NOT that the
+# full corpus ran. The backend-tests job prints the real pass/skip counts
+# in its job summary specifically so a green check can never be mistaken
+# for full coverage -- run the fixture-gated suite locally before merging
+# anything that touches a parser: `cd backend && python -m pytest tests/ -q`
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install -r requirements.txt
+      - name: Run test suite (real-fixture tests skip -- see workflow header)
+        run: |
+          set +e
+          python -m pytest tests/ -v --tb=short 2>&1 | tee pytest_output.txt
+          exit_code=${PIPESTATUS[0]}
+          set -e
+
+          {
+            echo "## Backend test results"
+            echo '```'
+            tail -n 5 pytest_output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          skipped=$(grep -oE '[0-9]+ skipped' pytest_output.txt | tail -1 | grep -oE '^[0-9]+' || true)
+          if [ -n "$skipped" ] && [ "$skipped" -gt 0 ]; then
+            {
+              echo ""
+              echo "**${skipped} tests skipped** -- these are the real-device-fixture"
+              echo "regression tests. They did NOT run in CI (the fixtures are"
+              echo "gitignored real device captures, not present on this runner)."
+              echo "Run them locally before merging any parser change:"
+              echo '``cd backend && python -m pytest tests/ -q``'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          exit "$exit_code"
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+      - run: npm run build

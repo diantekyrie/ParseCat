@@ -1,0 +1,51 @@
+project: ParseCat
+detected:
+  platform: github
+  apps:
+    - name: web
+      path: frontend
+      type: web
+      tool: agent-browser
+    - name: backend
+      path: backend
+      type: api
+      tool: curl
+  environments:
+    development:
+      frontend_url: http://localhost:5173
+      backend_url: http://127.0.0.1:8000
+  preview_deployments: false
+  auth:
+    method: none
+    provider: none
+  integrations:
+    - anthropic
+    - openai
+questionnaire:
+  category_1:
+    default_target: development
+    restrictions:
+      - Read-only checks only
+  category_2:
+    role_model: single-role
+    accounts: not_applicable_no_login
+    credentials_source: infer_from_repo
+    capabilities: not_applicable_no_login
+  category_3:
+    flow_set: keep_all_detected
+    success_criteria: defaults
+    multi_persona: not_applicable
+    persistent_data_cleanup: none_read_only
+  category_4:
+    llm_mode: real_keys_only
+    credentials: github_secrets_env_vars
+  category_5:
+    cleanup: not_applicable_read_only
+  category_6:
+    imagemagick: true
+  category_7:
+    generate_github_workflow: true
+    merge_policy: required
+    video_evidence: true
+  category_8:
+    failure_learning: suggest_in_report

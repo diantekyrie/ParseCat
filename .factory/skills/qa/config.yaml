@@ -1,0 +1,71 @@
+project: ParseCat
+platform: github
+imagemagick: true
+video_evidence: true
+environments:
+  development:
+    url: http://localhost:5173
+    backend_url: http://127.0.0.1:8000
+    restrictions:
+      - Read-only checks only
+      - Do not create or mutate persistent data
+default_target: development
+auth:
+  method: api-key
+  provider: custom
+personas:
+  - name: no_auth_user
+    description: 'Unauthenticated ParseCat operator (no end-user login exists)'
+    credentials_source: env-var
+    secret_name: ANTHROPIC_API_KEY / OPENAI_API_KEY
+    test_focus:
+      - upload and parse captures
+      - scan and diagnose flows
+      - investigation correlation flows
+    cannot_do:
+      - mutate persistent data (read-only QA policy)
+apps:
+  web:
+    path_patterns:
+      - frontend/src/**
+      - frontend/index.html
+      - frontend/vite.config.js
+      - frontend/package.json
+      - frontend/package-lock.json
+    skill: qa-web
+    test_tool: agent-browser
+    build_command: cd frontend && npm run build
+  backend:
+    path_patterns:
+      - backend/app/**
+      - backend/scripts/**
+      - backend/requirements.txt
+      - backend/app/main.py
+      - backend/app/api/routes.py
+    skill: qa-backend
+    test_tool: curl
+    build_command: cd backend && pip install -r requirements.txt
+feature_flags:
+  provider: none
+  dashboard_url: ''
+  how_to_override: 'No feature-flag framework detected.'
+integrations:
+  llm_providers:
+    provider: anthropic_openai
+    mode: real_keys_only
+    env_vars:
+      - ANTHROPIC_API_KEY
+      - OPENAI_API_KEY
+    optional_env_vars:
+      - OPENAI_MODEL
+      - OPENAI_CODEX_MODEL
+cleanup:
+  auto_cleanup: false
+  strategy: none
+  instructions: 'Not applicable. QA runs are read-only by policy.'
+failure_learning: suggest_in_report
+notes:
+  preview_environment_behavior: >
+    No Vercel/Netlify preview deployment workflow was detected in this repository.
+    If preview deployments are added later, treat preview URLs as development
+    environment targets using development data/keys, not production flows.

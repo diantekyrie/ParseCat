@@ -1,0 +1,45 @@
+name: Claude QA Reviewer
+
+# Cat QA, triggered by "@claude-qa" mentions or a "qa-review" label --
+# structurally read-only, not just instructed to be. `permissions:` below
+# has no `contents: write` at all, so even if the model tried to commit
+# code, the GitHub token it's given cannot push -- the boundary is
+# enforced by GitHub's own permission system, not just the system prompt.
+#
+# This is the "Cat QA" role: finds regressions/coverage gaps, comments on
+# issues/PRs, but never edits code and never merges anything. See
+# .claude/agents/parsecat-qa.md for the full persona.
+#
+# Setup still needed: same Claude GitHub App + secret as claude.yml (see
+# that file's header) -- both workflows share the same authentication.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, labeled]
+
+jobs:
+  claude-qa-review:
+    # Only fires on the qa trigger phrase/label -- avoid double-triggering
+    # alongside claude.yml's broader @claude mention on the same event.
+    if: |
+      contains(github.event.comment.body, '@claude-qa') ||
+      contains(github.event.issue.labels.*.name, 'qa-review')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+    steps:
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          trigger_phrase: "@claude-qa"
+          label_trigger: "qa-review"
+          claude_args: |
+            --allowedTools Read,Grep,Glob,Bash
+            --disallowedTools Edit,Write

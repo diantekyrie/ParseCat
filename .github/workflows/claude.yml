@@ -1,0 +1,43 @@
+name: Claude Code Assistant
+
+# General-purpose Claude, triggered by @claude mentions on issues/PRs, or
+# by assigning an issue to the "claude" label. Full read/write -- this is
+# the "Whiskers" (engineer) role: can edit code, commit, push, open PRs.
+# It cannot push to `main` directly (branch protection on main requires
+# backend-tests + frontend-build to pass, and this action always works
+# through a branch + PR like any other contributor).
+#
+# Setup still needed (not done by this file):
+#   1. Install the Claude GitHub App: https://github.com/apps/claude
+#   2. Add a repo secret: ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN
+#      for Pro/Max/Team/Enterprise plan users, via `claude setup-token`)
+#
+# See .claude/agents/parsecat-engineer.md for the persona/guardrails this
+# role should follow -- reference it explicitly in your @claude prompt if
+# you want the full engineering rules applied (e.g. "@claude, acting as
+# parsecat-engineer, fix issue #42").
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned, labeled]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  claude-response:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    steps:
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          assignee_trigger: "claude"
+          label_trigger: "claude"

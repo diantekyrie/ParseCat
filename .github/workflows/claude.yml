@@ -45,6 +45,11 @@ jobs:
       pull-requests: write
       issues: write
       actions: read
+      # Required by the action's own auth flow (fetches a short-lived OIDC
+      # token) -- unrelated to repo content access, confirmed by testing:
+      # the run failed with "Could not fetch an OIDC token" until this was
+      # added, on a workflow whose contents permission was already write.
+      id-token: write
     steps:
       - uses: anthropics/claude-code-action@v1
         with:

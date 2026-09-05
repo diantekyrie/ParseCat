@@ -20,12 +20,22 @@ on:
     types: [created]
   issues:
     types: [opened, labeled]
+  # Manual test trigger -- see claude.yml for why comment/label triggers
+  # can't fire until this workflow is merged to the default branch.
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Test prompt for Cat QA to act on"
+        required: true
+        default: "Reply confirming you can read this repo in read-only mode, then stop. Make no changes."
 
 jobs:
   claude-qa-review:
     # Only fires on the qa trigger phrase/label -- avoid double-triggering
     # alongside claude.yml's broader @claude mention on the same event.
+    # Manual dispatch always passes (no comment/label exists to check).
     if: |
+      github.event_name == 'workflow_dispatch' ||
       contains(github.event.comment.body, '@claude-qa') ||
       contains(github.event.issue.labels.*.name, 'qa-review')
     runs-on: ubuntu-latest
@@ -40,6 +50,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           trigger_phrase: "@claude-qa"
           label_trigger: "qa-review"
+          prompt: ${{ github.event_name == 'workflow_dispatch' && inputs.prompt || '' }}
           claude_args: |
             --allowedTools Read,Grep,Glob,Bash
             --disallowedTools Edit,Write

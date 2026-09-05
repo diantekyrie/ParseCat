@@ -26,6 +26,16 @@ on:
     types: [opened, assigned, labeled]
   pull_request_review:
     types: [submitted]
+  # Manual test trigger -- issue_comment/issues/pull_request_review* events
+  # are resolved from the repo's DEFAULT branch, so real @claude mentions
+  # can't fire until this workflow is merged. workflow_dispatch lets it be
+  # smoke-tested from an unmerged branch first.
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Test prompt for Claude to act on"
+        required: true
+        default: "Reply with a one-sentence confirmation that you can read this repo, then stop. Make no changes."
 
 jobs:
   claude-response:
@@ -41,3 +51,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           assignee_trigger: "claude"
           label_trigger: "claude"
+          # Only set on manual (workflow_dispatch) test runs -- mention/
+          # assignment/label triggers derive their own prompt from the
+          # comment/issue body and must not have this override applied.
+          prompt: ${{ github.event_name == 'workflow_dispatch' && inputs.prompt || '' }}

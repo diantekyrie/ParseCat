@@ -14,15 +14,14 @@ expecting `[stub LLM ...]` output.
 Found live TWICE now, same root cause each time: first when
 test_api_user_flows.py (imports app.main) made
 test_end_to_end.py::test_diagnose_returns_confidence_tied_to_corroboration
-fail via ANTHROPIC_API_KEY/OPENAI_API_KEY leaking in; then again on this
-very branch after adding the "openrouter" provider (app/llm/__init__.py) as
-a THIRD auto-detection fallback -- a real OPENROUTER_API_KEY added to
-backend/.env for manual testing was not covered by this fixture's original
-two-key list, so the very same test failed again, this time routed to a
-real OpenRouter call instead of falling through to Stub. Any future
-provider added to the no-selection auto-detection chain in get_llm_client()
-needs its env var added here too, or this same failure mode WILL recur a
-third time.
+fail via ANTHROPIC_API_KEY/OPENAI_API_KEY leaking in; then again after
+adding the "openrouter" provider (app/llm/__init__.py) as a THIRD
+auto-detection fallback -- a real OPENROUTER_API_KEY added to backend/.env
+for manual testing was not covered by this fixture's original two-key list,
+so the very same test failed again, this time routed to a real OpenRouter
+call instead of falling through to Stub. Any future provider added to the
+no-selection auto-detection chain in get_llm_client() needs its env var
+added here too, or this same failure mode WILL recur a third time.
 
 Fix: strip all three keys from the environment before any test body
 executes, session-wide, regardless of which file happens to import app.main

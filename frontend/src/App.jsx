@@ -262,6 +262,46 @@ function CoverageNotice({ coverage }) {
   );
 }
 
+// Issue #28: nothing in the UI disclosed that Diagnose/Scan can send the
+// extracted fact bundle to a third-party LLM. get_llm_client() in the
+// backend defaults to the first configured live provider (Anthropic, then
+// OpenAI) even when the user never touches the "Narrated by" dropdown --
+// so this can't just be a note next to the dropdown, it has to cover the
+// no-selection default case too. Only the structured facts bundle is sent,
+// never the raw log file; the Stub provider never leaves this machine.
+function PrivacyNotice({ providers, provider }) {
+  const liveProviders = providers.filter((p) => p.id !== "stub" && p.available);
+  if (liveProviders.length === 0) return null; // only Stub configured -- nothing leaves this machine
+
+  if (provider === "stub") {
+    return (
+      <div className="privacy-notice">
+        <strong>Data leaving this machine</strong>
+        <p className="muted small">
+          "Narrated by" is set to Stub — nothing is sent anywhere for this request. Facts are echoed
+          back exactly as extracted, with no LLM call at all.
+        </p>
+      </div>
+    );
+  }
+
+  const selected = providers.find((p) => p.id === provider && p.available && p.id !== "stub");
+  const activeLabel = selected
+    ? selected.label
+    : liveProviders.map((p) => p.label).join(" or ") + " (whichever has a key configured)";
+
+  return (
+    <div className="privacy-notice">
+      <strong>Data leaving this machine</strong>
+      <p className="muted small">
+        Diagnose and Scan send the extracted fact bundle shown above — never the raw log file — to{" "}
+        {activeLabel} for narration, unless you switch "Narrated by" to Stub (no LLM, echoes facts),
+        which stays fully local. API keys and uploaded files never leave this machine either way.
+      </p>
+    </div>
+  );
+}
+
 function TriageControls({
   appFilter,
   setAppFilter,
@@ -940,6 +980,8 @@ export default function App() {
                 </div>
               )}
             </div>
+
+            <PrivacyNotice providers={providers} provider={provider} />
 
             {askScope === "device" && summary && c && (
               <div className="severity-strip">

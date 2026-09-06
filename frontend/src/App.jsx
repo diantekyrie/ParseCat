@@ -17,15 +17,24 @@ async function api(path, opts) {
     const text = await res.text();
     // FastAPI errors are usually {"detail": "..."}; show that plain string in
     // the red .error banner instead of raw JSON (issue #31 upload rejects).
+    //
+    // Follow-up to #32: the original version of this did the JSON.parse
+    // inside a try and used the catch block as control flow to decide
+    // whether to re-throw. That meant any JSON.parse failure (a non-JSON
+    // error body -- a raw 500, a proxy's HTML error page, an empty body)
+    // produced a SyntaxError like "Unexpected token 'I', "Internal S"...
+    // is not valid JSON" in the banner instead of falling through to the
+    // intended plain-text fallback below. Parsing is now isolated from the
+    // control flow so a non-JSON body always falls through to `text`.
+    let detail;
     try {
-      const parsed = JSON.parse(text);
-      const detail = parsed?.detail;
-      if (typeof detail === "string" && detail.trim()) throw new Error(detail);
-      if (detail && typeof detail === "object" && typeof detail.message === "string") {
-        throw new Error(detail.message);
-      }
-    } catch (e) {
-      if (e instanceof Error && e.message !== text) throw e;
+      detail = JSON.parse(text)?.detail;
+    } catch {
+      detail = undefined;
+    }
+    if (typeof detail === "string" && detail.trim()) throw new Error(detail);
+    if (detail && typeof detail === "object" && typeof detail.message === "string") {
+      throw new Error(detail.message);
     }
     throw new Error(text);
   }

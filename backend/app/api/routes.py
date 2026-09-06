@@ -11,7 +11,7 @@ from sqlmodel import Session, select
 from app.db import get_session
 from app.llm import list_providers
 from app.models.db_models import Capture, Device, Investigation, InvestigationCaptureLink
-from app.services.ingestion import parse_capture_file
+from app.services.ingestion import empty_bugreport_rejection_message, parse_capture_file
 from app.services.persistence import (
     DeviceIdentityMismatchError,
     persist_capture,
@@ -69,6 +69,14 @@ def upload_capture(
         raise HTTPException(422, f"Failed to parse upload: {exc}") from exc
     finally:
         tmp_path.unlink(missing_ok=True)
+
+    # PC-ux-003 / #31: empty .txt (or plain logcat with no bugreport sections)
+    # must not become a successful capture row — surface as upload failure so
+    # the UI blocking .error banner fires. Parser still produced the diagnostic
+    # warning; we refuse to persist it.
+    reject = empty_bugreport_rejection_message(parsed)
+    if reject:
+        raise HTTPException(status_code=422, detail=reject)
 
     clean_investigation_label = investigation_label.strip() if investigation_label else None
     try:

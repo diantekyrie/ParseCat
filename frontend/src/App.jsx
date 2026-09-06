@@ -13,7 +13,22 @@ const TABS = [
 
 async function api(path, opts) {
   const res = await fetch(`/api${path}`, opts);
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) {
+    const text = await res.text();
+    // FastAPI errors are usually {"detail": "..."}; show that plain string in
+    // the red .error banner instead of raw JSON (issue #31 upload rejects).
+    try {
+      const parsed = JSON.parse(text);
+      const detail = parsed?.detail;
+      if (typeof detail === "string" && detail.trim()) throw new Error(detail);
+      if (detail && typeof detail === "object" && typeof detail.message === "string") {
+        throw new Error(detail.message);
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message !== text) throw e;
+    }
+    throw new Error(text);
+  }
   return res.json();
 }
 

@@ -352,6 +352,33 @@ def _decode_txt_upload(raw: bytes) -> str:
 # Standard `logcat -v threadtime` line shape, used only to tell a plain
 # logcat capture apart from an actually-malformed upload when neither has
 # any bugreport section markers.
+
+# Upload-time rejection (issue #31 / PC-ux-003): the parser correctly detects
+# "no bugreport content" and records a single clear warning, but historically
+# upload_capture still persisted that empty ParsedCapture as a successful
+# capture (HTTP 200). Soft Overview warnings are not a blocking upload error.
+# These prefixes mark the short-circuit empty paths in parse_bugreport_txt —
+# raise them at the API boundary instead of persisting.
+_EMPTY_BUGREPORT_WARNING_MARKERS = (
+    "No recognized bugreport section markers found in this file at all",
+    "This looks like a plain logcat capture",
+)
+
+
+def empty_bugreport_rejection_message(parsed: "ParsedCapture") -> str | None:
+    """Return a user-facing reject reason if this parse has no bugreport content.
+
+    Parser ground truth stays in parse_warnings; callers (upload) decide to
+    refuse persistence. Returns None for real/partial bugreport parses and
+    for pcap-only captures.
+    """
+    for warning in parsed.parse_warnings:
+        for marker in _EMPTY_BUGREPORT_WARNING_MARKERS:
+            if marker in warning:
+                return warning
+    return None
+
+
 _THREADTIME_LINE_RE = re.compile(r"^\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\s+\d+\s+\d+\s+[VDIWEF]\s")
 
 

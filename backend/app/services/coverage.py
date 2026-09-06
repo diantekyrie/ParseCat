@@ -70,6 +70,19 @@ _DAY_MONTH_RE = re.compile(
 # incident-window helper (dated ordinals do not year-wrap).
 _ARITHMETIC_YEAR = 2026
 
+# Relative time phrases (issue #36). Resolved against the loaded captures'
+# OWN most recent dated event -- never real wall-clock "now" -- matching
+# this system's core rule that a date claim must be grounded in the
+# capture's own data, not the outside world. A bugreport pulled months ago
+# has "last week" mean the week before that phone's own last activity.
+_RELATIVE_LAST_N_DAYS_RE = re.compile(r"\b(?:last|past)\s+(\d+)\s+days?\b", re.IGNORECASE)
+_RELATIVE_YESTERDAY_RE = re.compile(r"\byesterday\b", re.IGNORECASE)
+_RELATIVE_TODAY_RE = re.compile(r"\btoday\b", re.IGNORECASE)
+_RELATIVE_LAST_WEEK_RE = re.compile(r"\b(?:last|previous)\s+week\b", re.IGNORECASE)
+_RELATIVE_THIS_WEEK_RE = re.compile(r"\bthis\s+week\b", re.IGNORECASE)
+_RELATIVE_LAST_MONTH_RE = re.compile(r"\b(?:last|previous)\s+month\b", re.IGNORECASE)
+_RELATIVE_THIS_MONTH_RE = re.compile(r"\bthis\s+month\b", re.IGNORECASE)
+
 
 @dataclass(frozen=True)
 class CalendarDay:
@@ -163,6 +176,90 @@ def parse_question_date(question: str) -> dict:
         return {"parse": "unparsed", "day": None, "display": None}
 
     return {"parse": "absent", "day": None, "display": None}
+
+
+_RELATIVE_PHRASES: tuple[tuple[re.Pattern, str], ...] = (
+    (_RELATIVE_LAST_N_DAYS_RE, "last N days"),
+    (_RELATIVE_YESTERDAY_RE, "yesterday"),
+    (_RELATIVE_TODAY_RE, "today"),
+    (_RELATIVE_LAST_WEEK_RE, "last week"),
+    (_RELATIVE_THIS_WEEK_RE, "this week"),
+    (_RELATIVE_LAST_MONTH_RE, "last month"),
+    (_RELATIVE_THIS_MONTH_RE, "this month"),
+)
+
+
+def parse_relative_question_range(question: str, anchor: CalendarDay | None) -> dict | None:
+    """Resolve a relative time phrase ("last week", "yesterday", "last N
+    days", ...) into a concrete [start, end] CalendarDay range, anchored to
+    `anchor` -- the loaded captures' own most recent dated event. See the
+    module-level comment by the regexes above for why the anchor is never
+    real wall-clock "now".
+
+    Returns None if no relative phrase is found in the question at all.
+    If a phrase IS found but there's no anchor to resolve it against (no
+    dated capture data whatsoever), returns {"phrase": ..., "start": None,
+    "end": None, "anchorless": True} so the caller can still name which
+    phrase was seen instead of silently doing nothing (parse_question_date
+    doesn't need this distinction since a literal date needs no anchor).
+    """
+    if not question or not str(question).strip():
+        return None
+
+    n_days_match = _RELATIVE_LAST_N_DAYS_RE.search(question)
+    matched_phrase = None
+    if n_days_match:
+        matched_phrase = f"last {n_days_match.group(1)} days"
+    else:
+        for rx, phrase in _RELATIVE_PHRASES[1:]:  # skip last-N-days, handled above
+            if rx.search(question):
+                matched_phrase = phrase
+                break
+    if matched_phrase is None:
+        return None
+
+    if anchor is None:
+        return {"phrase": matched_phrase, "start": None, "end": None, "anchorless": True}
+
+    anchor_d = anchor.as_date()
+    yearless = anchor.year is None
+
+    def _day(d: date) -> CalendarDay:
+        return CalendarDay(d.month, d.day, None if yearless else d.year)
+
+    if n_days_match:
+        n = int(n_days_match.group(1))
+        start = anchor_d - timedelta(days=n - 1)
+        return {"phrase": matched_phrase, "start": _day(start), "end": _day(anchor_d), "anchorless": False}
+
+    if _RELATIVE_YESTERDAY_RE.search(question):
+        d = anchor_d - timedelta(days=1)
+        return {"phrase": matched_phrase, "start": _day(d), "end": _day(d), "anchorless": False}
+
+    if _RELATIVE_TODAY_RE.search(question):
+        return {"phrase": matched_phrase, "start": _day(anchor_d), "end": _day(anchor_d), "anchorless": False}
+
+    if _RELATIVE_LAST_WEEK_RE.search(question):
+        this_week_start = anchor_d - timedelta(days=anchor_d.weekday())
+        last_week_start = this_week_start - timedelta(days=7)
+        last_week_end = this_week_start - timedelta(days=1)
+        return {"phrase": matched_phrase, "start": _day(last_week_start), "end": _day(last_week_end), "anchorless": False}
+
+    if _RELATIVE_THIS_WEEK_RE.search(question):
+        this_week_start = anchor_d - timedelta(days=anchor_d.weekday())
+        return {"phrase": matched_phrase, "start": _day(this_week_start), "end": _day(anchor_d), "anchorless": False}
+
+    if _RELATIVE_LAST_MONTH_RE.search(question):
+        first_of_this_month = anchor_d.replace(day=1)
+        last_of_prev_month = first_of_this_month - timedelta(days=1)
+        first_of_prev_month = last_of_prev_month.replace(day=1)
+        return {"phrase": matched_phrase, "start": _day(first_of_prev_month), "end": _day(last_of_prev_month), "anchorless": False}
+
+    if _RELATIVE_THIS_MONTH_RE.search(question):
+        first_of_this_month = anchor_d.replace(day=1)
+        return {"phrase": matched_phrase, "start": _day(first_of_this_month), "end": _day(anchor_d), "anchorless": False}
+
+    return None  # unreachable: matched_phrase implies one of the branches above fired
 
 
 _EVENT_TS_SOURCES: list[tuple[type, tuple[str, ...]]] = [
@@ -307,6 +404,74 @@ def _per_capture_phrase(dated: list[dict]) -> str:
     return " and ".join(bits)
 
 
+def _range_overlaps_gaps(start_d: date, end_d: date, gaps: list[dict]) -> bool:
+    for gap in gaps:
+        gap_first = parse_timestamp_day(gap["gap_first_date"])
+        gap_last = parse_timestamp_day(gap["gap_last_date"])
+        if gap_first and gap_last and start_d <= gap_last.as_date() and end_d >= gap_first.as_date():
+            return True
+    return False
+
+
+def _build_relative_range_coverage(coverage: dict, relative: dict, dated: list[dict], gaps: list[dict]) -> dict:
+    phrase = relative["phrase"]
+    coverage["question_relative_phrase"] = phrase
+
+    if relative["anchorless"]:
+        coverage["relation"] = "unknown"
+        coverage["statement"] = (
+            f'The question refers to "{phrase}", but loaded captures have no timestamped '
+            f"events to anchor that phrase to, so its coverage cannot be determined."
+        )
+        return coverage
+
+    start_day: CalendarDay = relative["start"]
+    end_day: CalendarDay = relative["end"]
+    coverage["question_range"] = {"start": start_day.display(), "end": end_day.display(), "phrase": phrase}
+    window_phrase = f'"{phrase}" ({start_day.display()} through {end_day.display()})'
+
+    if not dated:
+        coverage["relation"] = "unknown"
+        coverage["statement"] = (
+            f"The question refers to {window_phrase}, but loaded captures have no timestamped "
+            f"events, so coverage cannot be determined."
+        )
+        return coverage
+
+    start_d, end_d = start_day.as_date(), end_day.as_date()
+    overall_min_d = min(s["_first"].as_date() for s in dated)
+    overall_max_d = max(s["_last"].as_date() for s in dated)
+    overlapping = [s for s in dated if not (end_d < s["_first"].as_date() or start_d > s["_last"].as_date())]
+
+    if not overlapping:
+        coverage["relation"] = "outside"
+        coverage["statement"] = (
+            f"The question refers to {window_phrase}, which falls entirely outside loaded "
+            f"captures ({_range_phrase(dated)}). Nothing from that window was checked."
+        )
+        return coverage
+
+    fully_inside = (
+        start_d >= overall_min_d
+        and end_d <= overall_max_d
+        and not _range_overlaps_gaps(start_d, end_d, gaps)
+    )
+    if fully_inside:
+        coverage["relation"] = "inside"
+        coverage["statement"] = (
+            f"The question refers to {window_phrase}, which is covered by loaded captures "
+            f"({_range_phrase(dated)}). This window was checked in the loaded captures."
+        )
+    else:
+        coverage["relation"] = "partial"
+        coverage["statement"] = (
+            f"The question refers to {window_phrase}, which only partially overlaps loaded "
+            f"captures ({_range_phrase(dated)}); part of that window falls outside what was "
+            f"captured. Only the overlapping portion was actually checked."
+        )
+    return coverage
+
+
 def build_capture_coverage(
     session: Session, captures: list[Capture], question: str,
 ) -> dict:
@@ -316,9 +481,12 @@ def build_capture_coverage(
     gaps = _coverage_gaps(dated)
 
     overall_first = overall_last = None
+    overall_last_day: CalendarDay | None = None
     if dated:
         overall_first = min(dated, key=lambda s: s["_first"].as_date())["_first"].display()
-        overall_last = max(dated, key=lambda s: s["_last"].as_date())["_last"].display()
+        last_span = max(dated, key=lambda s: s["_last"].as_date())
+        overall_last = last_span["_last"].display()
+        overall_last_day = last_span["_last"]
 
     coverage = {
         "captures": [_public_span(s) for s in spans],
@@ -332,7 +500,12 @@ def build_capture_coverage(
     }
 
     if parsed["parse"] == "absent":
-        return coverage
+        # No literal date -- try a relative phrase ("last week", "yesterday",
+        # ...) anchored to the captures' own last dated event before giving up.
+        relative = parse_relative_question_range(question, overall_last_day)
+        if relative is None:
+            return coverage
+        return _build_relative_range_coverage(coverage, relative, dated, gaps)
 
     if parsed["parse"] == "unparsed":
         coverage["statement"] = (

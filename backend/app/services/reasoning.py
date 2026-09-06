@@ -290,6 +290,18 @@ numbers). Rules, no exceptions:
     If "relation" is "inside", the requested date WAS covered; do not
     imply a coverage gap. If "question_date_parse" is "unparsed", say the
     date could not be parsed and make no coverage claim.
+12c. A relative time phrase in the question ("yesterday", "last week",
+    "this month", "last N days", ...) is resolved the same way a literal
+    date is: against the loaded captures' own most recent event, never
+    against today's real wall-clock date -- a bugreport pulled months ago
+    has "last week" mean the week before THAT PHONE's own last activity.
+    When this applies, "capture_coverage" carries "question_relative_phrase"
+    (the phrase matched) and "question_range" ({"start", "end", "phrase"})
+    instead of "question_date". Quote "statement" verbatim exactly as rule
+    12b requires -- it already names the resolved window in the phrase's
+    own words. "relation" may additionally be "partial" here: the window
+    only partly overlaps loaded captures, so say only the overlapping part
+    was actually checked -- do not claim the whole window was covered.
 13. Structure every report with these sections, in this order, using
     markdown headings (##):
     - "## Direct answer" -- if capture_coverage.statement is present, open
@@ -1316,13 +1328,15 @@ def build_diagnosis_bundle(
             })
     coverage = bundle.get("capture_coverage") or {}
     if coverage.get("statement"):
+        if coverage.get("question_relative_phrase"):
+            reason = f'question referenced a relative time phrase ("{coverage["question_relative_phrase"]}")'
+        elif coverage.get("question_date_parse") == "parsed":
+            reason = "question named a calendar date"
+        else:
+            reason = "question looked date-specific but the date could not be parsed"
         evidence_sources.append({
             "category": "capture date coverage",
-            "reason": (
-                "question named a calendar date"
-                if coverage.get("question_date_parse") == "parsed"
-                else "question looked date-specific but the date could not be parsed"
-            ),
+            "reason": reason,
             "detail": coverage["statement"],
         })
     bundle["evidence_sources"] = evidence_sources

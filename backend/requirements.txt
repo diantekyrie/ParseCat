@@ -1,11 +1,28 @@
-fastapi>=0.110
+# Floors below are bumped past specific known CVEs, not just "latest":
+# fastapi>=0.115.8   -- CVE-2026-2978 (RCE, CVSS 9.8), fixed in 0.115.8
+# starlette>=0.49.1  -- CVE-2025-54121 (multipart upload DoS, blocks the event
+#                       thread while spooling large files -- directly relevant,
+#                       this app accepts multi-hundred-MB bugreport uploads)
+#                       and CVE-2025-62727 (Range-header DoS), fixed 0.47.2 /
+#                       0.49.1 respectively; pinned explicitly since it's only
+#                       a transitive fastapi dependency otherwise
+# python-multipart>=0.0.22 -- CVE-2024-53981 (ReDoS/excessive logging, fixed
+#                       0.0.18) and CVE-2026-24486 (path traversal via
+#                       UPLOAD_KEEP_FILENAME, fixed 0.0.22 -- not reachable via
+#                       this app's upload route today, bumped anyway)
+# pytest>=9.0.3      -- CVE-2025-71176 (predictable /tmp dir, local
+#                       priv-esc/DoS on shared multi-user machines); low
+#                       relevance to this project's actual environments but
+#                       costs nothing to close
+fastapi>=0.115.8
+starlette>=0.49.1
 uvicorn[standard]>=0.27
 sqlmodel>=0.0.16
 pydantic>=2.6
-python-multipart>=0.0.9
+python-multipart>=0.0.22
 anthropic>=0.25.0
 openai>=1.30.0
 python-dotenv>=1.0.1
-pytest>=8.0
+pytest>=9.0.3
 httpx>=0.27
 scapy>=2.6.0

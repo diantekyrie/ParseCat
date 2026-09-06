@@ -47,10 +47,21 @@ def client():
     app.dependency_overrides.clear()
 
 
+# A real "------ SECTION ------" header/footer pair, not just plain
+# threadtime-shaped lines -- since #31/#32, a .txt with NO recognized
+# bugreport section marker (including a bare plain-logcat dump) is
+# rejected with 422 at upload time rather than persisted with a warning.
+# This is the minimal shape that clears empty_bugreport_rejection_message().
+_MINIMAL_BUGREPORT_TXT = """\
+------ SYSTEM LOG (logcat -v threadtime -v printable -v uid -d *:v) ------
+09-02 01:31:53.866  1145  1145 D keystore2: debug line 0
+09-02 01:31:54.866  1145  1145 D keystore2: debug line 1
+------ 0.326s was the duration of 'SYSTEM LOG' ------
+"""
+
+
 def _upload_txt(client, label, filename="logcat.txt", body=None, investigation_label=None):
-    body = body or "\n".join(
-        f"09-02 01:31:5{i}.866  1145  1145 D keystore2: debug line {i}" for i in range(5)
-    )
+    body = body if body is not None else _MINIMAL_BUGREPORT_TXT
     data = {"device_label": label}
     if investigation_label:
         data["investigation_label"] = investigation_label
@@ -84,11 +95,14 @@ def test_upload_unsupported_extension_is_rejected(client):
     assert ".zip" in resp.json()["detail"]
 
 
-def test_upload_unrecognizable_txt_still_succeeds_with_a_warning(client):
-    # Case 1.3 -- must not be a silent, warning-free "success" either
+def test_upload_unrecognizable_txt_is_rejected_not_silently_persisted(client):
+    # Case 1.3 -- superseded by #31/#32: this used to assert a silent 200
+    # with a soft warning, but the deliberate fix for #31 made this a
+    # blocking upload error instead (PC-ux-003). Updated to match the new,
+    # intended contract rather than the old one.
     resp = _upload_txt(client, "Pixel", body="just some random notes, not a log file")
-    assert resp.status_code == 200
-    assert resp.json()["parse_warnings"], "expected an explanatory parse warning"
+    assert resp.status_code == 422
+    assert "No recognized bugreport section markers" in resp.json()["detail"]
 
 
 def test_upload_corrupt_zip_returns_422(client):

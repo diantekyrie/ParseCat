@@ -19,7 +19,7 @@ Legend: 🟢 automated as a real HTTP request (`backend/tests/test_api_user_flow
 |---|-----|-----------|------------------|
 | 1.1 | web/api | Upload a valid `.txt` logcat with a device label | Capture appears with an ID, filename, and non-zero facts-found counts | 🟢
 | 1.2 | api | Upload with an unsupported extension (`.log`, `.pdf`) | `400` — "Expected one of: .zip, .txt, .pcap, .pcapng" | 🟢
-| 1.3 | api | Upload a `.txt` file with content that isn't a bugreport or logcat (random text) | `200` with an explanatory `parse_warnings` entry, not a crash or empty silent success | 🟢
+| 1.3 | api | Upload a `.txt` file with content that isn't a bugreport or logcat (random text) | `422` blocking upload error naming the reason (no recognized bugreport section markers); capture is **not** persisted — no capture row, no silent 200 (superseded by the #31 fix: this used to be a soft-accept, now it's a hard reject) | 🟢
 | 1.4 | api | Upload a corrupt/empty `.zip` claiming to be a bugreport | `422` — "Failed to parse upload: ..." | 🟢
 | 1.5 | web | Upload with no device label filled in | Upload button stays disabled — request never fires | ⬜
 | 1.6 | web | Select multiple files, upload in one action | Progress text updates per file; the last-uploaded capture becomes selected | ⬜

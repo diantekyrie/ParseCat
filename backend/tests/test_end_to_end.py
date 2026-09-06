@@ -143,7 +143,7 @@ def test_explicit_provider_selection_is_honored_and_reported_back(session):
 
 def test_list_providers_reports_availability_from_env():
     ids = {p["id"] for p in list_providers()}
-    assert ids == {"anthropic", "openai", "openai-codex", "stub"}
+    assert ids == {"anthropic", "openai", "openai-codex", "openrouter", "stub"}
     stub = next(p for p in list_providers() if p["id"] == "stub")
     assert stub["available"] is True  # never requires a key
 

@@ -98,11 +98,30 @@ def extract_candidate_packages(question: str, known_packages: list[str]) -> list
     # words -- substring matching let three-letter words like "and" falsely
     # match inside "android", which is exactly the kind of unverified
     # inference this pass exists to avoid.
-    ordered_words = [
-        w.lower() for w in re.findall(r"[A-Za-z]+", question)
-        if len(w) > 2 and w.lower() not in STOPWORDS
+    #
+    # Two separate word lists on purpose, found live via "Pokemon Go" (issue
+    # #39): "the Pokemon Go app...", "The Pokemon app..." both matched ZERO
+    # installed packages even though com.nianticlabs.pokemongo was on the
+    # capture. Root cause: the len>2 floor dropped "Go" before adjacency was
+    # ever tried, so "pokemon"+"go" -> "pokemongo" (the package's real
+    # segment) never got attempted. `words` (fed into the single-word/2-hit
+    # paths below) deliberately keeps that len>2 floor -- those paths trust a
+    # much weaker signal and short tokens there risk noisy accidental
+    # matches. `concat_words` has no length floor, only the digit/letter and
+    # stopword filters, because concatenation is inherently a stronger
+    # signal already (it still requires an EXACT full-segment match) -- a
+    # short token can only ever match by forming a real, exact, meaningful
+    # segment together with its neighbor(s), the same reasoning that already
+    # justified trusting a 2-word concat match on its own.
+    #
+    # `[A-Za-z0-9]+` (not `[A-Za-z]+`) also keeps digits, so a brand like
+    # "8 Ball Pool" can reconstruct a segment like "8ball" -- the old
+    # letters-only regex silently dropped the "8" before matching started.
+    concat_words = [
+        w.lower() for w in re.findall(r"[A-Za-z0-9]+", question)
+        if w.lower() not in STOPWORDS
     ]
-    words = set(ordered_words)
+    words = {w for w in concat_words if len(w) > 2}
 
     # Two-word brand names often collapse into a single package segment with
     # no separator ("Disney Plus" -> "disneyplus", "Proton VPN" ->
@@ -113,8 +132,15 @@ def extract_candidate_packages(question: str, known_packages: list[str]) -> list
     # segments too; a single such match is trusted on its own (concatenating
     # two specific words and landing on an exact real segment is not the
     # kind of coincidence three-letter substring matching produced).
+    #
+    # Three-word concatenation too -- the pairwise-only version had no path
+    # at all for a brand needing three words to reconstruct its segment.
     adjacent_concat = {
-        ordered_words[i] + ordered_words[i + 1] for i in range(len(ordered_words) - 1)
+        concat_words[i] + concat_words[i + 1] for i in range(len(concat_words) - 1)
+    }
+    adjacent_concat |= {
+        concat_words[i] + concat_words[i + 1] + concat_words[i + 2]
+        for i in range(len(concat_words) - 2)
     }
 
     all_segments = [

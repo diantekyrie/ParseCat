@@ -21,7 +21,7 @@ Paste exact commands and results here.
 
 ## QA handoff
 
-- Journey/test case:
+- Journey/test case: (PC-* ID from the ParseCat Test Cases — Unified Google Sheet)
 - Fixture corpus: not needed | maintainer must run locally
 - Remaining risk:
 

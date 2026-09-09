@@ -10,8 +10,8 @@ body:
     id: journey
     attributes:
       label: User journey / test case
-      description: Reference docs/test-cases.md, such as 4.3, or write "new".
-      placeholder: "4.3"
+      description: Reference the ParseCat Test Cases — Unified Google Sheet, such as PC-upload-001, or write "new".
+      placeholder: "PC-upload-001"
     validations:
       required: true
   - type: textarea

@@ -1,0 +1,74 @@
+name: QA bug report
+description: Send a reproducible ParseCat defect from QA to SWE.
+title: "[QA] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Include observable evidence only. Do not attach real device captures, API keys, tokens, or personal identifiers.
+  - type: input
+    id: journey
+    attributes:
+      label: User journey / test case
+      description: Reference docs/test-cases.md, such as 4.3, or write "new".
+      placeholder: "4.3"
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Branch or commit, browser/API client, OS, and relevant Python or Node version.
+      placeholder: |
+        Branch: main
+        Browser: Chrome 151
+        OS: macOS
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include UI state, status code, or sanitized output.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Sanitized logs, command output, screenshots, affected component, severity, and confidence.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+  - type: input
+    id: regression
+    attributes:
+      label: Regression test target
+      description: Existing test to update or a proposed new test.
+      placeholder: backend/tests/test_api_user_flows.py
+    validations:
+      required: true

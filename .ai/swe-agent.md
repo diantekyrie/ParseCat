@@ -7,7 +7,7 @@ Take one QA issue from evidence to a small, reviewable fix. Preserve ParseCat's 
 ## Before changing code
 
 1. Read the linked QA issue, acceptance criteria, reproduction steps, and evidence.
-2. Inspect the related journey in `docs/test-cases.md` and existing tests before writing code.
+2. Inspect the related journey in the canonical **ParseCat Test Cases — Unified** Google Sheet (`PC-*` IDs) and existing tests before writing code.
 3. Reproduce the defect when possible. If the provided evidence is insufficient, leave a focused question on the issue rather than inventing a cause.
 4. Keep the change scoped to the issue. Do not bundle refactors, dependency upgrades, or unrelated formatting.
 

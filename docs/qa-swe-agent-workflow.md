@@ -29,12 +29,12 @@ The role contracts live in [`.ai/qa-agent.md`](../.ai/qa-agent.md) and [`.ai/swe
 |---|---|
 | API route or user flow | `cd backend && python -m pytest tests/test_api_user_flows.py -v` |
 | Parser, correlation, ingestion, persistence, or reasoning | `cd backend && python -m pytest tests/ -q`; state whether the local real-device fixture corpus was also run |
-| Frontend | `cd frontend && npm ci && npm run build`; run the matching web journey from `docs/test-cases.md` |
+| Frontend | `cd frontend && npm ci && npm run build`; run the matching web journey from the ParseCat Test Cases — Unified Google Sheet |
 | CI/workflow only | Validate YAML and confirm the intended job/check name |
 
 ## First automated-QA backlog
 
-The best first agent-owned work is the unautomated web coverage called out in [`docs/test-cases.md`](test-cases.md):
+The best first agent-owned work is the unautomated web coverage called out in the ParseCat Test Cases — Unified Google Sheet (the `PC-upload-*`, `PC-browse-*`, `PC-triage-*`, `PC-scan-*`, `PC-diagnose-*`, `PC-followup-*`, `PC-investigation-*`, and `PC-resilience-*` cases carried over from the former `docs/test-cases.md`):
 
 1. Add Playwright and cover upload validation, disabled controls, filters, exports, and backend-unreachable states.
 2. Promote the API cases marked 🟡 to true HTTP-boundary tests where the route's form parsing or response shape can fail.

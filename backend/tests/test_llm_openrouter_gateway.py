@@ -7,6 +7,9 @@ writing a dedicated client. No real network calls here -- these tests only
 verify client construction (api_key/base_url/model wiring) and the
 endpoint-selection logic, the same boundary the existing openai-codex
 endpoint-picking logic sits at.
+
+Third-party construction requires PARSECAT_ALLOW_LLM_EGRESS=1 (default-deny
+egress gate). Tests that expect a live OpenRouter client set that env.
 """
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ import pytest
 
 from app.llm import (
     DEFAULT_OPENROUTER_MODEL,
+    EGRESS_ENV,
     OPENROUTER_BASE_URL,
     get_llm_client,
     list_providers,
@@ -22,12 +26,14 @@ from app.llm.openai_client import OpenAIClient
 
 
 def test_openrouter_missing_key_raises_a_clear_error(monkeypatch):
+    monkeypatch.setenv(EGRESS_ENV, "1")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
         get_llm_client("openrouter")
 
 
 def test_openrouter_client_points_at_the_gateway_with_the_default_model(monkeypatch):
+    monkeypatch.setenv(EGRESS_ENV, "1")
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
     monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
     client = get_llm_client("openrouter")
@@ -39,6 +45,7 @@ def test_openrouter_client_points_at_the_gateway_with_the_default_model(monkeypa
 def test_openrouter_model_override_via_env_reaches_any_routed_model(monkeypatch):
     # The whole point: OPENROUTER_MODEL can be pointed at any model
     # OpenRouter proxies, e.g. xAI's Grok, without a new provider id.
+    monkeypatch.setenv(EGRESS_ENV, "1")
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
     monkeypatch.setenv("OPENROUTER_MODEL", "x-ai/grok-4")
     client = get_llm_client("openrouter")
@@ -47,8 +54,9 @@ def test_openrouter_model_override_via_env_reaches_any_routed_model(monkeypatch)
 
 def test_openrouter_is_the_third_auto_detection_fallback(monkeypatch):
     # Case: a customer configures ONLY an OpenRouter key -- no direct
-    # Anthropic/OpenAI key. The no-selection default must still reach a
-    # real provider, not silently fall back to Stub.
+    # Anthropic/OpenAI key. With egress allowed, the no-selection default
+    # must still reach a real provider, not silently fall back to Stub.
+    monkeypatch.setenv(EGRESS_ENV, "1")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
@@ -59,10 +67,17 @@ def test_openrouter_is_the_third_auto_detection_fallback(monkeypatch):
 
 def test_openrouter_appears_in_list_providers_with_correct_availability(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv(EGRESS_ENV, raising=False)
     providers = {p["id"]: p for p in list_providers()}
     assert providers["openrouter"]["available"] is False
 
+    # Key alone is not enough: egress gate must be open too.
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    providers = {p["id"]: p for p in list_providers()}
+    assert providers["openrouter"]["available"] is False
+    assert providers["openrouter"]["disabled_reason"] == "egress_gated"
+
+    monkeypatch.setenv(EGRESS_ENV, "1")
     providers = {p["id"]: p for p in list_providers()}
     assert providers["openrouter"]["available"] is True
 

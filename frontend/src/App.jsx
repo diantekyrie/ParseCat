@@ -263,12 +263,12 @@ function CoverageNotice({ coverage }) {
 }
 
 // Issue #28: nothing in the UI disclosed that Diagnose/Scan can send the
-// extracted fact bundle to a third-party LLM. get_llm_client() in the
-// backend defaults to the first configured live provider (Anthropic, then
-// OpenAI) even when the user never touches the "Narrated by" dropdown --
-// so this can't just be a note next to the dropdown, it has to cover the
-// no-selection default case too. Only the structured facts bundle is sent,
-// never the raw log file; the Stub provider never leaves this machine.
+// extracted fact bundle to a third-party LLM. get_llm_client() only auto-
+// selects a live provider when PARSECAT_ALLOW_LLM_EGRESS is set; otherwise
+// keys alone leave providers unavailable and the default stays Stub. This
+// notice still covers the case where egress is allowed and a live provider
+// is selected (including the no-selection default). Only the structured
+// facts bundle is sent, never the raw log file; Stub never leaves this machine.
 function PrivacyNotice({ providers, provider }) {
   const liveProviders = providers.filter((p) => p.id !== "stub" && p.available);
   if (liveProviders.length === 0) return null; // only Stub configured -- nothing leaves this machine
@@ -1039,7 +1039,7 @@ export default function App() {
                       <select value={provider} onChange={(e) => setProvider(e.target.value)}>
                         {providers.map((p) => (
                           <option key={p.id} value={p.id} disabled={!p.available}>
-                            {p.label}{!p.available ? " (no key set)" : ""}
+                            {p.label}{!p.available ? (p.disabled_reason === "egress_gated" ? " (third-party send disabled)" : " (no key set)") : ""}
                           </option>
                         ))}
                       </select>
@@ -1118,7 +1118,7 @@ export default function App() {
                       <select value={provider} onChange={(e) => setProvider(e.target.value)}>
                         {providers.map((p) => (
                           <option key={p.id} value={p.id} disabled={!p.available}>
-                            {p.label}{!p.available ? " (no key set)" : ""}
+                            {p.label}{!p.available ? (p.disabled_reason === "egress_gated" ? " (third-party send disabled)" : " (no key set)") : ""}
                           </option>
                         ))}
                       </select>

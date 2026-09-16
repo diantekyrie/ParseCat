@@ -37,6 +37,6 @@ import pytest
 def _no_real_llm_keys_in_tests():
     import os
 
-    for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+    for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "PARSECAT_ALLOW_LLM_EGRESS"):
         os.environ.pop(key, None)
     yield

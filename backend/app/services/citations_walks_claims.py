@@ -40,9 +40,6 @@ def collect_verified_facts(bundle: dict) -> list[dict]:
                 continue
             device_label = cap.get("device_label")
             for fact in collect_verified_facts(cap):
-                # Capture identity is stamped inside the recursive claims /
-                # device-wide walks (via _capture_identity). Do not re-fold
-                # here — Arch #58: unreachable + out of #54 scope.
                 if device_label:
                     fact = stamp_fact_id({**fact, "device_label": device_label})
                 out.append(fact)

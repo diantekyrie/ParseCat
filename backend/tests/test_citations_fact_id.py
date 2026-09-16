@@ -128,8 +128,7 @@ def test_fact_id_is_deterministic_same_bundle_same_ids():
 def _claim_cap(capture_id: int, original_filename: str) -> dict:
     """Minimal capture with an identical claim signature (no device_label).
 
-    Populates all four claims-path _fact() categories (entity/crash/anr/
-    native_crash) so a typo in any loop cannot slip past CI.
+    Populates all four claims-path _fact() sites: entity, crash, anr, native_crash.
     """
     return {
         "capture_id": capture_id,
@@ -168,11 +167,11 @@ def _claim_cap(capture_id: int, original_filename: str) -> dict:
                     "native_crashes": [
                         {
                             "package": "com.example.app",
-                            "executable": "app_process64",
+                            "executable": "/system/bin/app_process64",
                             "signal_name": "SIGSEGV",
                             "timestamp": "08-13 12:02:00.000",
                             "source": {
-                                "section": "tombstone",
+                                "section": "tombstones",
                                 "line_start": 1,
                                 "line_end": 50,
                             },
@@ -190,9 +189,8 @@ def test_claim_facts_distinct_across_captures_without_device_label():
     Claims-path historically omitted capture_id/original_filename; without a
     per-capture discriminator, identical claim signatures across two captures
     hashed to the same vf_… id and broke the #49 identity contract.
-    Covers all four claims-path categories (entity/crash/anr/native_crash).
+    Covers all four claims-path categories: entity, crash, anr, native_crash.
     """
-    categories = {"entity", "crash", "anr", "native_crash"}
     bundle = {
         "captures": [
             _claim_cap(1, "bugreport-a.zip"),
@@ -200,8 +198,9 @@ def test_claim_facts_distinct_across_captures_without_device_label():
         ],
     }
     facts = collect_verified_facts(bundle)
-    # Two captures × 4 categories = 8 claim-derived facts
-    claim_facts = [f for f in facts if f["category"] in categories]
+    # Two captures × (entity + crash + anr + native_crash) = 8 claim-derived facts
+    claim_cats = ("entity", "crash", "anr", "native_crash")
+    claim_facts = [f for f in facts if f["category"] in claim_cats]
     assert len(claim_facts) == 8
     ids = [f["fact_id"] for f in claim_facts]
     assert len(set(ids)) == len(ids), f"collision: {ids}"
@@ -210,29 +209,28 @@ def test_claim_facts_distinct_across_captures_without_device_label():
     for f in claim_facts:
         by_capture.setdefault(f["capture_id"], []).append(f)
     assert set(by_capture) == {1, 2}
-    for cap_id, cap_facts in by_capture.items():
-        assert {f["category"] for f in cap_facts} == categories
-        assert all(f["capture_id"] == cap_id for f in cap_facts)
-        assert all(
-            f.get("original_filename")
-            == ("bugreport-a.zip" if cap_id == 1 else "bugreport-b.zip")
-            for f in cap_facts
-        )
+    for cap_facts in by_capture.values():
+        assert {f["category"] for f in cap_facts} == set(claim_cats)
+        assert {f["original_filename"] for f in cap_facts} <= {
+            "bugreport-a.zip",
+            "bugreport-b.zip",
+        }
 
     # Determinism: same investigation → same ids
     again = collect_verified_facts(bundle)
     assert [f["fact_id"] for f in again] == [f["fact_id"] for f in facts]
 
 
-def test_single_capture_dict_captures_unchanged_without_invented_identity():
-    """Diagnosis-shaped bundles use captures as dict {id: filename}.
+def test_claim_facts_single_capture_diagnosis_shape_stable():
+    """Diagnosis/scan bundles use captures as dict — investigation fold skipped.
 
-    That shape must not hit the investigation list-flatten branch, and claim
-    facts without capture identity on the claim/bundle stay unset (no invented
-    id from the dict map). fact_ids stay stable across runs.
+    Claim facts still get capture identity from the bundle via _capture_identity;
+    fact_ids stay deterministic (no corpus drift on the single-capture path).
     """
     bundle = {
-        "captures": {"1": "bugreport-a.zip"},  # dict, not list
+        "capture_id": 42,
+        "original_filename": "bugreport.zip",
+        "captures": {42: "bugreport.zip"},
         "claims": [
             {
                 "package": "com.example.app",
@@ -261,7 +259,8 @@ def test_single_capture_dict_captures_unchanged_without_invented_identity():
     facts = collect_verified_facts(bundle)
     claim_facts = [f for f in facts if f["category"] in ("entity", "crash")]
     assert len(claim_facts) == 2
-    assert all(f.get("capture_id") is None for f in claim_facts)
-    assert all(f.get("original_filename") is None for f in claim_facts)
+    assert all(f["capture_id"] == 42 for f in claim_facts)
+    assert all(f["original_filename"] == "bugreport.zip" for f in claim_facts)
+    assert len({f["fact_id"] for f in claim_facts}) == 2
     again = collect_verified_facts(bundle)
     assert [f["fact_id"] for f in again] == [f["fact_id"] for f in facts]

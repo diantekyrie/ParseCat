@@ -123,3 +123,82 @@ def test_fact_id_is_deterministic_same_bundle_same_ids():
     labeled = stamp_fact_id({**first[0], "device_label": "pixel-a"})
     assert labeled["fact_id"] != first[0]["fact_id"]
     assert labeled["fact_id"] == compute_fact_id(labeled)
+
+
+def _claim_capture(*, capture_id: int, original_filename: str, package: str) -> dict:
+    """One capture with claim-derived entity + crash facts; no device_label."""
+    return {
+        "capture_id": capture_id,
+        "original_filename": original_filename,
+        "claims": [
+            {
+                "package": package,
+                "confidence": "HIGH",
+                "corroboration": "seen in dumpsys",
+                "verified_state": {
+                    "crash_events": [
+                        {
+                            "package": package,
+                            "exception_class": "NullPointerException",
+                            "message": "npe",
+                            "timestamp": "08-13 12:00:00.000",
+                            "source": {
+                                "section": "system_log",
+                                "line_start": 10,
+                                "line_end": 20,
+                            },
+                        }
+                    ],
+                    "anrs": [],
+                    "native_crashes": [],
+                },
+            }
+        ],
+    }
+
+
+def test_claim_fact_ids_distinct_across_captures_without_device_label():
+    """Issue #54: claim-derived facts must not collide across captures.
+
+    Without capture_id/original_filename on claims `_fact()` calls, two
+    captures with the same claim shape and no device_label hash to the
+    same vf_… id (post-merge #53 review).
+    """
+    package = "com.example.app"
+    bundle = {
+        "captures": [
+            _claim_capture(
+                capture_id=1,
+                original_filename="bugreport-a.zip",
+                package=package,
+            ),
+            _claim_capture(
+                capture_id=2,
+                original_filename="bugreport-b.zip",
+                package=package,
+            ),
+        ]
+    }
+    facts = collect_verified_facts(bundle)
+    # 2 captures × (entity + crash) = 4 claim-derived facts
+    assert len(facts) == 4
+    ids = [f["fact_id"] for f in facts]
+    assert len(set(ids)) == 4, f"expected distinct fact_ids, got {ids}"
+
+    by_capture = {}
+    for f in facts:
+        by_capture.setdefault(f["capture_id"], []).append(f)
+    assert set(by_capture) == {1, 2}
+    assert all(len(v) == 2 for v in by_capture.values())
+
+    # Same capture re-collect is deterministic
+    again = collect_verified_facts(bundle)
+    assert [f["fact_id"] for f in again] == ids
+
+    # Capture identity is stamped on claim-derived rows
+    for f in facts:
+        assert f["capture_id"] in (1, 2)
+        assert f["original_filename"] in (
+            "bugreport-a.zip",
+            "bugreport-b.zip",
+        )

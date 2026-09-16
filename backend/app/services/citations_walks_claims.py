@@ -29,6 +29,11 @@ def collect_verified_facts(bundle: dict) -> list[dict]:
         return out
 
     facts: list[dict] = []
+    # Capture identity for claim-derived facts (mirrors device-wide walks).
+    # Without these, identical claims across captures collide on fact_id when
+    # device_label is unset (#54 / post-merge #53 review).
+    bundle_capture_id = bundle.get("capture_id")
+    bundle_original_filename = bundle.get("original_filename")
 
     for claim in bundle.get("claims") or []:
         if not isinstance(claim, dict):
@@ -40,6 +45,10 @@ def collect_verified_facts(bundle: dict) -> list[dict]:
             summary=f"Independently verified package {pkg}",
             confidence=claim_conf,
             detail=claim.get("corroboration") or claim.get("matched_how"),
+            capture_id=claim.get("capture_id", bundle_capture_id),
+            original_filename=claim.get(
+                "original_filename", bundle_original_filename
+            ),
         ))
         vs = claim.get("verified_state") or {}
         for c in vs.get("crash_events") or []:
@@ -54,6 +63,10 @@ def collect_verified_facts(bundle: dict) -> list[dict]:
                 confidence=claim_conf,
                 source=c.get("source"),
                 timestamp=c.get("timestamp"),
+                capture_id=c.get("capture_id", bundle_capture_id),
+                original_filename=c.get(
+                    "original_filename", bundle_original_filename
+                ),
                 detail=c.get("message") or c.get("root_cause_message"),
             ))
         for a in vs.get("anrs") or []:
@@ -65,6 +78,10 @@ def collect_verified_facts(bundle: dict) -> list[dict]:
                 confidence=claim_conf,
                 source=a.get("source"),
                 timestamp=a.get("timestamp"),
+                capture_id=a.get("capture_id", bundle_capture_id),
+                original_filename=a.get(
+                    "original_filename", bundle_original_filename
+                ),
                 detail=a.get("reason"),
             ))
         for t in vs.get("native_crashes") or []:
@@ -77,6 +94,10 @@ def collect_verified_facts(bundle: dict) -> list[dict]:
                 confidence=claim_conf,
                 source=t.get("source"),
                 timestamp=t.get("timestamp"),
+                capture_id=t.get("capture_id", bundle_capture_id),
+                original_filename=t.get(
+                    "original_filename", bundle_original_filename
+                ),
                 detail=t.get("signal_name"),
             ))
 

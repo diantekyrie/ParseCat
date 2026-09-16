@@ -1,1 +1,1 @@
-PLACEHOLDER_LOAD_FROM_DISK
+file:///tmp/bare_citations.py

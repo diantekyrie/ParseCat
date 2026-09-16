@@ -1,8 +1,9 @@
-"""Stable deterministic fact_id on verified_facts (issue #49).
+"""Stable deterministic fact_id on verified_facts (issue #49 / #55).
 
 Every verified_facts entry gets vf_<sha256[:16]>; empty stays empty;
 same bundle → same ids across runs. Entity facts without SourceRef still
-get fact_id but remain band-only for Arch RCA edges.
+get fact_id but remain band-only for Arch RCA edges. Distinct captures
+must not collide on fact_id when device_label is absent.
 """
 from __future__ import annotations
 
@@ -123,3 +124,58 @@ def test_fact_id_is_deterministic_same_bundle_same_ids():
     labeled = stamp_fact_id({**first[0], "device_label": "pixel-a"})
     assert labeled["fact_id"] != first[0]["fact_id"]
     assert labeled["fact_id"] == compute_fact_id(labeled)
+
+
+def _claim_capture(capture_id: int, original_filename: str, pkg: str = "com.example.app") -> dict:
+    """One capture with a claim-derived crash (no device_label)."""
+    return {
+        "capture_id": capture_id,
+        "original_filename": original_filename,
+        "claims": [
+            {
+                "package": pkg,
+                "confidence": "HIGH",
+                "matched_how": "package match",
+                "verified_state": {
+                    "crash_events": [
+                        {
+                            "package": pkg,
+                            "exception_class": "NullPointerException",
+                            "message": "npe",
+                            "timestamp": "08-13 12:00:00.000",
+                            "source": {
+                                "section": "system_log",
+                                "line_start": 10,
+                                "line_end": 20,
+                            },
+                        }
+                    ],
+                    "anrs": [],
+                    "native_crashes": [],
+                },
+            }
+        ],
+    }
+
+
+def test_claim_fact_ids_distinct_across_captures_without_device_label():
+    """Multi-capture claims without device_label must not collide on fact_id (#55)."""
+    bundle = {
+        "captures": [
+            _claim_capture(1, "bugreport-a.zip"),
+            _claim_capture(2, "bugreport-b.zip"),
+        ]
+    }
+    facts = collect_verified_facts(bundle)
+    # 2 captures × (1 entity + 1 crash)
+    assert len(facts) == 4
+    ids = [f["fact_id"] for f in facts]
+    assert len(set(ids)) == 4
+    crashes = [f for f in facts if f["category"] == "crash"]
+    assert len(crashes) == 2
+    assert crashes[0]["fact_id"] != crashes[1]["fact_id"]
+    assert crashes[0]["capture_id"] == 1
+    assert crashes[1]["capture_id"] == 2
+    # Same input still stable across runs.
+    again = collect_verified_facts(bundle)
+    assert [f["fact_id"] for f in facts] == [f["fact_id"] for f in again]

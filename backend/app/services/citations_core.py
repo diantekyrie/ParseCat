@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.services.fact_id import compute_fact_id, stamp_fact_id
+from app.services.fact_id import stamp_fact_id
 
 _CONFIDENCE_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "UNCONFIRMED": 3}
 VALID_CONFIDENCE = frozenset(_CONFIDENCE_RANK)

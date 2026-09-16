@@ -6,6 +6,25 @@ from app.services.citations_walks_device import _collect_device_wide_facts
 from app.services.fact_id import stamp_fact_id
 
 
+def _capture_id_fields(bundle: dict, event: dict | None = None) -> dict:
+    """Prefer event capture discriminators; else the current capture/bundle root.
+
+    Claims-derived facts must include capture_id/original_filename so multi-capture
+    investigations without device_label still get distinct fact_ids (#55).
+    """
+    src = event if isinstance(event, dict) else {}
+    capture_id = src.get("capture_id")
+    original_filename = src.get("original_filename")
+    if capture_id is None:
+        capture_id = bundle.get("capture_id")
+    if original_filename is None:
+        original_filename = bundle.get("original_filename")
+    return {
+        "capture_id": capture_id,
+        "original_filename": original_filename,
+    }
+
+
 def collect_verified_facts(bundle: dict) -> list[dict]:
     """Flatten parser-backed evidence into citation-ready rows for the UI.
 
@@ -40,6 +59,7 @@ def collect_verified_facts(bundle: dict) -> list[dict]:
             summary=f"Independently verified package {pkg}",
             confidence=claim_conf,
             detail=claim.get("corroboration") or claim.get("matched_how"),
+            **_capture_id_fields(bundle),
         ))
         vs = claim.get("verified_state") or {}
         for c in vs.get("crash_events") or []:
@@ -55,6 +75,7 @@ def collect_verified_facts(bundle: dict) -> list[dict]:
                 source=c.get("source"),
                 timestamp=c.get("timestamp"),
                 detail=c.get("message") or c.get("root_cause_message"),
+                **_capture_id_fields(bundle, c),
             ))
         for a in vs.get("anrs") or []:
             if not isinstance(a, dict):
@@ -66,6 +87,7 @@ def collect_verified_facts(bundle: dict) -> list[dict]:
                 source=a.get("source"),
                 timestamp=a.get("timestamp"),
                 detail=a.get("reason"),
+                **_capture_id_fields(bundle, a),
             ))
         for t in vs.get("native_crashes") or []:
             if not isinstance(t, dict):
@@ -78,6 +100,7 @@ def collect_verified_facts(bundle: dict) -> list[dict]:
                 source=t.get("source"),
                 timestamp=t.get("timestamp"),
                 detail=t.get("signal_name"),
+                **_capture_id_fields(bundle, t),
             ))
 
     facts.extend(_collect_device_wide_facts(bundle))

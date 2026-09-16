@@ -52,6 +52,7 @@ from app.models.db_models import (
 )
 from app.services.correlation import PackageHistory, package_history_across_device
 from app.services.coverage import build_capture_coverage
+from app.services.citations import attach_verified_facts
 from app.services.verification import EntityVerification, verify_question_entities
 
 MULTI_CAPTURE_TRIGGER_RE = re.compile(
@@ -1341,7 +1342,10 @@ def build_diagnosis_bundle(
         })
     bundle["evidence_sources"] = evidence_sources
 
-    return bundle
+    # Citation-ready list for the Verified-from-log UI band (issue #47).
+    # Confidence labels are code-owned; empty list means no verified facts
+    # for this question -- never speculative RCA filler.
+    return attach_verified_facts(bundle)
 
 
 DETAIL_MAX_CHARS = 600
@@ -1699,6 +1703,8 @@ def scan_capture(
     )
     bundle["ranked_findings"] = rank_findings(bundle)
     bundle["scan"] = True
+    # Re-attach after ranked_findings so scan findings feed verified_facts.
+    attach_verified_facts(bundle)
     report_text, llm_error = _run_llm(bundle, SCAN_SYSTEM_PROMPT, provider)
     return {"bundle": bundle, "report": report_text, "llm_error": llm_error, "provider": provider}
 
@@ -1811,5 +1817,6 @@ def diagnose_investigation(
         })
 
     bundle = {"question": question, "captures": captures_bundle}
+    attach_verified_facts(bundle)
     report_text, llm_error = _run_llm(bundle, INVESTIGATION_SYSTEM_PROMPT, provider, history)
     return {"bundle": bundle, "report": report_text, "llm_error": llm_error, "provider": provider}

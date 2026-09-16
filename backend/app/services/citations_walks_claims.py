@@ -40,18 +40,11 @@ def collect_verified_facts(bundle: dict) -> list[dict]:
                 continue
             device_label = cap.get("device_label")
             for fact in collect_verified_facts(cap):
-                updates: dict = {}
+                # Capture identity is stamped inside the recursive claims /
+                # device-wide walks (via _capture_identity). Do not re-fold
+                # here — Arch #58: unreachable + out of #54 scope.
                 if device_label:
-                    updates["device_label"] = device_label
-                # Fold capture identity when the nested walk left it unset
-                # (claims path historically omitted these; device-wide may
-                # already have them from the event).
-                if fact.get("capture_id") is None and cap.get("capture_id") is not None:
-                    updates["capture_id"] = cap.get("capture_id")
-                if not fact.get("original_filename") and cap.get("original_filename"):
-                    updates["original_filename"] = cap.get("original_filename")
-                if updates:
-                    fact = stamp_fact_id({**fact, **updates})
+                    fact = stamp_fact_id({**fact, "device_label": device_label})
                 out.append(fact)
         return out
 

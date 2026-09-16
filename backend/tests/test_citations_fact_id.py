@@ -1,4 +1,4 @@
-"""Stable deterministic fact_id on verified_facts (issue #49).
+"""Stable deterministic fact_id on verified_facts (issue #49 / #54).
 
 Every verified_facts entry gets vf_<sha256[:16]>; empty stays empty;
 same bundle → same ids across runs. Entity facts without SourceRef still
@@ -123,3 +123,67 @@ def test_fact_id_is_deterministic_same_bundle_same_ids():
     labeled = stamp_fact_id({**first[0], "device_label": "pixel-a"})
     assert labeled["fact_id"] != first[0]["fact_id"]
     assert labeled["fact_id"] == compute_fact_id(labeled)
+
+
+def _claim_cap(capture_id: int, original_filename: str) -> dict:
+    """Minimal capture with an identical claim signature (no device_label)."""
+    return {
+        "capture_id": capture_id,
+        "original_filename": original_filename,
+        "claims": [
+            {
+                "package": "com.example.app",
+                "confidence": "HIGH",
+                "corroboration": "seen in dumpsys",
+                "verified_state": {
+                    "crash_events": [
+                        {
+                            "package": "com.example.app",
+                            "exception_class": "NullPointerException",
+                            "message": "npe",
+                            "timestamp": "08-13 12:00:00.000",
+                            "source": {
+                                "section": "system_log",
+                                "line_start": 10,
+                                "line_end": 20,
+                            },
+                        }
+                    ],
+                    "anrs": [],
+                    "native_crashes": [],
+                },
+            }
+        ],
+    }
+
+
+def test_claim_facts_distinct_across_captures_without_device_label():
+    """Issue #54: multi-capture + no device_label must not collide on fact_id.
+
+    Claims-path historically omitted capture_id/original_filename; without a
+    per-capture discriminator, identical claim signatures across two captures
+    hashed to the same vf_… id and broke the #49 identity contract.
+    """
+    bundle = {
+        "captures": [
+            _claim_cap(1, "bugreport-a.zip"),
+            _claim_cap(2, "bugreport-b.zip"),
+        ],
+    }
+    facts = collect_verified_facts(bundle)
+    # Two captures × (entity + crash) = 4 claim-derived facts
+    claim_facts = [f for f in facts if f["category"] in ("entity", "crash")]
+    assert len(claim_facts) == 4
+    ids = [f["fact_id"] for f in claim_facts]
+    assert len(set(ids)) == len(ids), f"collision: {ids}"
+
+    by_capture = {}
+    for f in claim_facts:
+        by_capture.setdefault(f["capture_id"], []).append(f)
+    assert set(by_capture) == {1, 2}
+    for cap_facts in by_capture.values():
+        assert {f["category"] for f in cap_facts} == {"entity", "crash"}
+
+    # Determinism: same investigation → same ids
+    again = collect_verified_facts(bundle)
+    assert [f["fact_id"] for f in again] == [f["fact_id"] for f in facts]

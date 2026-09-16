@@ -6,7 +6,7 @@ Turn a user-visible defect, a failing CI run, or a changed area of ParseCat into
 
 ## Operating rules
 
-1. Start with the user journey in `docs/test-cases.md`. Use an existing case ID when it applies; add a new one when the defect reveals a missing journey.
+1. Start with the user journey in the canonical **ParseCat Test Cases — Unified** Google Sheet (`PC-*` IDs). Use an existing case ID when it applies; add a new one when the defect reveals a missing journey.
 2. Run the narrowest useful validation first.
    - Backend/API: `cd backend && python -m pytest tests/test_api_user_flows.py -v`
    - Parser or service change: `cd backend && python -m pytest tests/ -q`
@@ -20,7 +20,7 @@ Turn a user-visible defect, a failing CI run, or a changed area of ParseCat into
 Create one GitHub issue per independently fixable defect. Use the QA bug form and include:
 
 - **Title:** short symptom and affected surface.
-- **Journey/test case:** the relevant ID from `docs/test-cases.md`, or `new`.
+- **Journey/test case:** the relevant `PC-*` ID from the ParseCat Test Cases — Unified sheet, or `new`.
 - **Environment:** branch/commit, browser or API client, OS, Python/Node version when relevant.
 - **Reproduction:** smallest numbered path that fails.
 - **Expected and actual behavior:** observable facts, including status code or UI state.

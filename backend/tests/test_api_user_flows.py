@@ -6,7 +6,13 @@ None of them go through an actual HTTP request the way the frontend (or any
 other real client) does -- routing, form parsing, status codes, and error
 response shapes are all untested at that layer. This file closes that gap
 using FastAPI's TestClient, matching the user-journey cases catalogued in
-docs/test-cases.md (search for the case IDs in the docstrings below).
+the ParseCat Test Cases — Unified Google Sheet (PC-upload-*, PC-browse-*,
+PC-scan-*, PC-diagnose-*, PC-followup-*, PC-investigation-*, PC-resilience-*
+-- search for the PC-* IDs in the docstrings below). These cases used to
+live in a git-tracked docs/test-cases.md with numeric IDs (e.g. "Case 1.1");
+that file was removed from the repo so internal QA docs aren't bundled into
+shippable source, and its content was migrated into the Sheet under the
+PC-* scheme already used everywhere else (Notion, other Sheets).
 
 No real bugreport fixtures needed -- every capture here is a synthetic
 in-memory .txt/.zip built inline, same convention as test_capture_formats.py
@@ -75,7 +81,7 @@ def _upload_txt(client, label, filename="logcat.txt", body=None, investigation_l
 # --- 1. Upload & parse -------------------------------------------------
 
 def test_upload_valid_txt_returns_capture_id_and_facts(client):
-    # Case 1.1
+    # Case PC-upload-001
     resp = _upload_txt(client, "Pixel")
     assert resp.status_code == 200
     body = resp.json()
@@ -85,7 +91,7 @@ def test_upload_valid_txt_returns_capture_id_and_facts(client):
 
 
 def test_upload_unsupported_extension_is_rejected(client):
-    # Case 1.2
+    # Case PC-upload-002
     resp = client.post(
         "/api/captures",
         data={"device_label": "Pixel"},
@@ -96,7 +102,7 @@ def test_upload_unsupported_extension_is_rejected(client):
 
 
 def test_upload_unrecognizable_txt_is_rejected_not_silently_persisted(client):
-    # Case 1.3 -- superseded by #31/#32: this used to assert a silent 200
+    # Case PC-upload-003 -- superseded by #31/#32: this used to assert a silent 200
     # with a soft warning, but the deliberate fix for #31 made this a
     # blocking upload error instead (PC-ux-003). Updated to match the new,
     # intended contract rather than the old one.
@@ -106,7 +112,7 @@ def test_upload_unrecognizable_txt_is_rejected_not_silently_persisted(client):
 
 
 def test_upload_corrupt_zip_returns_422(client):
-    # Case 1.4
+    # Case PC-upload-004
     resp = client.post(
         "/api/captures",
         data={"device_label": "Pixel"},
@@ -117,7 +123,7 @@ def test_upload_corrupt_zip_returns_422(client):
 
 
 def test_upload_with_investigation_label_links_capture(client):
-    # Case 1.7
+    # Case PC-upload-007
     resp = _upload_txt(client, "Pixel", investigation_label="case-42")
     assert resp.status_code == 200
     assert resp.json()["investigation_label"] == "case-42"
@@ -127,7 +133,7 @@ def test_upload_with_investigation_label_links_capture(client):
     assert len(listing.json()) == 1
 
 
-# Case 1.8 (device identity mismatch -> 409, not a silent merge) is NOT
+# Case PC-upload-008 (device identity mismatch -> 409, not a silent merge) is NOT
 # repeated here: building a synthetic bugreport zip whose DeviceInfo
 # section actually parses is significantly heavier than testing the same
 # rule at the service level, and test_device_label_identity.py already
@@ -141,19 +147,19 @@ def test_upload_with_investigation_label_links_capture(client):
 # --- 2. Device & investigation browsing ---------------------------------
 
 def test_unknown_device_returns_404(client):
-    # Case 2.2
+    # Case PC-browse-002
     resp = client.get("/api/devices/does-not-exist/captures")
     assert resp.status_code == 404
 
 
 def test_unknown_investigation_returns_404(client):
-    # Case 2.3
+    # Case PC-browse-003
     resp = client.get("/api/investigations/does-not-exist/captures")
     assert resp.status_code == 404
 
 
 def test_unknown_capture_summary_returns_404(client):
-    # Case 2.4
+    # Case PC-browse-004
     resp = client.get("/api/captures/999999/summary")
     assert resp.status_code == 404
 
@@ -161,7 +167,7 @@ def test_unknown_capture_summary_returns_404(client):
 # --- 4. Scan for problems ------------------------------------------------
 
 def test_scan_unknown_capture_returns_404(client):
-    # Case 4.2
+    # Case PC-scan-002
     resp = client.post("/api/captures/999999/scan")
     assert resp.status_code == 404
 
@@ -169,13 +175,13 @@ def test_scan_unknown_capture_returns_404(client):
 # --- 5. Diagnose (single capture) ----------------------------------------
 
 def test_diagnose_unknown_capture_returns_404(client):
-    # Case 5.4
+    # Case PC-diagnose-004
     resp = client.post("/api/captures/999999/diagnose", data={"question": "why did it crash?"})
     assert resp.status_code == 404
 
 
 def test_diagnose_unknown_provider_degrades_with_llm_error_not_a_silent_fallback(client):
-    # Case 5.8 -- get_llm_client() itself raises ValueError for an unknown
+    # Case PC-diagnose-008 -- get_llm_client() itself raises ValueError for an unknown
     # provider (test_end_to_end.py::test_unknown_provider_raises_rather_than_
     # silently_falling_back covers that lower level directly). At the HTTP
     # layer, diagnose() catches that and degrades the same way it does for
@@ -200,7 +206,7 @@ def test_diagnose_unknown_provider_degrades_with_llm_error_not_a_silent_fallback
 # --- 6. Follow-up diagnosis -----------------------------------------------
 
 def test_diagnose_malformed_history_degrades_to_no_history_not_400(client):
-    # Case 6.2
+    # Case PC-followup-002
     upload = _upload_txt(client, "Pixel")
     capture_id = upload.json()["capture_id"]
     resp = client.post(
@@ -213,7 +219,7 @@ def test_diagnose_malformed_history_degrades_to_no_history_not_400(client):
 # --- 7. Investigation-scope diagnosis -------------------------------------
 
 def test_diagnose_investigation_unknown_label_returns_404(client):
-    # Case 7.4
+    # Case PC-investigation-004
     resp = client.post(
         "/api/investigations/does-not-exist/diagnose",
         data={"question": "anything?"},
@@ -222,7 +228,7 @@ def test_diagnose_investigation_unknown_label_returns_404(client):
 
 
 def test_diagnose_investigation_with_one_capture_is_not_gated_server_side(client):
-    # Case 7.3 -- documents CURRENT behavior, not necessarily desired
+    # Case PC-investigation-003 -- documents CURRENT behavior, not necessarily desired
     # behavior. The frontend disables investigation-scope diagnose below
     # 2 linked captures (App.jsx: `captures.length < 2`), but the API
     # route itself applies no such check. Calling it directly with a
@@ -240,7 +246,7 @@ def test_diagnose_investigation_with_one_capture_is_not_gated_server_side(client
 # --- 9. Cross-cutting ------------------------------------------------------
 
 def test_llm_providers_endpoint_reports_unavailable_not_error_when_unconfigured(client, monkeypatch):
-    # Case 9.2
+    # Case PC-resilience-002
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     resp = client.get("/api/llm/providers")

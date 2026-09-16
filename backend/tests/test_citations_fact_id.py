@@ -126,10 +126,7 @@ def test_fact_id_is_deterministic_same_bundle_same_ids():
 
 
 def _claim_cap(capture_id: int, original_filename: str) -> dict:
-    """Minimal capture with an identical claim signature (no device_label).
-
-    Populates all four claims-path _fact() sites: entity, crash, anr, native_crash.
-    """
+    """Minimal capture with an identical claim signature (no device_label)."""
     return {
         "capture_id": capture_id,
         "original_filename": original_filename,
@@ -167,7 +164,7 @@ def _claim_cap(capture_id: int, original_filename: str) -> dict:
                     "native_crashes": [
                         {
                             "package": "com.example.app",
-                            "executable": "/system/bin/app_process64",
+                            "executable": "com.example.app",
                             "signal_name": "SIGSEGV",
                             "timestamp": "08-13 12:02:00.000",
                             "source": {
@@ -189,7 +186,7 @@ def test_claim_facts_distinct_across_captures_without_device_label():
     Claims-path historically omitted capture_id/original_filename; without a
     per-capture discriminator, identical claim signatures across two captures
     hashed to the same vf_… id and broke the #49 identity contract.
-    Covers all four claims-path categories: entity, crash, anr, native_crash.
+    Covers all four claims-path _fact() sites: entity, crash, anr, native_crash.
     """
     bundle = {
         "captures": [
@@ -209,28 +206,28 @@ def test_claim_facts_distinct_across_captures_without_device_label():
     for f in claim_facts:
         by_capture.setdefault(f["capture_id"], []).append(f)
     assert set(by_capture) == {1, 2}
-    for cap_facts in by_capture.values():
+    for cap_id, cap_facts in by_capture.items():
         assert {f["category"] for f in cap_facts} == set(claim_cats)
-        assert {f["original_filename"] for f in cap_facts} <= {
-            "bugreport-a.zip",
-            "bugreport-b.zip",
-        }
+        for f in cap_facts:
+            assert f["capture_id"] == cap_id
+            assert f["original_filename"] in ("bugreport-a.zip", "bugreport-b.zip")
 
     # Determinism: same investigation → same ids
     again = collect_verified_facts(bundle)
     assert [f["fact_id"] for f in again] == [f["fact_id"] for f in facts]
 
 
-def test_claim_facts_single_capture_diagnosis_shape_stable():
-    """Diagnosis/scan bundles use captures as dict — investigation fold skipped.
+def test_claim_facts_single_capture_dict_captures_unchanged_identity():
+    """Single-capture diagnose/scan shape: captures is a dict, not a list.
 
-    Claim facts still get capture identity from the bundle via _capture_identity;
-    fact_ids stay deterministic (no corpus drift on the single-capture path).
+    build_diagnosis_bundle uses {id: filename}; the investigation fold must
+    not run. Claim facts still get capture_id from the bundle via
+    _capture_identity; fact_ids stay stable across runs.
     """
     bundle = {
         "capture_id": 42,
-        "original_filename": "bugreport.zip",
-        "captures": {42: "bugreport.zip"},
+        "original_filename": "pixel-bugreport.zip",
+        "captures": {"42": "pixel-bugreport.zip"},  # dict shape, not list
         "claims": [
             {
                 "package": "com.example.app",
@@ -250,17 +247,43 @@ def test_claim_facts_single_capture_diagnosis_shape_stable():
                             },
                         }
                     ],
-                    "anrs": [],
-                    "native_crashes": [],
+                    "anrs": [
+                        {
+                            "package": "com.example.app",
+                            "reason": "Input dispatching timed out",
+                            "timestamp": "08-13 12:01:00.000",
+                            "source": {
+                                "section": "system_log",
+                                "line_start": 30,
+                                "line_end": 40,
+                            },
+                        }
+                    ],
+                    "native_crashes": [
+                        {
+                            "package": "com.example.app",
+                            "signal_name": "SIGSEGV",
+                            "timestamp": "08-13 12:02:00.000",
+                            "source": {
+                                "section": "tombstones",
+                                "line_start": 1,
+                                "line_end": 50,
+                            },
+                        }
+                    ],
                 },
             }
         ],
     }
     facts = collect_verified_facts(bundle)
-    claim_facts = [f for f in facts if f["category"] in ("entity", "crash")]
-    assert len(claim_facts) == 2
-    assert all(f["capture_id"] == 42 for f in claim_facts)
-    assert all(f["original_filename"] == "bugreport.zip" for f in claim_facts)
-    assert len({f["fact_id"] for f in claim_facts}) == 2
+    claim_cats = ("entity", "crash", "anr", "native_crash")
+    claim_facts = [f for f in facts if f["category"] in claim_cats]
+    assert len(claim_facts) == 4
+    assert {f["category"] for f in claim_facts} == set(claim_cats)
+    for f in claim_facts:
+        assert f["capture_id"] == 42
+        assert f["original_filename"] == "pixel-bugreport.zip"
+        assert f["fact_id"].startswith("vf_")
+    # Stable across runs (corpus identity contract)
     again = collect_verified_facts(bundle)
     assert [f["fact_id"] for f in again] == [f["fact_id"] for f in facts]

@@ -123,3 +123,55 @@ def test_fact_id_is_deterministic_same_bundle_same_ids():
     labeled = stamp_fact_id({**first[0], "device_label": "pixel-a"})
     assert labeled["fact_id"] != first[0]["fact_id"]
     assert labeled["fact_id"] == compute_fact_id(labeled)
+
+
+def test_claim_facts_distinct_across_captures_without_device_label():
+    """#54: two captures, same claim signature, no device_label → distinct ids."""
+
+    def _cap(capture_id: int, original_filename: str) -> dict:
+        return {
+            "capture_id": capture_id,
+            "original_filename": original_filename,
+            "claims": [
+                {
+                    "package": "com.example.app",
+                    "confidence": "HIGH",
+                    "corroboration": "seen in dumpsys",
+                    "verified_state": {
+                        "crash_events": [
+                            {
+                                "package": "com.example.app",
+                                "exception_class": "NullPointerException",
+                                "message": "npe",
+                                "timestamp": "08-13 12:00:00.000",
+                                "source": {
+                                    "section": "system_log",
+                                    "line_start": 10,
+                                    "line_end": 20,
+                                },
+                            }
+                        ],
+                        "anrs": [],
+                        "native_crashes": [],
+                    },
+                }
+            ],
+        }
+
+    bundle = {
+        "captures": [
+            _cap(1, "capture-a.zip"),
+            _cap(2, "capture-b.zip"),
+        ]
+    }
+    facts = collect_verified_facts(bundle)
+    assert len(facts) == 4  # entity + crash per capture
+    ids = [f["fact_id"] for f in facts]
+    assert len(ids) == len(set(ids)), f"fact_id collision across captures: {ids}"
+    crashes = [f for f in facts if f["category"] == "crash"]
+    entities = [f for f in facts if f["category"] == "entity"]
+    assert len(crashes) == 2
+    assert len(entities) == 2
+    assert crashes[0]["fact_id"] != crashes[1]["fact_id"]
+    assert entities[0]["fact_id"] != entities[1]["fact_id"]
+    assert {f["capture_id"] for f in crashes} == {1, 2}

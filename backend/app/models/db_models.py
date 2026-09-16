@@ -15,6 +15,13 @@ class Device(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     label: str = Field(index=True, unique=True)  # user-chosen identifier, e.g. serial or nickname
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    # Soft-delete, not a real DELETE: no cascade-delete exists across the
+    # 30+ fact tables that key off capture_id, so hard-deleting a device
+    # would mean manually cleaning every one of those tables (and silently
+    # breaking the moment a new fact table is added and missed). Archiving
+    # just hides a device from GET /api/devices and the frontend's
+    # <datalist> by default -- fully recoverable, no schema-wide risk.
+    archived: bool = Field(default=False, index=True)
 
 
 class Capture(SQLModel, table=True):
@@ -30,6 +37,7 @@ class Investigation(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     label: str = Field(index=True, unique=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    archived: bool = Field(default=False, index=True)  # see Device.archived
 
 
 class InvestigationCaptureLink(SQLModel, table=True):

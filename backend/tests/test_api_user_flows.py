@@ -252,3 +252,59 @@ def test_llm_providers_endpoint_reports_unavailable_not_error_when_unconfigured(
     resp = client.get("/api/llm/providers")
     assert resp.status_code == 200
     assert isinstance(resp.json(), list)
+
+
+# --- Device/investigation archiving ----------------------------------------
+# No delete endpoint exists (no cascade-delete across the 30+ fact tables
+# keyed off capture_id) -- archiving hides a device/investigation from the
+# default GET list (and the frontend's <datalist> dropdown) without
+# deleting anything. Real problem found live: an unbounded, ever-growing
+# device dropdown with test/typo labels and no way to clean it up.
+
+def test_archived_device_is_hidden_from_default_list_but_not_deleted(client):
+    _upload_txt(client, "clutter-device")
+    resp = client.post("/api/devices/clutter-device/archive")
+    assert resp.status_code == 200
+    assert resp.json()["archived"] is True
+
+    listing = client.get("/api/devices")
+    assert "clutter-device" not in [d["label"] for d in listing.json()]
+
+    # Not deleted: still directly reachable by label, and include_archived
+    # brings it back into the list.
+    captures = client.get("/api/devices/clutter-device/captures")
+    assert captures.status_code == 200
+    assert len(captures.json()) == 1
+
+    listing_all = client.get("/api/devices", params={"include_archived": True})
+    assert "clutter-device" in [d["label"] for d in listing_all.json()]
+
+
+def test_unarchive_device_restores_it_to_the_default_list(client):
+    _upload_txt(client, "temporarily-hidden")
+    client.post("/api/devices/temporarily-hidden/archive")
+    resp = client.post("/api/devices/temporarily-hidden/unarchive")
+    assert resp.status_code == 200
+    assert resp.json()["archived"] is False
+
+    listing = client.get("/api/devices")
+    assert "temporarily-hidden" in [d["label"] for d in listing.json()]
+
+
+def test_archive_unknown_device_returns_404(client):
+    resp = client.post("/api/devices/does-not-exist/archive")
+    assert resp.status_code == 404
+
+
+def test_archived_investigation_is_hidden_from_default_list_but_not_deleted(client):
+    _upload_txt(client, "some-device", investigation_label="clutter-investigation")
+    resp = client.post("/api/investigations/clutter-investigation/archive")
+    assert resp.status_code == 200
+    assert resp.json()["archived"] is True
+
+    listing = client.get("/api/investigations")
+    assert "clutter-investigation" not in [i["label"] for i in listing.json()]
+
+    captures = client.get("/api/investigations/clutter-investigation/captures")
+    assert captures.status_code == 200
+    assert len(captures.json()) == 1

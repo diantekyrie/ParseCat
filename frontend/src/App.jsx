@@ -509,6 +509,31 @@ export default function App() {
     api("/investigations").then(setInvestigations).catch(() => {});
   }, []);
 
+  // Archiving only hides a device/investigation from these lists (and the
+  // datalist dropdowns below) -- it's not deleted, nothing about its
+  // captures changes, and typing the exact label back in still works.
+  async function archiveDevice() {
+    const label = deviceLabel.trim();
+    if (!label) return;
+    try {
+      await api(`/devices/${encodeURIComponent(label)}/archive`, { method: "POST" });
+      refreshDevices();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function archiveInvestigation() {
+    const label = investigationLabel.trim();
+    if (!label) return;
+    try {
+      await api(`/investigations/${encodeURIComponent(label)}/archive`, { method: "POST" });
+      refreshInvestigations();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
   useEffect(() => { refreshDevices(); }, [refreshDevices]);
   useEffect(() => { refreshInvestigations(); }, [refreshInvestigations]);
 
@@ -888,29 +913,49 @@ export default function App() {
             <h2>Device</h2>
             <label>
               Device identifier
-              <input
-                type="text" list="known-devices" placeholder="e.g. frankel-pixel"
-                value={deviceLabel}
-                onChange={(e) => {
-                  setDeviceLabel(e.target.value);
-                  if (!investigationLabel) loadCaptures(e.target.value);
-                }}
-              />
+              <div className="identifier-row">
+                <input
+                  type="text" list="known-devices" placeholder="e.g. frankel-pixel"
+                  value={deviceLabel}
+                  onChange={(e) => {
+                    setDeviceLabel(e.target.value);
+                    if (!investigationLabel) loadCaptures(e.target.value);
+                  }}
+                />
+                <button
+                  type="button" className="secondary-btn"
+                  title="Archive this device -- hides it from the list above, does not delete anything"
+                  disabled={!devices.some((d) => d.label === deviceLabel.trim())}
+                  onClick={archiveDevice}
+                >
+                  Archive
+                </button>
+              </div>
               <datalist id="known-devices">
                 {devices.map((d) => <option key={d.id} value={d.label} />)}
               </datalist>
             </label>
             <label>
               Bug folder
-              <input
-                type="text" list="known-investigations" placeholder="e.g. wifi-drop-at-hotel"
-                value={investigationLabel}
-                onChange={(e) => {
-                  setInvestigationLabel(e.target.value);
-                  setInvDiagnosis(null);
-                  loadInvestigationCaptures(e.target.value);
-                }}
-              />
+              <div className="identifier-row">
+                <input
+                  type="text" list="known-investigations" placeholder="e.g. wifi-drop-at-hotel"
+                  value={investigationLabel}
+                  onChange={(e) => {
+                    setInvestigationLabel(e.target.value);
+                    setInvDiagnosis(null);
+                    loadInvestigationCaptures(e.target.value);
+                  }}
+                />
+                <button
+                  type="button" className="secondary-btn"
+                  title="Archive this investigation -- hides it from the list above, does not delete anything"
+                  disabled={!investigations.some((i) => i.label === investigationLabel.trim())}
+                  onClick={archiveInvestigation}
+                >
+                  Archive
+                </button>
+              </div>
               <datalist id="known-investigations">
                 {investigations.map((i) => <option key={i.id} value={i.label} />)}
               </datalist>
@@ -1820,6 +1865,9 @@ export default function App() {
           padding: 8px 10px; font: inherit; font-size: 13px; background: #0e1420; color: var(--text);
           border: 1px solid var(--panel-border); border-radius: 6px; margin-top: 4px;
         }
+        .identifier-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+        .identifier-row input[type=text] { margin-top: 0; width: auto; flex: 1; min-width: 0; }
+        .identifier-row .secondary-btn { margin-bottom: 0; padding: 9px 12px; font-size: 12px; flex: 0 0 auto; }
         .ask-row { display: flex; align-items: flex-end; gap: 16px; margin-top: 4px; }
         .inline-label { margin-bottom: 0; flex: 0 0 auto; }
         .inline-label select { display: block; }

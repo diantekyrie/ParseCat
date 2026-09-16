@@ -114,14 +114,67 @@ def get_llm_providers():
 
 
 @router.get("/devices")
-def list_devices(session: Session = Depends(get_session)):
-    devices = session.exec(select(Device)).all()
-    return devices
+def list_devices(include_archived: bool = False, session: Session = Depends(get_session)):
+    query = select(Device)
+    if not include_archived:
+        query = query.where(Device.archived == False)  # noqa: E712
+    return session.exec(query).all()
+
+
+@router.post("/devices/{device_label}/archive")
+def archive_device(device_label: str, session: Session = Depends(get_session)):
+    return _set_device_archived(session, device_label, True)
+
+
+@router.post("/devices/{device_label}/unarchive")
+def unarchive_device(device_label: str, session: Session = Depends(get_session)):
+    return _set_device_archived(session, device_label, False)
+
+
+def _set_device_archived(session: Session, device_label: str, archived: bool):
+    device = session.exec(select(Device).where(Device.label == device_label)).first()
+    if device is None:
+        raise HTTPException(404, "Unknown device")
+    # Archiving only hides a device from GET /devices (and the frontend's
+    # device-picker <datalist>) by default -- it is not deleted, and every
+    # existing route that looks it up directly by label still works exactly
+    # as before, so nothing breaks for a user who still has it typed in.
+    device.archived = archived
+    session.add(device)
+    session.commit()
+    session.refresh(device)
+    return device
 
 
 @router.get("/investigations")
-def list_investigations(session: Session = Depends(get_session)):
-    return session.exec(select(Investigation)).all()
+def list_investigations(include_archived: bool = False, session: Session = Depends(get_session)):
+    query = select(Investigation)
+    if not include_archived:
+        query = query.where(Investigation.archived == False)  # noqa: E712
+    return session.exec(query).all()
+
+
+@router.post("/investigations/{investigation_label}/archive")
+def archive_investigation(investigation_label: str, session: Session = Depends(get_session)):
+    return _set_investigation_archived(session, investigation_label, True)
+
+
+@router.post("/investigations/{investigation_label}/unarchive")
+def unarchive_investigation(investigation_label: str, session: Session = Depends(get_session)):
+    return _set_investigation_archived(session, investigation_label, False)
+
+
+def _set_investigation_archived(session: Session, investigation_label: str, archived: bool):
+    investigation = session.exec(
+        select(Investigation).where(Investigation.label == investigation_label)
+    ).first()
+    if investigation is None:
+        raise HTTPException(404, "Unknown investigation")
+    investigation.archived = archived
+    session.add(investigation)
+    session.commit()
+    session.refresh(investigation)
+    return investigation
 
 
 @router.get("/investigations/{investigation_label}/captures")

@@ -1,6 +1,14 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 // Dated incident ordinals do not year-wrap (Dec 31 vs Jan 1 looks ~31 days); see incidentWindow.js.
 import { matchesIncidentWindow } from "./incidentWindow";
+import {
+  EMPTY_VERIFIED_MESSAGE,
+  NEXT_STEPS_LABEL,
+  answerConfidence,
+  flattenVerifiedFacts,
+  hasVerifiedFacts,
+  splitNarrationSections,
+} from "./answerBands";
 
 const SEVERITY_COLOR = { critical: "var(--red)", warning: "var(--amber)", info: "var(--blue)" };
 const CONFIDENCE_COLOR = { HIGH: "var(--green)", MEDIUM: "var(--amber)", LOW: "var(--orange)", UNCONFIRMED: "var(--muted)" };
@@ -408,6 +416,92 @@ function FindingsList({ findings }) {
         ))}
       </ul>
     </>
+  );
+}
+
+
+function ConfidenceChip({ confidence }) {
+  const label = confidence && CONFIDENCE_COLOR[confidence] ? confidence : "UNCONFIRMED";
+  return (
+    <span className="badge" style={{ background: CONFIDENCE_COLOR[label] || CONFIDENCE_COLOR.UNCONFIRMED }}>
+      {label}
+    </span>
+  );
+}
+
+function VerifiedFactRow({ fact }) {
+  return (
+    <li className="verified-fact">
+      <div className="verified-fact-head">
+        <span className="verified-cat">{fact.category}</span>
+        <strong>{fact.summary}</strong>
+        <ConfidenceChip confidence={fact.confidence} />
+      </div>
+      {fact.detail && <div className="muted small">{fact.detail}</div>}
+      <div className="verified-fact-meta">
+        {fact.timestamp && <span className="muted small">{fact.timestamp}</span>}
+        {fact.device_label && <span className="badge device-badge">{fact.device_label}</span>}
+        <CaptureTag filename={fact.original_filename} />
+        <SourceTag source={fact.source} />
+      </div>
+    </li>
+  );
+}
+
+/** Verified-from-log band: parser-backed facts only. Empty => honest empty state. */
+function VerifiedFromLogBand({ bundle, extra }) {
+  const facts = flattenVerifiedFacts(bundle);
+  const conf = answerConfidence(bundle);
+  const empty = !hasVerifiedFacts(bundle) && facts.length === 0;
+  return (
+    <section className="answer-band verified-band" data-testid="verified-from-log">
+      <div className="answer-band-head">
+        <h3>Verified from log</h3>
+        <ConfidenceChip confidence={conf} />
+      </div>
+      <p className="muted small answer-band-note">
+        Structured facts from parsers with SourceRef citations. Confidence is computed in code — not by the model.
+      </p>
+      {empty ? (
+        <p className="empty-verified" data-testid="empty-verified">{EMPTY_VERIFIED_MESSAGE}</p>
+      ) : (
+        <ul className="verified-fact-list">
+          {facts.map((f, i) => <VerifiedFactRow key={i} fact={f} />)}
+        </ul>
+      )}
+      {extra}
+    </section>
+  );
+}
+
+/** Narration band: LLM prose that may only restate verified facts. */
+function NarrationBand({ report, llmError, providerLabel }) {
+  const { narration, nextSteps } = splitNarrationSections(report || "");
+  return (
+    <section className="answer-band narration-band" data-testid="narration-band">
+      <div className="answer-band-head">
+        <h3>
+          Narration
+          {providerLabel && <span className="muted small"> — narrated by {providerLabel}</span>}
+        </h3>
+      </div>
+      <p className="muted small answer-band-note">
+        LLM prose that may only restate verified facts above. Not itself evidence.
+      </p>
+      {report ? (
+        <>
+          <div className="report">{renderMarkdown(narration || report)}</div>
+          {nextSteps && (
+            <div className="next-steps-band" data-testid="next-steps-band">
+              <h4>{NEXT_STEPS_LABEL}</h4>
+              <div className="report next-steps-body">{renderMarkdown(nextSteps)}</div>
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="error">LLM narration failed (verified facts above are unaffected): {llmError}</div>
+      )}
+    </section>
   );
 }
 
@@ -1008,16 +1102,20 @@ export default function App() {
                 {scan && (
                   <div className="ask-result">
                     <CoverageNotice coverage={scan.bundle.capture_coverage} />
-                    <h3>Scan findings</h3>
-                    <FindingsList findings={scan.bundle.ranked_findings} />
-                    {scan.report ? (
-                      <>
-                        <h3>Summary {scan.provider && <span className="muted small"> - narrated by {providers.find((p) => p.id === scan.provider)?.label || scan.provider}</span>}</h3>
-                        <div className="report">{renderMarkdown(scan.report)}</div>
-                      </>
-                    ) : (
-                      <div className="error">LLM narration failed (findings above are unaffected): {scan.llm_error}</div>
-                    )}
+                    <VerifiedFromLogBand
+                      bundle={scan.bundle}
+                      extra={(
+                        <>
+                          <h4 className="verified-subhead">Ranked findings</h4>
+                          <FindingsList findings={scan.bundle.ranked_findings} />
+                        </>
+                      )}
+                    />
+                    <NarrationBand
+                      report={scan.report}
+                      llmError={scan.llm_error}
+                      providerLabel={scan.provider ? (providers.find((p) => p.id === scan.provider)?.label || scan.provider) : null}
+                    />
                   </div>
                 )}
 
@@ -1054,27 +1152,25 @@ export default function App() {
                 {diagnosis && (
                   <div className="ask-result">
                     <CoverageNotice coverage={diagnosis.bundle.capture_coverage} />
-                    {diagnosis.bundle.claims.length === 0 && (
-                      <p className="muted">No app named in the question matched a known package — nothing to verify.</p>
-                    )}
-                    {diagnosis.bundle.claims.map((cl) => <ClaimCard key={cl.package} claim={cl} />)}
-                    <h3>Report {diagnosis.provider && <span className="muted small"> - narrated by {providers.find((p) => p.id === diagnosis.provider)?.label || diagnosis.provider}</span>}</h3>
-                    <button type="button" className="secondary-btn" onClick={exportDiagnosis}>Export diagnosis</button>
-                    {diagnosis.report ? (
-                      <div className="report">{renderMarkdown(diagnosis.report)}</div>
-                    ) : (
-                      <div className="error">LLM narration failed (facts above are unaffected): {diagnosis.llm_error}</div>
-                    )}
+                    <div className="ask-result-toolbar">
+                      <button type="button" className="secondary-btn" onClick={exportDiagnosis}>Export diagnosis</button>
+                    </div>
+                    <VerifiedFromLogBand
+                      bundle={diagnosis.bundle}
+                      extra={diagnosis.bundle.claims.map((cl) => <ClaimCard key={cl.package} claim={cl} />)}
+                    />
+                    <NarrationBand
+                      report={diagnosis.report}
+                      llmError={diagnosis.llm_error}
+                      providerLabel={diagnosis.provider ? (providers.find((p) => p.id === diagnosis.provider)?.label || diagnosis.provider) : null}
+                    />
 
                     {(diagnosis.followUps || []).map((turn, i) => (
                       <div className="follow-up-turn" key={i}>
                         <h3>Follow-up: {turn.question}</h3>
                         <CoverageNotice coverage={turn.bundle && turn.bundle.capture_coverage} />
-                        {turn.report ? (
-                          <div className="report">{renderMarkdown(turn.report)}</div>
-                        ) : (
-                          <div className="error">LLM narration failed: {turn.llm_error}</div>
-                        )}
+                        <VerifiedFromLogBand bundle={turn.bundle} />
+                        <NarrationBand report={turn.report} llmError={turn.llm_error} />
                       </div>
                     ))}
 
@@ -1134,38 +1230,29 @@ export default function App() {
                     {(invDiagnosis.bundle.captures || []).map((cap) => (
                       <CoverageNotice key={`cov-${cap.capture_id}`} coverage={cap.capture_coverage} />
                     ))}
-                    {invDiagnosis.bundle.captures.map((cap) => (
-                      <div key={cap.capture_id}>
-                        {cap.claims.map((cl) => (
+                    <div className="ask-result-toolbar">
+                      <button type="button" className="secondary-btn" onClick={exportInvestigationDiagnosis}>Export diagnosis</button>
+                    </div>
+                    <VerifiedFromLogBand
+                      bundle={invDiagnosis.bundle}
+                      extra={(invDiagnosis.bundle.captures || []).flatMap((cap) =>
+                        (cap.claims || []).map((cl) => (
                           <ClaimCard key={`${cap.capture_id}-${cl.package}`} claim={cl} deviceLabel={cap.device_label} />
-                        ))}
-                      </div>
-                    ))}
-                    {invDiagnosis.bundle.captures.every((cap) => cap.claims.length === 0) && (
-                      <p className="muted">No app named in the question matched a known package in any linked capture — nothing to verify.</p>
-                    )}
-                    <h3>
-                      Report
-                      {invDiagnosis.provider && (
-                        <span className="muted small"> - narrated by {providers.find((p) => p.id === invDiagnosis.provider)?.label || invDiagnosis.provider}</span>
+                        ))
                       )}
-                    </h3>
-                    <button type="button" className="secondary-btn" onClick={exportInvestigationDiagnosis}>Export diagnosis</button>
-                    {invDiagnosis.report ? (
-                      <div className="report">{renderMarkdown(invDiagnosis.report)}</div>
-                    ) : (
-                      <div className="error">LLM narration failed (facts above are unaffected): {invDiagnosis.llm_error}</div>
-                    )}
+                    />
+                    <NarrationBand
+                      report={invDiagnosis.report}
+                      llmError={invDiagnosis.llm_error}
+                      providerLabel={invDiagnosis.provider ? (providers.find((p) => p.id === invDiagnosis.provider)?.label || invDiagnosis.provider) : null}
+                    />
 
                     {(invDiagnosis.followUps || []).map((turn, i) => (
                       <div className="follow-up-turn" key={i}>
                         <h3>Follow-up: {turn.question}</h3>
                         <CoverageNotice coverage={turn.bundle && turn.bundle.capture_coverage} />
-                        {turn.report ? (
-                          <div className="report">{renderMarkdown(turn.report)}</div>
-                        ) : (
-                          <div className="error">LLM narration failed: {turn.llm_error}</div>
-                        )}
+                        <VerifiedFromLogBand bundle={turn.bundle} />
+                        <NarrationBand report={turn.report} llmError={turn.llm_error} />
                       </div>
                     ))}
 
@@ -1862,6 +1949,25 @@ export default function App() {
         .finding-detail { margin-top: 3px; word-break: break-word; }
         .finding-meta { display: flex; align-items: center; gap: 10px; margin-top: 5px; flex-wrap: wrap; }
         .ask-result { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--panel-border); }
+
+        .answer-band { border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px 14px; margin: 12px 0; background: #0e1420; }
+        .verified-band { border-color: var(--green); }
+        .narration-band { border-color: var(--blue); }
+        .answer-band-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+        .answer-band-head h3 { margin: 0; font-size: 14px; text-transform: uppercase; letter-spacing: 0.04em; }
+        .answer-band-note { margin: 0 0 10px; }
+        .verified-subhead { margin: 12px 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+        .empty-verified { color: var(--amber); font-weight: 600; margin: 8px 0 0; }
+        .verified-fact-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+        .verified-fact { background: #10151f; border: 1px solid #1c2433; border-radius: 6px; padding: 8px 10px; }
+        .verified-fact-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+        .verified-cat { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); font-weight: 700; }
+        .verified-fact-meta { display: flex; align-items: center; gap: 10px; margin-top: 4px; flex-wrap: wrap; }
+        .next-steps-band { margin-top: 14px; padding: 10px 12px; border: 1px dashed var(--amber); border-radius: 8px; background: #14110a; }
+        .next-steps-band h4 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--amber); }
+        .next-steps-body { max-height: 240px; border-style: dashed; }
+        .ask-result-toolbar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+
 
         .tabbar { display: flex; gap: 2px; border-bottom: 1px solid var(--panel-border); position: sticky; top: 0; z-index: 2; background: var(--bg); padding-top: 2px; }
         .tab { background: transparent; color: var(--muted); border: none; border-radius: 8px 8px 0 0; padding: 9px 16px; font-size: 13px; font-weight: 600; }

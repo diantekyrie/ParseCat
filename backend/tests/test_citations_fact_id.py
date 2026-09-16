@@ -126,10 +126,113 @@ def test_fact_id_is_deterministic_same_bundle_same_ids():
 
 
 def _claim_cap(capture_id: int, original_filename: str) -> dict:
-    """Minimal capture with an identical claim signature (no device_label)."""
+    """Minimal capture with an identical claim signature (no device_label).
+
+    Populates all four claims-path _fact() categories (entity/crash/anr/
+    native_crash) so a typo in any loop cannot slip past CI.
+    """
     return {
         "capture_id": capture_id,
         "original_filename": original_filename,
+        "claims": [
+            {
+                "package": "com.example.app",
+                "confidence": "HIGH",
+                "corroboration": "seen in dumpsys",
+                "verified_state": {
+                    "crash_events": [
+                        {
+                            "package": "com.example.app",
+                            "exception_class": "NullPointerException",
+                            "message": "npe",
+                            "timestamp": "08-13 12:00:00.000",
+                            "source": {
+                                "section": "system_log",
+                                "line_start": 10,
+                                "line_end": 20,
+                            },
+                        }
+                    ],
+                    "anrs": [
+                        {
+                            "package": "com.example.app",
+                            "reason": "Input dispatching timed out",
+                            "timestamp": "08-13 12:01:00.000",
+                            "source": {
+                                "section": "system_log",
+                                "line_start": 30,
+                                "line_end": 40,
+                            },
+                        }
+                    ],
+                    "native_crashes": [
+                        {
+                            "package": "com.example.app",
+                            "executable": "app_process64",
+                            "signal_name": "SIGSEGV",
+                            "timestamp": "08-13 12:02:00.000",
+                            "source": {
+                                "section": "tombstone",
+                                "line_start": 1,
+                                "line_end": 50,
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+    }
+
+
+def test_claim_facts_distinct_across_captures_without_device_label():
+    """Issue #54: multi-capture + no device_label must not collide on fact_id.
+
+    Claims-path historically omitted capture_id/original_filename; without a
+    per-capture discriminator, identical claim signatures across two captures
+    hashed to the same vf_… id and broke the #49 identity contract.
+    Covers all four claims-path categories (entity/crash/anr/native_crash).
+    """
+    categories = {"entity", "crash", "anr", "native_crash"}
+    bundle = {
+        "captures": [
+            _claim_cap(1, "bugreport-a.zip"),
+            _claim_cap(2, "bugreport-b.zip"),
+        ],
+    }
+    facts = collect_verified_facts(bundle)
+    # Two captures × 4 categories = 8 claim-derived facts
+    claim_facts = [f for f in facts if f["category"] in categories]
+    assert len(claim_facts) == 8
+    ids = [f["fact_id"] for f in claim_facts]
+    assert len(set(ids)) == len(ids), f"collision: {ids}"
+
+    by_capture = {}
+    for f in claim_facts:
+        by_capture.setdefault(f["capture_id"], []).append(f)
+    assert set(by_capture) == {1, 2}
+    for cap_id, cap_facts in by_capture.items():
+        assert {f["category"] for f in cap_facts} == categories
+        assert all(f["capture_id"] == cap_id for f in cap_facts)
+        assert all(
+            f.get("original_filename")
+            == ("bugreport-a.zip" if cap_id == 1 else "bugreport-b.zip")
+            for f in cap_facts
+        )
+
+    # Determinism: same investigation → same ids
+    again = collect_verified_facts(bundle)
+    assert [f["fact_id"] for f in again] == [f["fact_id"] for f in facts]
+
+
+def test_single_capture_dict_captures_unchanged_without_invented_identity():
+    """Diagnosis-shaped bundles use captures as dict {id: filename}.
+
+    That shape must not hit the investigation list-flatten branch, and claim
+    facts without capture identity on the claim/bundle stay unset (no invented
+    id from the dict map). fact_ids stay stable across runs.
+    """
+    bundle = {
+        "captures": {"1": "bugreport-a.zip"},  # dict, not list
         "claims": [
             {
                 "package": "com.example.app",
@@ -155,35 +258,10 @@ def _claim_cap(capture_id: int, original_filename: str) -> dict:
             }
         ],
     }
-
-
-def test_claim_facts_distinct_across_captures_without_device_label():
-    """Issue #54: multi-capture + no device_label must not collide on fact_id.
-
-    Claims-path historically omitted capture_id/original_filename; without a
-    per-capture discriminator, identical claim signatures across two captures
-    hashed to the same vf_… id and broke the #49 identity contract.
-    """
-    bundle = {
-        "captures": [
-            _claim_cap(1, "bugreport-a.zip"),
-            _claim_cap(2, "bugreport-b.zip"),
-        ],
-    }
     facts = collect_verified_facts(bundle)
-    # Two captures × (entity + crash) = 4 claim-derived facts
     claim_facts = [f for f in facts if f["category"] in ("entity", "crash")]
-    assert len(claim_facts) == 4
-    ids = [f["fact_id"] for f in claim_facts]
-    assert len(set(ids)) == len(ids), f"collision: {ids}"
-
-    by_capture = {}
-    for f in claim_facts:
-        by_capture.setdefault(f["capture_id"], []).append(f)
-    assert set(by_capture) == {1, 2}
-    for cap_facts in by_capture.values():
-        assert {f["category"] for f in cap_facts} == {"entity", "crash"}
-
-    # Determinism: same investigation → same ids
+    assert len(claim_facts) == 2
+    assert all(f.get("capture_id") is None for f in claim_facts)
+    assert all(f.get("original_filename") is None for f in claim_facts)
     again = collect_verified_facts(bundle)
     assert [f["fact_id"] for f in again] == [f["fact_id"] for f in facts]

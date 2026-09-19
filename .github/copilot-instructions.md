@@ -44,11 +44,13 @@ richest backend tests (`backend/tests/test_parsers_fixtures.py`,
 `test_end_to_end.py`) are gated behind real bugreport fixtures
 (`backend/tests/fixtures/*.zip`) that are deliberately gitignored --
 real device captures, never committed. They do not exist on the CI
-runner, so 78 of the 113 backend tests are silently skipped there (35
-pass, 78 skip -- verified, not estimated). CI passing means the
-synthetic/regression suite is green, NOT that the full corpus ran. Any
-change touching a parser needs a local run with the real fixtures
-present: `cd backend && python -m pytest tests/ -q`.
+runner, so fixture-gated tests are silently skipped there. `pytest
+tests/ --collect-only` on this branch reports **116** collected (not
+the older 113; do not treat a hardcoded pass/skip split as current
+without a fresh collect-only and CI log). CI passing means the
+synthetic/regression suite that executes is green, NOT that the full
+corpus ran. Any change touching a parser needs a local run with the
+real fixtures present: `cd backend && python -m pytest tests/ -q`.
 
 ## Working style
 

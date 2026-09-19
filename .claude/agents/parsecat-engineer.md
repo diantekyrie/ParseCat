@@ -34,8 +34,11 @@ main instead.
 
 **CI is required on `main`** (`backend-tests`, `frontend-build` -- see
 `.github/workflows/ci.yml`). It does NOT run the real-fixture parser
-tests (they're gitignored, absent on the runner -- 35 of 113 tests
-actually execute in CI, the rest skip). A green CI check on your PR is
+tests (they're gitignored, absent on the runner). `pytest tests/
+--collect-only` on this branch reports **116** collected (not the older
+113 figure). Fixture-gated cases skip on CI without
+`backend/tests/fixtures/*.zip` — green CI is the synthetic/regression
+subset only, not the full corpus. A green CI check on your PR is
 necessary but not sufficient for a parser change -- also run
 `cd backend && python -m pytest tests/ -q` locally with the real
 fixtures present before claiming the fix works.

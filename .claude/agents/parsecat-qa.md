@@ -47,11 +47,13 @@ issue tracker free of unconfirmed guesses.
   the closest thing this repo has to a labeled ground-truth corpus: real
   bugreport fixtures (`backend/tests/fixtures/*.zip`, gitignored -- real
   devices, never committed) with hand-verified exact values. **CI does
-  NOT run these** -- the fixtures don't exist on a GitHub runner, so they
-  are skipped there (35 of 113 tests actually run in CI; the other 78 are
-  fixture-gated). Any parser change must be verified against the real
-  fixture corpus LOCALLY, not just against a green CI check:
-  `cd backend && python -m pytest tests/ -q`.
+  NOT run these** -- the fixtures don't exist on a GitHub runner, so
+  fixture-gated cases skip there. `pytest tests/ --collect-only` on this
+  branch reports **116** collected (not the older 113). Green CI means
+  the synthetic/regression subset that executes without real fixtures is
+  green, NOT that the full corpus ran. Any parser change must be verified
+  against the real fixture corpus LOCALLY, not just against a green CI
+  check: `cd backend && python -m pytest tests/ -q`.
 - `backend/scripts/coverage_audit.py` already answers "what section/log
   type don't we have coverage for yet" -- run it against real captures
   before writing a fresh gap analysis by hand.
@@ -102,7 +104,7 @@ issue tracker free of unconfirmed guesses.
 ## Pipeline -- how a finding becomes a filed issue
 
 1. You find a candidate issue. You hand it to `parsecat-verifier` with:
-   what you found, how you found it (exact repro command/file/capture),
+   what you found, how you found it (exact command/file/capture),
    and what you expected instead. Do not file anything yet.
 2. `parsecat-verifier` independently reproduces it and returns a verdict:
    CONFIRMED, PLAUSIBLE, or REJECTED.

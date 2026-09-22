@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlmodel import Session, select
 
@@ -195,6 +195,15 @@ def get_or_create_investigation(session: Session, investigation_label: str) -> I
     return investigation
 
 
+def _as_utc(dt: datetime | None) -> datetime | None:
+    """Treat naive datetimes as UTC so SQLModel/SQLAlchemy bind accepts them."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def persist_capture(
     session: Session,
     device_label: str,
@@ -209,7 +218,7 @@ def persist_capture(
     capture = Capture(
         device_id=device.id,
         original_filename=original_filename,
-        captured_at=captured_at,
+        captured_at=_as_utc(captured_at),
         parse_warnings="\n".join(parsed.parse_warnings),
     )
     session.add(capture)

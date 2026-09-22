@@ -6,7 +6,7 @@ use timezone-aware UTC — never datetime.utcnow.
 """
 from __future__ import annotations
 
-from datetime import timezone
+from datetime import datetime, timezone
 
 from sqlmodel import Session, SQLModel, create_engine
 
@@ -60,3 +60,34 @@ def test_device_and_capture_defaults_survive_session_commit():
         assert device.created_at.utcoffset() == timezone.utc.utcoffset(device.created_at)
         assert capture.ingested_at.tzinfo is not None
         assert capture.ingested_at.utcoffset() == timezone.utc.utcoffset(capture.ingested_at)
+
+
+def test_naive_captured_at_survives_session_commit():
+    """Caller-supplied naive captured_at must coerce at bind, not 500.
+
+    Defaults-only coverage misses this path (see CI failure on
+    test_matching_identity_different_dates_merges before the coerce).
+    """
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        device = Device(label="tz-naive-captured-at")
+        session.add(device)
+        session.commit()
+        session.refresh(device)
+
+        naive = datetime(2026, 8, 13, 12, 0, 0)  # intentionally naive
+        assert naive.tzinfo is None
+        capture = Capture(
+            device_id=device.id,
+            original_filename="day-one.txt",
+            captured_at=naive,
+        )
+        session.add(capture)
+        session.commit()
+        session.refresh(capture)
+
+        assert capture.captured_at is not None
+        assert capture.captured_at.tzinfo is not None
+        assert capture.captured_at.utcoffset() == timezone.utc.utcoffset(capture.captured_at)
+        assert capture.captured_at.replace(tzinfo=None) == naive

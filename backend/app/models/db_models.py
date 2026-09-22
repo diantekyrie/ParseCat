@@ -8,13 +8,51 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy import Column, Dialect, types
+from sqlalchemy.types import TypeDecorator
 from sqlmodel import Field, SQLModel
+
+
+class AwareUTCDateTime(TypeDecorator):
+    """UTC DateTime that coerces naive values instead of rejecting them.
+
+    SQLModel's default UTCDateTime raises at bind when tzinfo is missing.
+    Caller-supplied fields (e.g. Capture.captured_at from tests or parsers)
+    are often naive; treat those as UTC so Session.commit() does not 500.
+    """
+
+    impl = types.DateTime
+    cache_ok = True
+
+    def __init__(self) -> None:
+        super().__init__(timezone=True)
+
+    def process_bind_param(
+        self, value: datetime | None, dialect: Dialect
+    ) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def process_result_value(
+        self, value: datetime | None, dialect: Dialect
+    ) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
 
 class Device(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     label: str = Field(index=True, unique=True)  # user-chosen identifier, e.g. serial or nickname
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(AwareUTCDateTime(), nullable=False),
+    )
     # Soft-delete, not a real DELETE: no cascade-delete exists across the
     # 30+ fact tables that key off capture_id, so hard-deleting a device
     # would mean manually cleaning every one of those tables (and silently
@@ -28,15 +66,25 @@ class Capture(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     device_id: int = Field(foreign_key="device.id", index=True)
     original_filename: str
-    captured_at: Optional[datetime] = None   # parsed from the bugreport's own timestamp, if known
-    ingested_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # parsed from the bugreport's own timestamp, if known; naive values coerced to UTC at bind
+    captured_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(AwareUTCDateTime(), nullable=True),
+    )
+    ingested_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(AwareUTCDateTime(), nullable=False),
+    )
     parse_warnings: str = ""                 # newline-joined; empty string = clean parse
 
 
 class Investigation(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     label: str = Field(index=True, unique=True)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(AwareUTCDateTime(), nullable=False),
+    )
     archived: bool = Field(default=False, index=True)  # see Device.archived
 
 
@@ -44,7 +92,10 @@ class InvestigationCaptureLink(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     investigation_id: int = Field(foreign_key="investigation.id", index=True)
     capture_id: int = Field(foreign_key="capture.id", index=True, unique=True)
-    added_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    added_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(AwareUTCDateTime(), nullable=False),
+    )
 
 
 class FocusStackEntryRow(SQLModel, table=True):

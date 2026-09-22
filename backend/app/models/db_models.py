@@ -5,7 +5,7 @@ re-parse of every uploaded zip.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlmodel import Field, SQLModel
@@ -14,7 +14,7 @@ from sqlmodel import Field, SQLModel
 class Device(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     label: str = Field(index=True, unique=True)  # user-chosen identifier, e.g. serial or nickname
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     # Soft-delete, not a real DELETE: no cascade-delete exists across the
     # 30+ fact tables that key off capture_id, so hard-deleting a device
     # would mean manually cleaning every one of those tables (and silently
@@ -29,14 +29,14 @@ class Capture(SQLModel, table=True):
     device_id: int = Field(foreign_key="device.id", index=True)
     original_filename: str
     captured_at: Optional[datetime] = None   # parsed from the bugreport's own timestamp, if known
-    ingested_at: datetime = Field(default_factory=datetime.utcnow)
+    ingested_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     parse_warnings: str = ""                 # newline-joined; empty string = clean parse
 
 
 class Investigation(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     label: str = Field(index=True, unique=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     archived: bool = Field(default=False, index=True)  # see Device.archived
 
 
@@ -44,7 +44,7 @@ class InvestigationCaptureLink(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     investigation_id: int = Field(foreign_key="investigation.id", index=True)
     capture_id: int = Field(foreign_key="capture.id", index=True, unique=True)
-    added_at: datetime = Field(default_factory=datetime.utcnow)
+    added_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class FocusStackEntryRow(SQLModel, table=True):

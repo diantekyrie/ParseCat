@@ -4,7 +4,7 @@ No real bugreport zips. Serials and fingerprints in fixtures are synthetic.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -75,11 +75,11 @@ def test_matching_identity_different_dates_merges(session):
     second = _capture_with_identity(serial="serial-a", build_fingerprint="fingerprint-a")
     persist_capture(
         session, "Pixel", "day-one.txt", first,
-        captured_at=datetime(2026, 8, 13, 12, 0, 0),
+        captured_at=datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc),
     )
     persist_capture(
         session, "Pixel", "day-two.txt", second,
-        captured_at=datetime(2026, 8, 19, 18, 30, 0),
+        captured_at=datetime(2026, 8, 19, 18, 30, 0, tzinfo=timezone.utc),
     )
 
     captures = session.exec(select(Capture).order_by(Capture.id)).all()

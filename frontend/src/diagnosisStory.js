@@ -28,10 +28,16 @@ export function buildIdentityFields({
   const buildFingerprint = firstString(ctx.build_fingerprint, info.build_fingerprint);
   const buildId = firstString(ctx.build_id, info.build_id);
   const filename = firstString(cap.original_filename, info.original_filename);
+  // Provenance (Arch #64): never label ingested_at as "Captured".
+  // Prefer captured_at for Captured; only when that is absent, push a
+  // separate Ingested row so the timestamp stays visible but honestly named.
   const capturedAt = firstString(
     formatMaybeDate(cap.captured_at),
     formatMaybeDate(info.captured_at),
+  );
+  const ingestedAt = firstString(
     formatMaybeDate(cap.ingested_at),
+    formatMaybeDate(info.ingested_at),
   );
   const label = firstString(deviceLabel, cap.device_label, info.device_label);
 
@@ -56,15 +62,20 @@ export function buildIdentityFields({
     fields.push({ key: "build", label: "Build", value: buildId });
   }
   if (filename) fields.push({ key: "capture", label: "Capture", value: filename });
-  if (capturedAt) fields.push({ key: "captured_at", label: "Captured", value: capturedAt });
+  if (capturedAt) {
+    fields.push({ key: "captured_at", label: "Captured", value: capturedAt });
+  } else if (ingestedAt) {
+    fields.push({ key: "ingested_at", label: "Ingested", value: ingestedAt });
+  }
   return fields;
 }
 
 /**
  * Expected vs Actual contrast.
- * Prefer sequence_check / explicit expected+actual from the bundle.
+ * Prefer sequence_check_evidence from the bundle when present.
  * Otherwise Observed-only from deterministic findings/facts — never invent
- * a happy-path Expected sequence.
+ * a happy-path Expected sequence. Freeform bundle.expected/actual are NOT
+ * a code-owned contract today — do not treat them as explicit mode.
  */
 export function buildExpectedVsActual(bundle) {
   if (!bundle || typeof bundle !== "object") {
@@ -97,15 +108,9 @@ export function buildExpectedVsActual(bundle) {
     };
   }
 
-  if (bundle.expected != null || bundle.actual != null) {
-    return {
-      mode: "explicit",
-      expected: asTextOrNull(bundle.expected),
-      actual: asTextOrNull(bundle.actual),
-      note: null,
-    };
-  }
-
+  // Invent-nothing: ignore freeform bundle.expected / bundle.actual until
+  // build_diagnosis_bundle / diagnose_investigation emit them as a documented
+  // code-owned contract. Fall through to observed-only / empty.
   const observed = pickObservedText(bundle);
   if (!observed) {
     return {
@@ -286,24 +291,6 @@ function formatMaybeDate(v) {
   if (v == null) return null;
   if (typeof v === "string" && v.trim()) return v.trim();
   if (v instanceof Date && !Number.isNaN(v.getTime())) return v.toISOString();
-  return null;
-}
-
-function asTextOrNull(v) {
-  if (v == null) return null;
-  if (typeof v === "string") return v.trim() || null;
-  if (typeof v === "number" || typeof v === "boolean") return String(v);
-  if (Array.isArray(v)) {
-    const parts = v.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).filter(Boolean);
-    return parts.length ? parts.join("; ") : null;
-  }
-  if (typeof v === "object") {
-    try {
-      return JSON.stringify(v);
-    } catch {
-      return null;
-    }
-  }
   return null;
 }
 

@@ -108,18 +108,6 @@ export function ExpectedVsActual({ bundle }) {
           </div>
         </>
       )}
-      {contrast.mode === "explicit" && (
-        <div className="ea-grid">
-          <div className="ea-card ea-expected">
-            <div className="ea-card-label">Expected</div>
-            <div className="ea-card-body">{contrast.expected || <span className="muted">—</span>}</div>
-          </div>
-          <div className="ea-card ea-actual">
-            <div className="ea-card-label">Actual</div>
-            <div className="ea-card-body">{contrast.actual || <span className="muted">—</span>}</div>
-          </div>
-        </div>
-      )}
       {contrast.mode === "sequence_check" && (
         <>
           {contrast.sequence && (

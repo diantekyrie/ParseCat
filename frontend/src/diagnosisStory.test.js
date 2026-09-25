@@ -27,6 +27,30 @@ test("buildIdentityFields returns empty when nothing present", () => {
   assert.deepEqual(buildIdentityFields(), []);
 });
 
+test("buildIdentityFields: ingested_at alone never produces a Captured field", () => {
+  const fields = buildIdentityFields({
+    capture: { original_filename: "bugreport.zip", ingested_at: "2026-09-20T08:00:00Z" },
+  });
+  const byKey = Object.fromEntries(fields.map((f) => [f.key, f]));
+  assert.equal(byKey.captured_at, undefined);
+  assert.equal(fields.find((f) => f.label === "Captured"), undefined);
+  assert.equal(byKey.ingested_at.label, "Ingested");
+  assert.equal(byKey.ingested_at.value, "2026-09-20T08:00:00Z");
+});
+
+test("buildIdentityFields: captured_at prefers Captured and does not also emit Ingested", () => {
+  const fields = buildIdentityFields({
+    capture: {
+      captured_at: "2026-09-01T12:00:00Z",
+      ingested_at: "2026-09-20T08:00:00Z",
+    },
+  });
+  const byKey = Object.fromEntries(fields.map((f) => [f.key, f]));
+  assert.equal(byKey.captured_at.label, "Captured");
+  assert.equal(byKey.captured_at.value, "2026-09-01T12:00:00Z");
+  assert.equal(byKey.ingested_at, undefined);
+});
+
 test("buildExpectedVsActual is invent-nothing: observed-only without sequence_check", () => {
   const contrast = buildExpectedVsActual({
     ranked_findings: [
@@ -67,6 +91,34 @@ test("buildExpectedVsActual uses sequence_check_evidence when present", () => {
   assert.equal(contrast.sequence, "wifi_assoc");
   assert.equal(contrast.expected.length, 2);
   assert.equal(contrast.expected[1].status, "not_reached");
+});
+
+test("buildExpectedVsActual: freeform expected/actual keys do not switch to explicit mode", () => {
+  const withFindings = buildExpectedVsActual({
+    expected: "phone pairs cleanly",
+    actual: "pairing failed",
+    ranked_findings: [
+      {
+        severity: "HIGH",
+        category: "bluetooth",
+        title: "Pairing failure",
+        detail: "bond state BOND_NONE",
+        confidence: "HIGH",
+      },
+    ],
+  });
+  assert.notEqual(withFindings.mode, "explicit");
+  assert.equal(withFindings.mode, "observed_only");
+  assert.match(withFindings.actual, /Pairing failure/);
+
+  const freeformOnly = buildExpectedVsActual({
+    expected: "should work",
+    actual: "did not work",
+  });
+  assert.notEqual(freeformOnly.mode, "explicit");
+  assert.equal(freeformOnly.mode, "empty");
+  assert.equal(freeformOnly.expected, null);
+  assert.equal(freeformOnly.actual, null);
 });
 
 test("buildClassification never invents from prose — Unconfirmed when empty", () => {

@@ -1227,7 +1227,12 @@ export default function App() {
                       <div className="follow-up-turn" key={i}>
                         <h3>Follow-up: {turn.question}</h3>
                         <CoverageNotice coverage={turn.bundle && turn.bundle.capture_coverage} />
-                        <DiagnosisStory bundle={turn.bundle} deviceLabel={deviceLabel} />
+                        <DiagnosisStory
+                          bundle={turn.bundle}
+                          capture={captures.find((cap) => cap.id === selectedCaptureId)}
+                          deviceInfo={(summary?.device_infos || []).find((d) => d.capture_id === selectedCaptureId)}
+                          deviceLabel={deviceLabel}
+                        />
                         <VerifiedFromLogBand bundle={turn.bundle} />
                         <NarrationBand report={turn.report} llmError={turn.llm_error} />
                       </div>
@@ -1294,7 +1299,13 @@ export default function App() {
                     </div>
                     <DiagnosisStory
                       bundle={invDiagnosis.bundle}
-                      deviceLabel={investigationLabel || deviceLabel}
+                      deviceContext={(invDiagnosis.bundle.captures || [])[0]?.device_context}
+                      capture={(invDiagnosis.bundle.captures || [])[0]}
+                      deviceLabel={
+                        (invDiagnosis.bundle.captures || [])[0]?.device_label
+                        || investigationLabel
+                        || deviceLabel
+                      }
                     />
                     <VerifiedFromLogBand
                       bundle={invDiagnosis.bundle}
@@ -1314,7 +1325,16 @@ export default function App() {
                       <div className="follow-up-turn" key={i}>
                         <h3>Follow-up: {turn.question}</h3>
                         <CoverageNotice coverage={turn.bundle && turn.bundle.capture_coverage} />
-                        <DiagnosisStory bundle={turn.bundle} deviceLabel={investigationLabel || deviceLabel} />
+                        <DiagnosisStory
+                          bundle={turn.bundle}
+                          deviceContext={(turn.bundle?.captures || [])[0]?.device_context}
+                          capture={(turn.bundle?.captures || [])[0]}
+                          deviceLabel={
+                            (turn.bundle?.captures || [])[0]?.device_label
+                            || investigationLabel
+                            || deviceLabel
+                          }
+                        />
                         <VerifiedFromLogBand bundle={turn.bundle} />
                         <NarrationBand report={turn.report} llmError={turn.llm_error} />
                       </div>

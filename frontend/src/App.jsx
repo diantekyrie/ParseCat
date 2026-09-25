@@ -9,6 +9,7 @@ import {
   hasVerifiedFacts,
   splitNarrationSections,
 } from "./answerBands";
+import DiagnosisStory, { IdentityStrip } from "./DiagnosisStory";
 
 const SEVERITY_COLOR = { critical: "var(--red)", warning: "var(--amber)", info: "var(--blue)" };
 const CONFIDENCE_COLOR = { HIGH: "var(--green)", MEDIUM: "var(--amber)", LOW: "var(--orange)", UNCONFIRMED: "var(--muted)" };
@@ -1147,6 +1148,12 @@ export default function App() {
                 {scan && (
                   <div className="ask-result">
                     <CoverageNotice coverage={scan.bundle.capture_coverage} />
+                    <DiagnosisStory
+                      bundle={scan.bundle}
+                      capture={captures.find((cap) => cap.id === selectedCaptureId)}
+                      deviceInfo={(summary?.device_infos || []).find((d) => d.capture_id === selectedCaptureId)}
+                      deviceLabel={deviceLabel}
+                    />
                     <VerifiedFromLogBand
                       bundle={scan.bundle}
                       extra={(
@@ -1200,6 +1207,12 @@ export default function App() {
                     <div className="ask-result-toolbar">
                       <button type="button" className="secondary-btn" onClick={exportDiagnosis}>Export diagnosis</button>
                     </div>
+                    <DiagnosisStory
+                      bundle={diagnosis.bundle}
+                      capture={captures.find((cap) => cap.id === selectedCaptureId)}
+                      deviceInfo={(summary?.device_infos || []).find((d) => d.capture_id === selectedCaptureId)}
+                      deviceLabel={deviceLabel}
+                    />
                     <VerifiedFromLogBand
                       bundle={diagnosis.bundle}
                       extra={diagnosis.bundle.claims.map((cl) => <ClaimCard key={cl.package} claim={cl} />)}
@@ -1214,6 +1227,7 @@ export default function App() {
                       <div className="follow-up-turn" key={i}>
                         <h3>Follow-up: {turn.question}</h3>
                         <CoverageNotice coverage={turn.bundle && turn.bundle.capture_coverage} />
+                        <DiagnosisStory bundle={turn.bundle} deviceLabel={deviceLabel} />
                         <VerifiedFromLogBand bundle={turn.bundle} />
                         <NarrationBand report={turn.report} llmError={turn.llm_error} />
                       </div>
@@ -1278,6 +1292,10 @@ export default function App() {
                     <div className="ask-result-toolbar">
                       <button type="button" className="secondary-btn" onClick={exportInvestigationDiagnosis}>Export diagnosis</button>
                     </div>
+                    <DiagnosisStory
+                      bundle={invDiagnosis.bundle}
+                      deviceLabel={investigationLabel || deviceLabel}
+                    />
                     <VerifiedFromLogBand
                       bundle={invDiagnosis.bundle}
                       extra={(invDiagnosis.bundle.captures || []).flatMap((cap) =>
@@ -1296,6 +1314,7 @@ export default function App() {
                       <div className="follow-up-turn" key={i}>
                         <h3>Follow-up: {turn.question}</h3>
                         <CoverageNotice coverage={turn.bundle && turn.bundle.capture_coverage} />
+                        <DiagnosisStory bundle={turn.bundle} deviceLabel={investigationLabel || deviceLabel} />
                         <VerifiedFromLogBand bundle={turn.bundle} />
                         <NarrationBand report={turn.report} llmError={turn.llm_error} />
                       </div>
@@ -1354,6 +1373,15 @@ export default function App() {
 
               {activeTab === "overview" && (
                 <>
+                  {selectedCaptureId && (
+                    <IdentityStrip
+                      compact
+                      capture={captures.find((cap) => cap.id === selectedCaptureId)}
+                      deviceInfo={(summary.device_infos || []).find((d) => d.capture_id === selectedCaptureId)
+                        || summary.device_infos?.[0]}
+                      deviceLabel={deviceLabel || investigationLabel}
+                    />
+                  )}
                   <section className="panel">
                     <h2>Device information</h2>
                     {summary.device_infos.length === 0 && <p className="muted">No device info parsed for any linked capture.</p>}
@@ -2015,6 +2043,39 @@ export default function App() {
         .next-steps-band h4 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--amber); }
         .next-steps-body { max-height: 240px; border-style: dashed; }
         .ask-result-toolbar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+
+        .diagnosis-story { border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px 14px; margin: 12px 0; background: #0c1018; border-color: var(--amber); }
+        .diagnosis-story-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+        .diagnosis-story-head h3 { margin: 0; font-size: 14px; text-transform: uppercase; letter-spacing: 0.04em; }
+        .classification-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .classification-label { text-transform: uppercase; letter-spacing: 0.04em; }
+        .identity-strip { margin: 10px 0 12px; padding: 10px 12px; border: 1px solid var(--panel-border); border-radius: 8px; background: #0e1420; }
+        .identity-strip-compact { margin: 0 0 12px; }
+        .identity-strip-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); font-weight: 700; margin-bottom: 8px; }
+        .identity-strip-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px 16px; margin: 0; }
+        .identity-strip-item dt { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin: 0 0 2px; }
+        .identity-strip-item dd { margin: 0; font-size: 12.5px; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .story-panel { margin-top: 12px; }
+        .story-panel-title { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+        .story-honest-note { margin: 0 0 8px; }
+        .ea-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .ea-grid-single { grid-template-columns: 1fr; }
+        .ea-card { border: 1px solid var(--panel-border); border-radius: 6px; padding: 10px 12px; background: #10151f; }
+        .ea-expected { border-color: var(--blue); }
+        .ea-actual { border-color: var(--amber); }
+        .ea-card-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); font-weight: 700; margin-bottom: 6px; }
+        .ea-card-body { font-size: 13px; line-height: 1.45; word-break: break-word; }
+        .seq-steps { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; }
+        .seq-step { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+        .cited-timeline-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 280px; overflow-y: auto; }
+        .cited-timeline-row { display: grid; grid-template-columns: 140px 1fr auto; gap: 10px; align-items: start; padding: 6px 8px; border-radius: 4px; font-size: 12px; background: #10151f; border: 1px solid #1c2433; }
+        .cited-ts { color: var(--muted); font-family: ui-monospace, monospace; }
+        .cited-label { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .cited-cites { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+        @media (max-width: 720px) {
+          .ea-grid { grid-template-columns: 1fr; }
+          .cited-timeline-row { grid-template-columns: 1fr; }
+        }
 
 
         .tabbar { display: flex; gap: 2px; border-bottom: 1px solid var(--panel-border); position: sticky; top: 0; z-index: 2; background: var(--bg); padding-top: 2px; }

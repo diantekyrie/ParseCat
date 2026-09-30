@@ -27,11 +27,16 @@ import struct
 import pytest
 
 from app.parsers.packet_analysis import (
+    TSHARK_FIELDS,
     _analyze_dot11_fallback,
+    _decode_tshark_ssid,
     _dot11_frame_control,
     _radiotap_rssi_and_header_len,
+    _tshark_bool,
     analyze_packet_capture,
+    analyze_with_tshark,
     dot11_frame_label,
+    tshark_available,
 )
 
 PCAP_MAGIC_LE = b"\xd4\xc3\xb2\xa1"
@@ -148,3 +153,212 @@ def test_analyze_packet_capture_returns_none_for_unsupported_linktype(tmp_path):
     pcap_path.write_bytes(_pcap_global_header(0) + _pcap_record(b"\x00" * 20))
     result = analyze_packet_capture(pcap_path, linktype=0)  # linktype 0 = unsupported here
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# tshark backend regressions (issues #67, #68, #69) -- mock _run_tshark_fields
+# row output pinned to the exact shapes QA captured against Wireshark 4.4.18.
+# A gated live-tshark test below exercises the real binary when present.
+# ---------------------------------------------------------------------------
+
+def _tshark_row(**field_values: str) -> list[str]:
+    """Build one tshark `-T fields` row in TSHARK_FIELDS order, defaulting
+    unspecified fields to "" (tshark's own empty-field representation).
+    Keyed by field name rather than position so this doesn't silently
+    break if TSHARK_FIELDS is ever reordered.
+    """
+    return [field_values.get(f, "") for f in TSHARK_FIELDS]
+
+
+def test_tshark_fields_uses_current_wireshark_reason_code_name():
+    # PC-pcap-001 / #67: wlan_mgt.fixed.reason_code was removed in
+    # Wireshark 4.x; an unknown -e field aborts the WHOLE tshark
+    # invocation (exit 1), silently falling back for every capture.
+    # Membership alone is weak against the *next* rename — the gated
+    # live_tshark test below is the real guard; this pins the known swap.
+    assert "wlan_mgt.fixed.reason_code" not in TSHARK_FIELDS
+    assert "wlan.fixed.reason_code" in TSHARK_FIELDS
+    assert TSHARK_FIELDS.index("wlan.fixed.reason_code") == 6
+
+
+def test_analyze_with_tshark_decodes_deauth_reason_code(monkeypatch, tmp_path):
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.fc.type": "0", "wlan.fc.subtype": "12",
+        "wlan.bssid": "aa:bb:cc:dd:ee:ff",
+        "wlan.fixed.reason_code": "0x0003",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    assert result.backend == "tshark"
+    assert len(result.anomalies) == 1
+    assert result.anomalies[0].kind == "deauthentication"
+    assert "0x0003" in result.anomalies[0].detail
+
+
+def test_analyze_with_tshark_detects_tcp_reset_as_true_text(monkeypatch, tmp_path):
+    # PC-pcap-002 / #68: modern tshark emits boolean fields as "True"/
+    # "False" text, not "1"/"0" -- the old `== "1"` check silently never
+    # matched, dropping every TCP RST on the tshark backend.
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "ip.src": "203.0.113.10", "ip.dst": "198.51.100.20",
+        "tcp.flags.reset": "True",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "ethernet")
+    resets = [a for a in result.anomalies if a.kind == "tcp_reset"]
+    assert len(resets) == 1
+    assert resets[0].detail == "TCP RST 203.0.113.10 -> 198.51.100.20"
+
+
+def test_analyze_with_tshark_still_detects_tcp_reset_as_1_text(monkeypatch, tmp_path):
+    # Older tshark's numeric-boolean output shape must keep working too.
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{"tcp.flags.reset": "1"})
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "ethernet")
+    assert any(a.kind == "tcp_reset" for a in result.anomalies)
+
+
+def test_decode_tshark_ssid_converts_hex_bytes_to_network_name():
+    # PC-pcap-003 / #69: wlan.ssid is FT_BYTES; `-T fields` emits raw hex,
+    # not the decoded SSID string (fixture from issue #69: "SYNTH_PCAP_QA").
+    assert _decode_tshark_ssid("53594e54485f504341505f5141") == "SYNTH_PCAP_QA"
+
+
+def test_decode_tshark_ssid_handles_colon_separated_hex():
+    # Some tshark builds/preferences render FT_BYTES colon-separated.
+    assert _decode_tshark_ssid("53:59:4e:54") == "SYNT"
+
+
+def test_decode_tshark_ssid_falls_back_to_raw_value_on_invalid_hex():
+    # Defensive: an unexpected (non-hex) value must not raise or vanish.
+    assert _decode_tshark_ssid("not-hex!!") == "not-hex!!"
+
+
+def test_analyze_with_tshark_ssid_identity_signal_is_decoded(monkeypatch, tmp_path):
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.ssid": "53594e54485f504341505f5141",
+        "wlan.bssid": "aa:bb:cc:dd:ee:ff",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    ssids = {s.value for s in result.identity_signals if s.kind == "ssid"}
+    assert ssids == {"SYNTH_PCAP_QA"}
+
+
+def test_tshark_bool_accepts_true_false_and_numeric():
+    assert _tshark_bool("True") is True
+    assert _tshark_bool("true") is True
+    assert _tshark_bool("1") is True
+    assert _tshark_bool("False") is False
+    assert _tshark_bool("false") is False
+    assert _tshark_bool("0") is False
+    assert _tshark_bool("") is False
+
+
+def test_analyze_with_tshark_counts_retry_as_true_text(monkeypatch, tmp_path):
+    # Same boolean trap as #68 / tcp.flags.reset: modern tshark emits
+    # wlan.fc.retry as "True"/"False". The old `== "1"` check left
+    # retry_count at 0 and retry_rate_pct at 0.0 (confidently wrong).
+    import app.parsers.packet_analysis as pa_module
+
+    rows = [
+        _tshark_row(**{
+            "wlan.fc.type": "2", "wlan.fc.subtype": "0",
+            "wlan.fc.retry": "True",
+        }),
+        _tshark_row(**{
+            "wlan.fc.type": "2", "wlan.fc.subtype": "0",
+            "wlan.fc.retry": "False",
+        }),
+    ]
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: rows)
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    assert result.retry_count == 1
+    assert result.retry_rate_pct == 50.0
+
+
+def test_analyze_with_tshark_still_counts_retry_as_1_text(monkeypatch, tmp_path):
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.fc.type": "2", "wlan.fc.subtype": "0",
+        "wlan.fc.retry": "1",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    assert result.retry_count == 1
+    assert result.retry_rate_pct == 100.0
+
+
+def test_decode_tshark_ssid_replaces_non_utf8_bytes_like_fallback():
+    # Parity with _dot11_ssid_from_ies: errors="replace" -> U+FFFD per bad byte.
+    assert _decode_tshark_ssid("fffefd") == "���"
+
+
+def test_decode_tshark_ssid_treats_hidden_or_missing_as_absent():
+    # Zero-length / wildcard SSID: tshark may emit "" or literal "<MISSING>".
+    # Fallback returns None for tag_len == 0; match that (no identity signal).
+    assert _decode_tshark_ssid("") is None
+    assert _decode_tshark_ssid("<MISSING>") is None
+
+
+def test_analyze_with_tshark_skips_hidden_ssid_identity(monkeypatch, tmp_path):
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{"wlan.ssid": "<MISSING>", "wlan.bssid": "aa:bb:cc:dd:ee:ff"})
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    ssids = [s for s in result.identity_signals if s.kind == "ssid"]
+    assert ssids == []
+    assert any(s.kind == "bssid" and s.value == "aa:bb:cc:dd:ee:ff" for s in result.identity_signals)
+
+
+@pytest.mark.skipif(not tshark_available(), reason="tshark not on PATH")
+def test_live_tshark_dissects_synthetic_80211_fixture(tmp_path):
+    # End-to-end against real tshark (gated): catches the next renamed -e
+    # field the way mock membership alone cannot (#67 acceptance).
+    deauth_pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff")
+        + b"\x03\x00"  # reason code 3
+    )
+    beacon_pkt = _radiotap_with_rssi(-40) + _beacon_with_ssid(
+        addr2=b"\x11\x22\x33\x44\x55\x66", ssid="SYNTH_PCAP_QA"
+    )
+    retry_data_pkt = (
+        _radiotap_with_rssi(-80)
+        + _dot11_frame_control_bytes(2, 0, retry=True)
+        + b"\x00" * 22
+    )
+    pcap_path = tmp_path / "live_synth.pcap"
+    pcap_path.write_bytes(
+        _pcap_global_header(127)
+        + _pcap_record(deauth_pkt)
+        + _pcap_record(beacon_pkt)
+        + _pcap_record(retry_data_pkt)
+    )
+
+    result = analyze_with_tshark(pcap_path, "802.11")
+    assert result.backend == "tshark"
+    assert result.packets_analyzed == 3
+    assert result.retry_count == 1
+    ssids = {s.value for s in result.identity_signals if s.kind == "ssid"}
+    assert "SYNTH_PCAP_QA" in ssids
+    deauths = [a for a in result.anomalies if a.kind == "deauthentication"]
+    assert len(deauths) == 1
+    assert "0x0003" in deauths[0].detail

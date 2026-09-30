@@ -711,6 +711,28 @@ class WifiEventRow(SQLModel, table=True):
     source_line_end: int
 
 
+
+
+class BtFrameworkEventRow(SQLModel, table=True):
+    """Framework BT dumpsys facts (bluetooth_manager) — not HCI binary."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_id: int = Field(foreign_key="capture.id", index=True)
+    timestamp: str
+    kind: str = Field(index=True)
+    action: Optional[str] = None
+    profile: Optional[str] = None
+    address: Optional[str] = None
+    from_state: Optional[str] = None
+    to_state: Optional[str] = None
+    reason_code: Optional[int] = None
+    reason_name: Optional[str] = None
+    detail: str = ""
+    source_section: str
+    source_line_start: int
+    source_line_end: int
+
+
 class FreezeSummaryRow(SQLModel, table=True):
     """Per-package freeze/unfreeze counts for one capture. Individual
     freeze/unfreeze events aren't persisted row-by-row (a capture can have

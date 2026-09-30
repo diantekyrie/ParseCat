@@ -10,6 +10,31 @@ import { answerConfidence, flattenVerifiedFacts } from "./answerBands.js";
 const SEVERITY_ORDER = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
 const CLASS_SEVERITIES = new Set(Object.keys(SEVERITY_ORDER));
 
+
+/** Flatten ranked_findings from a diagnose/scan/investigation bundle.
+ * Mirrors flattenVerifiedFacts: top-level list wins; else per-capture lists
+ * under captures[] (investigation Diagnose has no top-level ranked_findings).
+ */
+export function flattenRankedFindings(bundle) {
+  if (!bundle || typeof bundle !== "object") return [];
+  if (Array.isArray(bundle.ranked_findings)) return bundle.ranked_findings;
+  if (Array.isArray(bundle.captures)) {
+    return bundle.captures.flatMap((cap) => {
+      if (!cap || typeof cap !== "object") return [];
+      const label = cap.device_label;
+      const filename = cap.original_filename;
+      return (Array.isArray(cap.ranked_findings) ? cap.ranked_findings : []).map((f) => {
+        const out = { ...f };
+        if (label && !out.device_label) out.device_label = label;
+        if (filename && !out.original_filename) out.original_filename = filename;
+        return out;
+      });
+    });
+  }
+  return [];
+}
+
+
 /** Pick identity fields that are actually present — omit missing; never fabricate. */
 export function buildIdentityFields({
   deviceContext,
@@ -132,7 +157,7 @@ export function buildExpectedVsActual(bundle) {
 /** Ordered cited steps from verified facts / ranked findings (parser ground truth). */
 export function buildCitedTimeline(bundle, { limit = 24 } = {}) {
   const facts = flattenVerifiedFacts(bundle);
-  const findings = Array.isArray(bundle?.ranked_findings) ? bundle.ranked_findings : [];
+  const findings = flattenRankedFindings(bundle);
   const events = Array.isArray(bundle?.timeline) ? bundle.timeline : [];
 
   const rows = [];
@@ -205,7 +230,7 @@ export function buildCitedTimeline(bundle, { limit = 24 } = {}) {
  */
 export function buildClassification(bundle) {
   const confidence = answerConfidence(bundle);
-  const findings = Array.isArray(bundle?.ranked_findings) ? bundle.ranked_findings : [];
+  const findings = flattenRankedFindings(bundle);
   const top = pickTopFinding(findings);
   const facts = flattenVerifiedFacts(bundle);
 
@@ -259,7 +284,7 @@ function pickTopFinding(findings) {
 }
 
 function pickObservedText(bundle) {
-  const findings = Array.isArray(bundle.ranked_findings) ? bundle.ranked_findings : [];
+  const findings = flattenRankedFindings(bundle);
   const top = pickTopFinding(findings);
   if (top) {
     const parts = [top.title, top.detail].filter(Boolean);

@@ -1397,8 +1397,7 @@ export default function App() {
                     <IdentityStrip
                       compact
                       capture={captures.find((cap) => cap.id === selectedCaptureId)}
-                      deviceInfo={(summary.device_infos || []).find((d) => d.capture_id === selectedCaptureId)
-                        || summary.device_infos?.[0]}
+                      deviceInfo={(summary.device_infos || []).find((d) => d.capture_id === selectedCaptureId)}
                       deviceLabel={deviceLabel || investigationLabel}
                     />
                   )}

@@ -176,3 +176,88 @@ test("buildCitedTimeline filters empty labels", () => {
   });
   assert.equal(rows.length, 0);
 });
+
+test("investigation-shape: CRITICAL under captures[].ranked_findings surfaces in classification + timeline + observed", () => {
+  // diagnose_investigation() shape: no top-level ranked_findings; findings live per capture.
+  const bundle = {
+    question: "Which device crashed?",
+    verified_facts: [
+      {
+        category: "wifi",
+        summary: "Wi-Fi disconnection on watch",
+        timestamp: "10:00:03",
+        confidence: "MEDIUM",
+        device_label: "watch",
+        source: { section: "wifi", line_start: 1, line_end: 1 },
+      },
+    ],
+    captures: [
+      {
+        capture_id: 1,
+        device_label: "phone",
+        original_filename: "phone.zip",
+        verified_facts: [],
+        ranked_findings: [
+          {
+            severity: "CRITICAL",
+            category: "crash",
+            title: "Java crash in com.android.systemui",
+            detail: "NullPointerException",
+            timestamp: "10:00:01",
+            confidence: "HIGH",
+            source: { section: "system_log", line_start: 10, line_end: 12 },
+          },
+        ],
+      },
+      {
+        capture_id: 2,
+        device_label: "watch",
+        original_filename: "watch.zip",
+        verified_facts: [],
+        ranked_findings: [
+          {
+            severity: "LOW",
+            category: "wifi",
+            title: "Wi-Fi disconnect (locally initiated)",
+            detail: "802.11 reason 3",
+            timestamp: "10:00:02",
+            confidence: "MEDIUM",
+          },
+        ],
+      },
+    ],
+  };
+
+  const cls = buildClassification(bundle);
+  assert.equal(cls.label, "CRITICAL · crash");
+  assert.equal(cls.severity, "CRITICAL");
+  assert.equal(cls.category, "crash");
+  assert.equal(cls.source, "ranked_finding");
+
+  const rows = buildCitedTimeline(bundle);
+  const crashRow = rows.find((r) => r.label === "Java crash in com.android.systemui");
+  assert.ok(crashRow, "CRITICAL finding from captures[0].ranked_findings must appear in cited timeline");
+  assert.equal(crashRow.severity, "CRITICAL");
+  assert.equal(crashRow.device_label, "phone");
+  assert.equal(crashRow.original_filename, "phone.zip");
+  assert.equal(crashRow.kind, "finding");
+
+  const contrast = buildExpectedVsActual(bundle);
+  assert.equal(contrast.mode, "observed_only");
+  assert.match(contrast.actual, /Java crash in com.android.systemui/);
+});
+
+test("investigation-shape: empty per-capture ranked_findings does not invent classification", () => {
+  const bundle = {
+    question: "anything?",
+    verified_facts: [],
+    captures: [
+      { capture_id: 1, device_label: "phone", ranked_findings: [] },
+      { capture_id: 2, device_label: "watch" },
+    ],
+  };
+  const cls = buildClassification(bundle);
+  assert.equal(cls.label, "Unconfirmed");
+  assert.equal(cls.source, "empty");
+  assert.equal(buildCitedTimeline(bundle).length, 0);
+});

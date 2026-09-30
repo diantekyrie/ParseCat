@@ -493,15 +493,18 @@ class PacketAnalysis:
 class WifiEvent:
     """One decoded event from `DUMP OF SERVICE wifi` -> WifiController's
     state-machine transition log (`rec[N]: time=... what=EVENT_NAME ...`).
-    Only the diagnostically load-bearing event types are decoded
-    (disconnection with 802.11 reason code, BSSID association/roam);
-    the state machine log has many other "what=" event types not parsed
-    here (e.g. CMD_UPDATE_AP_CAPABILITY, screen state) since they carry no
-    connectivity-failure signal.
+    Load-bearing types: disconnection (802.11 reason), association/roam,
+    supplicant_state, network_connection, and dhcp / ip_provisioning /
+    ip_configuration. Other what= types are skipped.
+    For kind=supplicant_state, reason_name holds the SupplicantState token
+    (or Unknown (TOKEN)). For dhcp/ip_* kinds, reason_name holds the outcome
+    label (e.g. success / pre_dhcp_action).
     """
 
     timestamp: str
-    kind: str                 # "disconnection" | "association"
+    kind: str                 # "disconnection" | "association" | "supplicant_state" |
+                              # "network_connection" | "dhcp" | "ip_provisioning" |
+                              # "ip_configuration"
     ssid: Optional[str]
     bssid: Optional[str]
     reason_code: Optional[int]        # 802.11 reason code, disconnection only

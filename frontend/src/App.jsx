@@ -10,6 +10,7 @@ import {
   splitNarrationSections,
 } from "./answerBands";
 import DiagnosisStory, { IdentityStrip } from "./DiagnosisStory";
+import HowToCapturePanel from "./HowToCapturePanel";
 
 const SEVERITY_COLOR = { critical: "var(--red)", warning: "var(--amber)", info: "var(--blue)" };
 const CONFIDENCE_COLOR = { HIGH: "var(--green)", MEDIUM: "var(--amber)", LOW: "var(--orange)", UNCONFIRMED: "var(--muted)" };
@@ -1073,6 +1074,8 @@ export default function App() {
               {busy ? "Parsing..." : selectedFiles.length > 1 ? "Upload & parse all" : "Upload & parse"}
             </button>
           </section>
+
+          <HowToCapturePanel />
 
           <section className="panel">
             <h2>Captures for this device</h2>
@@ -2148,6 +2151,21 @@ export default function App() {
         .coverage-notice.coverage-gap { border-color: var(--amber); }
         .coverage-notice.coverage-ok { border-color: var(--green); }
         .coverage-notice.coverage-info { border-color: var(--blue); }
+        .how-to-capture-panel { padding-top: 10px; padding-bottom: 10px; }
+        .how-to-capture-toggle {
+          display: flex; width: 100%; align-items: center; justify-content: space-between;
+          background: transparent; border: 0; color: var(--text); font: inherit; font-weight: 600;
+          cursor: pointer; padding: 0; text-align: left;
+        }
+        .how-to-capture-toggle:hover { color: var(--blue); }
+        .how-to-capture-chevron { color: var(--muted); font-weight: 400; }
+        .how-to-capture-body { margin-top: 10px; }
+        .how-to-capture-list { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 8px; }
+        .how-to-capture-list li strong { display: block; font-size: 13px; }
+        .how-to-capture-list li p { margin: 4px 0 0; }
+        .how-to-capture-docs { margin-top: 10px; }
+        .how-to-capture-body a { color: var(--blue); }
+
         .claim-card { border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px; margin-bottom: 12px; background: #0e1420; }
         .claim-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
         .badge { color: #10131a; font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 10px; }

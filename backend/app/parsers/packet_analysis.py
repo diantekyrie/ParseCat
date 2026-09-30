@@ -8,21 +8,18 @@ Two backends, tried in this order:
    (see the exchange this was scoped from: Wireshark/tshark's dissection
    engine is what nearly every serious network-analysis tool either shells
    out to or embeds, rather than reimplementing dissection by hand). Still
-   NOT live-verified in THIS codebase's dev/test environment -- `tshark`
-   isn't installed here (confirmed: `shutil.which("tshark")` returns None,
-   and installing it here requires admin rights this environment doesn't
-   have) -- but it WAS live-verified against real Wireshark 4.4.18 on a QA
-   box (issues #67-#69), which is how three real bugs were caught: an
-   obsolete field name that made every tshark invocation hard-fail
-   (`wlan_mgt.fixed.reason_code` -> `wlan.fixed.reason_code`), a stale
-   boolean comparison that silently dropped every TCP RST on this backend
-   (`tcp.flags.reset == "1"` never matches tshark's `"True"`/`"False"`
-   text), and an undecoded SSID (wlan.ssid is FT_BYTES; `-T fields` emits
-   raw hex, not the network name). Those three are fixed per QA's exact
-   reproduction, with tests that mock `_run_tshark_fields`'s row shape
-   rather than shelling out to a real tshark this environment doesn't
-   have. Re-verify against a live tshark the next time this path actually
-   runs somewhere one is present.
+   Live-verified against real Wireshark/tshark 4.4.x (issues #67-#69 and
+   the gated synthetic-fixture test in test_packet_analysis.py). That
+   verification caught: an obsolete field name that made every tshark
+   invocation hard-fail (`wlan_mgt.fixed.reason_code` ->
+   `wlan.fixed.reason_code`), a stale boolean comparison that silently
+   dropped every TCP RST on this backend (`tcp.flags.reset == "1"` never
+   matches tshark's `"True"`/`"False"` text), the same boolean trap on
+   `wlan.fc.retry` (retry_count/rate stayed 0.0), and an undecoded SSID
+   (wlan.ssid is FT_BYTES; `-T fields` emits raw hex, not the network
+   name). Unit tests mock `_run_tshark_fields` row shapes; a
+   `@pytest.mark.skipif(not tshark_available())` live test exercises the
+   real binary when present.
 
 2. Fallback (no external dependency) -- used when tshark isn't available.
    This is NOT generic scapy packet dissection: that was benchmarked
@@ -117,13 +114,25 @@ def tshark_available() -> bool:
     return shutil.which("tshark") is not None
 
 
-def _decode_tshark_ssid(raw: str) -> str:
+def _tshark_bool(raw: str) -> bool:
+    # Modern tshark emits boolean fields as "True"/"False" text; older
+    # builds used "1"/"0". Accept both so tcp.flags.reset and wlan.fc.retry
+    # (issues #68 + review on #80) never silently under-count.
+    return raw in ("1", "True", "true")
+
+
+def _decode_tshark_ssid(raw: str) -> str | None:
     # wlan.ssid is Wireshark's FT_BYTES field type -- `-T fields` emits the
     # raw SSID bytes as a hex string (observed as plain hex with no colon
     # separators on 4.4.18, e.g. "53594e54..."), not a decoded network
-    # name. The fallback backend already decodes SSIDs to UTF-8 (see
-    # _dot11_ssid_from_ies); match that behavior here (issue #69) instead
-    # of surfacing raw hex to the UI/LLM.
+    # name. The fallback backend already decodes SSIDs to UTF-8 with
+    # errors="replace" (see _dot11_ssid_from_ies); match that behavior
+    # here (issue #69) instead of surfacing raw hex to the UI/LLM.
+    # Hidden/wildcard beacons: tshark may emit "" or the literal
+    # "<MISSING>" for a zero-length SSID tag -- treat both as absent
+    # (fallback returns None when tag_len == 0).
+    if not raw or raw == "<MISSING>":
+        return None
     hex_str = raw.replace(":", "")
     try:
         return bytes.fromhex(hex_str).decode("utf-8", errors="replace")
@@ -177,15 +186,15 @@ def analyze_with_tshark(path: Path, link_layer: str) -> PacketAnalysis:
                         detail=f"Disassociation frame, reason code {reason_code or 'unknown'}",
                         mac_or_ip=bssid or None,
                     ))
-        if retry == "1":
+        if _tshark_bool(retry):
             retry_count += 1
         if dbm:
             try:
                 rssis.append(int(dbm))
             except ValueError:
                 pass
-        if ssid:
-            decoded_ssid = _decode_tshark_ssid(ssid)
+        decoded_ssid = _decode_tshark_ssid(ssid) if ssid else None
+        if decoded_ssid:
             ssid_counts[decoded_ssid] = ssid_counts.get(decoded_ssid, 0) + 1
         if bssid:
             bssid_counts[bssid] = bssid_counts.get(bssid, 0) + 1
@@ -193,8 +202,9 @@ def analyze_with_tshark(path: Path, link_layer: str) -> PacketAnalysis:
             dns_counts[dns_qry] = dns_counts.get(dns_qry, 0) + 1
         # Modern tshark emits boolean fields as "True"/"False" text, not
         # "1"/"0" -- comparing only against "1" meant TCP RST was silently
-        # never detected on the tshark backend at all (issue #68).
-        if tcp_rst in ("1", "True", "true"):
+        # never detected on the tshark backend at all (issue #68). Same
+        # helper covers wlan.fc.retry above.
+        if _tshark_bool(tcp_rst):
             anomalies.append(PacketAnomalyEvent(
                 timestamp=ts or None, kind="tcp_reset",
                 detail=f"TCP RST {ip_src or '?'} -> {ip_dst or '?'}",

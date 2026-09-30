@@ -27,10 +27,13 @@ import struct
 import pytest
 
 from app.parsers.packet_analysis import (
+    TSHARK_FIELDS,
     _analyze_dot11_fallback,
+    _decode_tshark_ssid,
     _dot11_frame_control,
     _radiotap_rssi_and_header_len,
     analyze_packet_capture,
+    analyze_with_tshark,
     dot11_frame_label,
 )
 
@@ -148,3 +151,103 @@ def test_analyze_packet_capture_returns_none_for_unsupported_linktype(tmp_path):
     pcap_path.write_bytes(_pcap_global_header(0) + _pcap_record(b"\x00" * 20))
     result = analyze_packet_capture(pcap_path, linktype=0)  # linktype 0 = unsupported here
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# tshark backend regressions (issues #67, #68, #69) -- real tshark isn't
+# installed in this environment (see module docstring), so these mock
+# _run_tshark_fields' row output directly, pinned to the exact row shapes
+# QA captured against live Wireshark 4.4.18.
+# ---------------------------------------------------------------------------
+
+def _tshark_row(**field_values: str) -> list[str]:
+    """Build one tshark `-T fields` row in TSHARK_FIELDS order, defaulting
+    unspecified fields to "" (tshark's own empty-field representation).
+    Keyed by field name rather than position so this doesn't silently
+    break if TSHARK_FIELDS is ever reordered.
+    """
+    return [field_values.get(f, "") for f in TSHARK_FIELDS]
+
+
+def test_tshark_fields_uses_current_wireshark_reason_code_name():
+    # PC-pcap-001 / #67: wlan_mgt.fixed.reason_code was removed in
+    # Wireshark 4.x; an unknown -e field aborts the WHOLE tshark
+    # invocation (exit 1), silently falling back for every capture.
+    assert "wlan_mgt.fixed.reason_code" not in TSHARK_FIELDS
+    assert "wlan.fixed.reason_code" in TSHARK_FIELDS
+
+
+def test_analyze_with_tshark_decodes_deauth_reason_code(monkeypatch, tmp_path):
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.fc.type": "0", "wlan.fc.subtype": "12",
+        "wlan.bssid": "aa:bb:cc:dd:ee:ff",
+        "wlan.fixed.reason_code": "0x0003",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    assert result.backend == "tshark"
+    assert len(result.anomalies) == 1
+    assert result.anomalies[0].kind == "deauthentication"
+    assert "0x0003" in result.anomalies[0].detail
+
+
+def test_analyze_with_tshark_detects_tcp_reset_as_true_text(monkeypatch, tmp_path):
+    # PC-pcap-002 / #68: modern tshark emits boolean fields as "True"/
+    # "False" text, not "1"/"0" -- the old `== "1"` check silently never
+    # matched, dropping every TCP RST on the tshark backend.
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "ip.src": "203.0.113.10", "ip.dst": "198.51.100.20",
+        "tcp.flags.reset": "True",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "ethernet")
+    resets = [a for a in result.anomalies if a.kind == "tcp_reset"]
+    assert len(resets) == 1
+    assert resets[0].detail == "TCP RST 203.0.113.10 -> 198.51.100.20"
+
+
+def test_analyze_with_tshark_still_detects_tcp_reset_as_1_text(monkeypatch, tmp_path):
+    # Older tshark's numeric-boolean output shape must keep working too.
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{"tcp.flags.reset": "1"})
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "ethernet")
+    assert any(a.kind == "tcp_reset" for a in result.anomalies)
+
+
+def test_decode_tshark_ssid_converts_hex_bytes_to_network_name():
+    # PC-pcap-003 / #69: wlan.ssid is FT_BYTES; `-T fields` emits raw hex,
+    # not the decoded SSID string (fixture from issue #69: "SYNTH_PCAP_QA").
+    assert _decode_tshark_ssid("53594e54485f504341505f5141") == "SYNTH_PCAP_QA"
+
+
+def test_decode_tshark_ssid_handles_colon_separated_hex():
+    # Some tshark builds/preferences render FT_BYTES colon-separated.
+    assert _decode_tshark_ssid("53:59:4e:54") == "SYNT"
+
+
+def test_decode_tshark_ssid_falls_back_to_raw_value_on_invalid_hex():
+    # Defensive: an unexpected (non-hex) value must not raise or vanish.
+    assert _decode_tshark_ssid("not-hex!!") == "not-hex!!"
+
+
+def test_analyze_with_tshark_ssid_identity_signal_is_decoded(monkeypatch, tmp_path):
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.ssid": "53594e54485f504341505f5141",
+        "wlan.bssid": "aa:bb:cc:dd:ee:ff",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    ssids = {s.value for s in result.identity_signals if s.kind == "ssid"}
+    assert ssids == {"SYNTH_PCAP_QA"}

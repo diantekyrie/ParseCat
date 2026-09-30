@@ -32,7 +32,7 @@ from app.parsers.packet_analysis import (
     _decode_tshark_ssid,
     _dot11_frame_control,
     _radiotap_rssi_and_header_len,
-    _tshark_bool,
+    _tshark_truthy,
     analyze_packet_capture,
     analyze_with_tshark,
     dot11_frame_label,
@@ -257,14 +257,14 @@ def test_analyze_with_tshark_ssid_identity_signal_is_decoded(monkeypatch, tmp_pa
     assert ssids == {"SYNTH_PCAP_QA"}
 
 
-def test_tshark_bool_accepts_true_false_and_numeric():
-    assert _tshark_bool("True") is True
-    assert _tshark_bool("true") is True
-    assert _tshark_bool("1") is True
-    assert _tshark_bool("False") is False
-    assert _tshark_bool("false") is False
-    assert _tshark_bool("0") is False
-    assert _tshark_bool("") is False
+def test_tshark_truthy_accepts_true_false_and_numeric():
+    assert _tshark_truthy("True") is True
+    assert _tshark_truthy("true") is True
+    assert _tshark_truthy("1") is True
+    assert _tshark_truthy("False") is False
+    assert _tshark_truthy("false") is False
+    assert _tshark_truthy("0") is False
+    assert _tshark_truthy("") is False
 
 
 def test_analyze_with_tshark_counts_retry_as_true_text(monkeypatch, tmp_path):

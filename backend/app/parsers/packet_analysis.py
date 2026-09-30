@@ -8,16 +8,18 @@ Two backends, tried in this order:
    (see the exchange this was scoped from: Wireshark/tshark's dissection
    engine is what nearly every serious network-analysis tool either shells
    out to or embeds, rather than reimplementing dissection by hand). Still
-   Live-verified against real Wireshark/tshark 4.4.x (issues #67-#69 and
-   the gated synthetic-fixture test in test_packet_analysis.py). That
-   verification caught: an obsolete field name that made every tshark
-   invocation hard-fail (`wlan_mgt.fixed.reason_code` ->
+   Live-verified against real Wireshark/tshark 4.4.x for issues #67-#69
+   (Cat QA). That verification caught: an obsolete field name that made
+   every tshark invocation hard-fail (`wlan_mgt.fixed.reason_code` ->
    `wlan.fixed.reason_code`), a stale boolean comparison that silently
    dropped every TCP RST on this backend (`tcp.flags.reset == "1"` never
-   matches tshark's `"True"`/`"False"` text), the same boolean trap on
-   `wlan.fc.retry` (retry_count/rate stayed 0.0), and an undecoded SSID
+   matches tshark's `"True"`/`"False"` text), and an undecoded SSID
    (wlan.ssid is FT_BYTES; `-T fields` emits raw hex, not the network
-   name). Unit tests mock `_run_tshark_fields` row shapes; a
+   name). The same boolean-text class also applied to `wlan.fc.retry`
+   (retry_count/rate stayed 0.0); that is now fixed via a shared
+   `_tshark_truthy` helper used for both RST and retry (mock regression
+   + gated live synth fixture — Cat QA did not re-spot-check retry yet).
+   Unit tests mock `_run_tshark_fields` row shapes; a
    `@pytest.mark.skipif(not tshark_available())` live test exercises the
    real binary when present.
 
@@ -114,11 +116,13 @@ def tshark_available() -> bool:
     return shutil.which("tshark") is not None
 
 
-def _tshark_bool(raw: str) -> bool:
-    # Modern tshark emits boolean fields as "True"/"False" text; older
-    # builds used "1"/"0". Accept both so tcp.flags.reset and wlan.fc.retry
-    # (issues #68 + review on #80) never silently under-count.
-    return raw in ("1", "True", "true")
+def _tshark_truthy(val: str) -> bool:
+    """True for tshark FT_BOOLEAN field shapes we accept: "1", "True", "true".
+
+    Modern Wireshark/tshark emits FT_BOOLEAN as "True"/"False" text; older
+    builds used "1"/"0". Empty and any other value are False.
+    """
+    return val in ("1", "True", "true")
 
 
 def _decode_tshark_ssid(raw: str) -> str | None:
@@ -186,7 +190,7 @@ def analyze_with_tshark(path: Path, link_layer: str) -> PacketAnalysis:
                         detail=f"Disassociation frame, reason code {reason_code or 'unknown'}",
                         mac_or_ip=bssid or None,
                     ))
-        if _tshark_bool(retry):
+        if _tshark_truthy(retry):
             retry_count += 1
         if dbm:
             try:
@@ -204,7 +208,7 @@ def analyze_with_tshark(path: Path, link_layer: str) -> PacketAnalysis:
         # "1"/"0" -- comparing only against "1" meant TCP RST was silently
         # never detected on the tshark backend at all (issue #68). Same
         # helper covers wlan.fc.retry above.
-        if _tshark_bool(tcp_rst):
+        if _tshark_truthy(tcp_rst):
             anomalies.append(PacketAnomalyEvent(
                 timestamp=ts or None, kind="tcp_reset",
                 detail=f"TCP RST {ip_src or '?'} -> {ip_dst or '?'}",

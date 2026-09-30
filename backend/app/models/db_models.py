@@ -382,9 +382,15 @@ class BtHciSummaryRow(SQLModel, table=True):
 
 
 class BtHciEventRow(SQLModel, table=True):
-    """One decoded high-value HCI event (connection/disconnection/command
-    complete/status) -- see app/parsers/bt_hci.py for which event types
-    get per-record decoding."""
+    """One decoded high-value HCI event (connection/disconnection/auth/
+    encryption/link-key/pairing/command complete/status) -- see
+    app/parsers/bt_hci.py for which event types get per-record decoding.
+
+    source_* cite the 1-indexed btsnoop record index (binary log).
+    severity/confidence are code-owned at parse time. encryption_enabled
+    and key_type are optional extras for Encryption Change / Link Key
+    Notification; BD_ADDR and link-key bytes are never persisted.
+    """
 
     id: Optional[int] = Field(default=None, primary_key=True)
     capture_id: int = Field(foreign_key="capture.id", index=True)
@@ -396,6 +402,13 @@ class BtHciEventRow(SQLModel, table=True):
     reason_code: Optional[int]
     reason_name: Optional[str]
     opcode: Optional[int]
+    encryption_enabled: Optional[int] = None
+    key_type: Optional[int] = None
+    source_section: Optional[str] = None
+    source_line_start: Optional[int] = None
+    source_line_end: Optional[int] = None
+    severity: Optional[str] = None
+    confidence: Optional[str] = None
 
 
 class PacketCaptureSummaryRow(SQLModel, table=True):

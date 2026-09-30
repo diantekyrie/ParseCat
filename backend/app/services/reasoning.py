@@ -1260,8 +1260,22 @@ def build_diagnosis_bundle(
                     "notable_events": [
                         {"timestamp": e.timestamp, "kind": e.kind, "status_name": e.status_name,
                          "reason_name": e.reason_name, "handle": e.handle,
-                         "confidence": pairing_confidence}
-                        for e in bt_events if e.kind == "disconnection_complete" or (e.status_code or 0) != 0
+                         "encryption_enabled": e.encryption_enabled, "key_type": e.key_type,
+                         "severity": e.severity,
+                         "confidence": e.confidence or pairing_confidence,
+                         "source": (
+                             {"section": e.source_section,
+                              "line_start": e.source_line_start,
+                              "line_end": e.source_line_end}
+                             if e.source_section is not None else None
+                         )}
+                        for e in bt_events
+                        if e.kind in (
+                            "disconnection_complete", "authentication_complete",
+                            "encryption_change", "simple_pairing_complete",
+                            "change_connection_link_key_complete",
+                            "link_key_request", "link_key_notification",
+                        ) or (e.status_code or 0) != 0
                     ],
                 })
         pcap_rows = session.exec(

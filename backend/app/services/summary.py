@@ -272,18 +272,35 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
                      + (f" ({t.signal_code})" if t.signal_code else ""),
             "source": None,
         })
+    _BT_NOTABLE_KINDS = {
+        "disconnection_complete", "authentication_complete", "encryption_change",
+        "simple_pairing_complete", "change_connection_link_key_complete",
+        "link_key_request", "link_key_notification",
+    }
     for e in bt_event_rows:
-        if e.kind == "disconnection_complete" or (e.status_code and e.status_code != 0):
-            label = f"BT {e.kind.replace('_', ' ')}"
-            if e.status_name:
-                label += f": {e.status_name}"
-            if e.reason_name:
-                label += f" (reason: {e.reason_name})"
-            timeline.append({
-                "timestamp": e.timestamp, "kind": "bt_hci",
-                "severity": "warning" if (e.status_code or 0) != 0 else "info",
-                "label": label, "source": None,
-            })
+        notable = (
+            e.kind in _BT_NOTABLE_KINDS
+            or (e.status_code is not None and e.status_code != 0)
+        )
+        if not notable:
+            continue
+        label = f"BT {e.kind.replace('_', ' ')}"
+        if e.status_name:
+            label += f": {e.status_name}"
+        if e.reason_name:
+            label += f" (reason: {e.reason_name})"
+        # Prefer parser-assigned severity; fall back for rows from older captures.
+        sev = e.severity or (
+            "warning" if (e.status_code or 0) != 0 or (e.reason_code or 0) != 0 else "info"
+        )
+        timeline.append({
+            "timestamp": e.timestamp, "kind": "bt_hci",
+            "severity": sev,
+            "label": label,
+            "source": _source(e.source_section, e.source_line_start, e.source_line_end)
+            if e.source_section is not None else None,
+            "confidence": e.confidence,
+        })
     for w in wifi_event_rows:
         if w.kind == "disconnection":
             timeline.append({
@@ -358,9 +375,18 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
                     {
                         "timestamp": e.timestamp, "kind": e.kind, "status_name": e.status_name,
                         "reason_name": e.reason_name, "handle": e.handle,
+                        "encryption_enabled": e.encryption_enabled, "key_type": e.key_type,
+                        "severity": e.severity, "confidence": e.confidence,
+                        "source": _source(e.source_section, e.source_line_start, e.source_line_end)
+                        if e.source_section is not None else None,
                     }
                     for e in bt_event_rows
-                    if e.kind == "disconnection_complete" or (e.status_code or 0) != 0
+                    if e.kind in (
+                        "disconnection_complete", "authentication_complete",
+                        "encryption_change", "simple_pairing_complete",
+                        "change_connection_link_key_complete",
+                        "link_key_request", "link_key_notification",
+                    ) or (e.status_code or 0) != 0
                 ],
             } if bt_summary_row else None
         ),

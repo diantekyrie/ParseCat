@@ -408,11 +408,17 @@ def persist_capture(
             event_code_counts_json=json.dumps(s.event_code_counts),
         ))
         for e in s.events:
+            ref = e.source_ref
             session.add(BtHciEventRow(
                 capture_id=capture.id, timestamp=e.timestamp, kind=e.kind,
                 status_code=e.status_code, status_name=e.status_name,
                 handle=e.handle, reason_code=e.reason_code, reason_name=e.reason_name,
                 opcode=e.opcode,
+                encryption_enabled=e.encryption_enabled, key_type=e.key_type,
+                source_section=ref.section if ref else None,
+                source_line_start=ref.line_start if ref else None,
+                source_line_end=ref.line_end if ref else None,
+                severity=e.severity, confidence=e.confidence,
             ))
 
     if parsed.packet_capture_summary is not None:

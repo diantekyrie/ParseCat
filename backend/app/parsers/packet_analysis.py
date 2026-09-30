@@ -114,11 +114,13 @@ def tshark_available() -> bool:
     return shutil.which("tshark") is not None
 
 
-def _tshark_bool(raw: str) -> bool:
-    # Modern tshark emits boolean fields as "True"/"False" text; older
-    # builds used "1"/"0". Accept both so tcp.flags.reset and wlan.fc.retry
-    # (issues #68 + review on #80) never silently under-count.
-    return raw in ("1", "True", "true")
+def _tshark_truthy(val: str) -> bool:
+    """True for tshark FT_BOOLEAN field shapes we accept: "1", "True", "true".
+
+    Modern Wireshark/tshark emits FT_BOOLEAN as "True"/"False" text; older
+    builds used "1"/"0". Empty and any other value are False.
+    """
+    return val in ("1", "True", "true")
 
 
 def _decode_tshark_ssid(raw: str) -> str | None:
@@ -186,7 +188,7 @@ def analyze_with_tshark(path: Path, link_layer: str) -> PacketAnalysis:
                         detail=f"Disassociation frame, reason code {reason_code or 'unknown'}",
                         mac_or_ip=bssid or None,
                     ))
-        if _tshark_bool(retry):
+        if _tshark_truthy(retry):
             retry_count += 1
         if dbm:
             try:
@@ -204,7 +206,7 @@ def analyze_with_tshark(path: Path, link_layer: str) -> PacketAnalysis:
         # "1"/"0" -- comparing only against "1" meant TCP RST was silently
         # never detected on the tshark backend at all (issue #68). Same
         # helper covers wlan.fc.retry above.
-        if _tshark_bool(tcp_rst):
+        if _tshark_truthy(tcp_rst):
             anomalies.append(PacketAnomalyEvent(
                 timestamp=ts or None, kind="tcp_reset",
                 detail=f"TCP RST {ip_src or '?'} -> {ip_dst or '?'}",

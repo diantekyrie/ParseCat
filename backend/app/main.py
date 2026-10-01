@@ -109,7 +109,7 @@ def _is_unknown_api_path(full_path: str) -> bool:
 
 
 def _safe_frontend_file(dist_root: Path, full_path: str) -> Path | None:
-    """Return an in-dist file to serve, or None (SPA fallback / miss / escape).
+    """Return an in-dist file to serve, or None if missing / empty path.
 
     Resolves the joined path and requires containment under dist_root so a
     client-controlled full_path like ``../backend/.env`` cannot be served.
@@ -117,24 +117,65 @@ def _safe_frontend_file(dist_root: Path, full_path: str) -> Path | None:
     if not full_path:
         return None
     root = dist_root.resolve()
-    candidate = (root / full_path).resolve()
-    if candidate.is_file() and candidate.is_relative_to(root):
+    try:
+        candidate = (root / full_path).resolve()
+    except (OSError, ValueError):
+        return None
+    if not candidate.is_relative_to(root):
+        return None
+    if candidate.is_file():
         return candidate
     return None
 
 
-if _FRONTEND_DIST.is_dir():
-    app.mount("/assets", StaticFiles(directory=_FRONTEND_DIST / "assets"), name="frontend-assets")
+def _frontend_response(full_path: str, dist: Path):
+    """SPA/static serve with path containment + unknown-/api JSON 404.
 
-    @app.get("/{full_path:path}")
-    def serve_frontend(full_path: str):
-        # Unknown /api/* must stay JSON 404 — registered API routes win by
-        # registration order, but missing ones would otherwise hit this
-        # catch-all and return index.html as 200 text/html.
-        if _is_unknown_api_path(full_path):
+    Traversal that resolves outside ``dist`` returns 404 (never FileResponse
+    outside dist, and not SPA index fallthrough for escaped paths). Normal
+    missing client routes still get index.html when it stays under dist.
+    """
+    if _is_unknown_api_path(full_path):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    if not dist.is_dir():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    dist_root = dist.resolve()
+    if full_path:
+        try:
+            candidate = (dist / full_path).resolve()
+        except (OSError, ValueError):
+            raise HTTPException(status_code=404, detail="Not Found") from None
+        if not candidate.is_relative_to(dist_root):
             raise HTTPException(status_code=404, detail="Not Found")
-        dist_root = _FRONTEND_DIST.resolve()
-        safe = _safe_frontend_file(dist_root, full_path)
-        if safe is not None:
-            return FileResponse(safe)
-        return FileResponse(dist_root / "index.html")
+        if candidate.is_file():
+            return FileResponse(candidate)
+
+    index = (dist / "index.html").resolve()
+    if index.is_file() and index.is_relative_to(dist_root):
+        return FileResponse(index)
+    raise HTTPException(status_code=404, detail="Not Found")
+
+
+def mount_frontend(application: FastAPI, dist: Path) -> bool:
+    """Register /assets + SPA catch-all for ``dist`` when it exists.
+
+    Extracted so TestClient can mount a temp dist/ without a real vite build
+    at import time. Returns True if routes were registered.
+    """
+    if not dist.is_dir():
+        return False
+
+    assets = dist / "assets"
+    if assets.is_dir():
+        application.mount("/assets", StaticFiles(directory=assets), name="frontend-assets")
+
+    @application.get("/{full_path:path}")
+    def serve_frontend(full_path: str):
+        return _frontend_response(full_path, dist)
+
+    return True
+
+
+mount_frontend(app, _FRONTEND_DIST)

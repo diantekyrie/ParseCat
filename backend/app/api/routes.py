@@ -80,6 +80,8 @@ def upload_capture(
     # transfer-encoding, and nothing stops a client from lying about it), so
     # this counts actual bytes written and aborts mid-stream rather than
     # buffering an unbounded upload to disk first and checking after.
+    # Single try/finally so every failure path (413, disconnect, OSError,
+    # parse error) and the success path unlink the NamedTemporaryFile.
     written = 0
     tmp_path: Path | None = None
     max_bytes = _max_upload_bytes()
@@ -94,19 +96,14 @@ def upload_capture(
                         f"Upload exceeds the {max_bytes // (1024 * 1024)}MB limit.",
                     )
                 tmp.write(chunk)
-    except BaseException:
-        # HTTPException (413), client disconnect, OSError/disk-full, etc. —
-        # never leave a partial NamedTemporaryFile behind.
+
+        try:
+            parsed = parse_capture_file(tmp_path, file.filename)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(422, f"Failed to parse upload: {exc}") from exc
+    finally:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
-        raise
-
-    try:
-        parsed = parse_capture_file(tmp_path, file.filename)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(422, f"Failed to parse upload: {exc}") from exc
-    finally:
-        tmp_path.unlink(missing_ok=True)
 
     # PC-ux-003 / #31: empty .txt (or plain logcat with no bugreport sections)
     # must not become a successful capture row — surface as upload failure so

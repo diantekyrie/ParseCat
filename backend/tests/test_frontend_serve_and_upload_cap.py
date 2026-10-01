@@ -146,3 +146,38 @@ def test_upload_exceeds_cap_returns_413_and_does_not_persist(client, monkeypatch
     assert "Upload exceeds" in detail
     with Session(engine) as session:
         assert session.exec(select(Capture)).all() == []
+
+
+def test_real_serve_frontend_rejects_encoded_traversal(tmp_path, monkeypatch):
+    """TestClient against the production catch-all with percent-encoded '..'.
+
+    Plain `/../secret` is collapsed by httpx before the path param binds;
+    `/..%2fsecret` reaches serve_frontend as `../secret` — the real attack
+    shape Arch called out on #83.
+    """
+    from app import main as main_mod
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<html>spa-index</html>", encoding="utf-8")
+    (dist / "ok.txt").write_text("inside", encoding="utf-8")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP_SECRET_OUTSIDE_DIST\n", encoding="utf-8")
+    monkeypatch.setattr(main_mod, "_FRONTEND_DIST", dist)
+
+    # Catch-all is only registered when dist existed at import; this checkout
+    # stubs frontend/dist so the route is present. Monkeypatch swaps the root.
+    with TestClient(app) as c:
+        r = c.get("/..%2fsecret.txt")
+        assert "TOP_SECRET_OUTSIDE_DIST" not in r.text
+        assert r.status_code in (200, 404)
+        if r.status_code == 200:
+            assert "spa-index" in r.text
+
+        r2 = c.get("/ok.txt")
+        assert r2.status_code == 200
+        assert r2.text == "inside"
+
+        r3 = c.get("/api/nope-encoded-check")
+        assert r3.status_code == 404
+        assert r3.json()["detail"] == "Not Found"

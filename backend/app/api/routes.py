@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import shutil
+import os
 import tempfile
 from pathlib import Path
 
@@ -23,6 +23,15 @@ from app.services.summary import build_capture_summary, build_merged_summary, ca
 router = APIRouter()
 
 SUPPORTED_UPLOAD_SUFFIXES = {".zip", ".txt", ".pcap", ".pcapng"}
+
+# Real bugreport .zips seen in this repo's own test fixtures run 100-290MB
+# (see e.g. the Portkey bug threads), so this can't be a tiny cap -- but
+# nothing enforced ANY limit before this, on an endpoint that will be public
+# and unauthenticated: a single oversized or repeated upload could fill the
+# host's disk via the NamedTemporaryFile below, with nothing to stop it.
+# Override via env without a code change if a real device's bugreport ever
+# needs more headroom.
+MAX_UPLOAD_BYTES = int(os.environ.get("PARSECAT_MAX_UPLOAD_BYTES", 500 * 1024 * 1024))
 
 
 def _parse_history(raw: str | None) -> list[dict] | None:
@@ -59,9 +68,29 @@ def upload_capture(
     if suffix not in SUPPORTED_UPLOAD_SUFFIXES:
         raise HTTPException(400, "Expected one of: .zip, .txt, .pcap, .pcapng")
 
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = Path(tmp.name)
+    # Bounded chunked copy, not shutil.copyfileobj(file.file, tmp) -- that
+    # trusts the client to stop sending, which an unauthenticated public
+    # endpoint cannot assume. Content-Length is advisory (absent on chunked
+    # transfer-encoding, and nothing stops a client from lying about it), so
+    # this counts actual bytes written and aborts mid-stream rather than
+    # buffering an unbounded upload to disk first and checking after.
+    written = 0
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            while chunk := file.file.read(1024 * 1024):
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        413,
+                        f"Upload exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit.",
+                    )
+                tmp.write(chunk)
+    except HTTPException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
 
     try:
         parsed = parse_capture_file(tmp_path, file.filename)

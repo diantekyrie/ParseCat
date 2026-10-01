@@ -10,7 +10,7 @@ import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -102,17 +102,39 @@ def health():
 # ---------------------------------------------------------------------------
 _FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
 
+
+def _is_unknown_api_path(full_path: str) -> bool:
+    """Catch-all must not turn missing /api/* routes into HTML 200 SPA pages."""
+    return full_path == "api" or full_path.startswith("api/")
+
+
+def _safe_frontend_file(dist_root: Path, full_path: str) -> Path | None:
+    """Return an in-dist file to serve, or None (SPA fallback / miss / escape).
+
+    Resolves the joined path and requires containment under dist_root so a
+    client-controlled full_path like ``../backend/.env`` cannot be served.
+    """
+    if not full_path:
+        return None
+    root = dist_root.resolve()
+    candidate = (root / full_path).resolve()
+    if candidate.is_file() and candidate.is_relative_to(root):
+        return candidate
+    return None
+
+
 if _FRONTEND_DIST.is_dir():
     app.mount("/assets", StaticFiles(directory=_FRONTEND_DIST / "assets"), name="frontend-assets")
 
     @app.get("/{full_path:path}")
     def serve_frontend(full_path: str):
-        # Single-page app: any path that isn't /api/... or /assets/... (both
-        # handled above/by the router first, since route matching is in
-        # registration order) gets index.html, and the SPA's own routing (if
-        # any) takes it from there. A real missing static file (favicon.ico
-        # etc.) still 404s via FileResponse's own not-found handling.
-        candidate = _FRONTEND_DIST / full_path
-        if full_path and candidate.is_file():
-            return FileResponse(candidate)
-        return FileResponse(_FRONTEND_DIST / "index.html")
+        # Unknown /api/* must stay JSON 404 — registered API routes win by
+        # registration order, but missing ones would otherwise hit this
+        # catch-all and return index.html as 200 text/html.
+        if _is_unknown_api_path(full_path):
+            raise HTTPException(status_code=404, detail="Not Found")
+        dist_root = _FRONTEND_DIST.resolve()
+        safe = _safe_frontend_file(dist_root, full_path)
+        if safe is not None:
+            return FileResponse(safe)
+        return FileResponse(dist_root / "index.html")

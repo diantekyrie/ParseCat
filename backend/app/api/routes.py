@@ -30,8 +30,14 @@ SUPPORTED_UPLOAD_SUFFIXES = {".zip", ".txt", ".pcap", ".pcapng"}
 # and unauthenticated: a single oversized or repeated upload could fill the
 # host's disk via the NamedTemporaryFile below, with nothing to stop it.
 # Override via env without a code change if a real device's bugreport ever
-# needs more headroom.
-MAX_UPLOAD_BYTES = int(os.environ.get("PARSECAT_MAX_UPLOAD_BYTES", 500 * 1024 * 1024))
+# needs more headroom. Read at request time via _max_upload_bytes() so tests
+# (and ops) can change PARSECAT_MAX_UPLOAD_BYTES without reloading the module.
+_DEFAULT_MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+MAX_UPLOAD_BYTES = _DEFAULT_MAX_UPLOAD_BYTES  # documented default; prefer helper
+
+
+def _max_upload_bytes() -> int:
+    return int(os.environ.get("PARSECAT_MAX_UPLOAD_BYTES", str(_DEFAULT_MAX_UPLOAD_BYTES)))
 
 
 def _parse_history(raw: str | None) -> list[dict] | None:
@@ -76,18 +82,21 @@ def upload_capture(
     # buffering an unbounded upload to disk first and checking after.
     written = 0
     tmp_path: Path | None = None
+    max_bytes = _max_upload_bytes()
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp_path = Path(tmp.name)
             while chunk := file.file.read(1024 * 1024):
                 written += len(chunk)
-                if written > MAX_UPLOAD_BYTES:
+                if written > max_bytes:
                     raise HTTPException(
                         413,
-                        f"Upload exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit.",
+                        f"Upload exceeds the {max_bytes // (1024 * 1024)}MB limit.",
                     )
                 tmp.write(chunk)
-    except HTTPException:
+    except BaseException:
+        # HTTPException (413), client disconnect, OSError/disk-full, etc. —
+        # never leave a partial NamedTemporaryFile behind.
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
         raise

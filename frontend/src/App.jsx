@@ -293,8 +293,9 @@ function PrivacyNotice({ providers, provider, byokApiKey }) {
           A personal API key is set above — this request sends the extracted fact bundle shown
           below (never the raw log file) to OpenRouter, using that key, for narration. The key
           itself is sent with this request and is not stored anywhere server-side; it's held only
-          in this page's memory and is gone on refresh. Clear the field above to go back to
-          "Narrated by" / Stub.
+          in this page's memory and is gone on refresh. This deployment has no per-user accounts,
+          so this applies to whichever capture is currently selected, not only ones uploaded under
+          this key. Clear the field above to go back to "Narrated by" / Stub.
         </p>
       </div>
     );
@@ -618,6 +619,10 @@ export default function App() {
   // key (see app/llm/__init__.py get_byok_client).
   const [byokApiKey, setByokApiKey] = useState("");
   const [byokModel, setByokModel] = useState("");
+  // Whether THIS deployment allows BYOK at all (PARSECAT_ALLOW_BYOK) --
+  // see the fetch below and app/llm/__init__.py byok_allowed(). Starts
+  // false (hidden) until the check resolves, same as a closed gate.
+  const [byokAvailable, setByokAvailable] = useState(false);
   const [invQuestion, setInvQuestion] = useState("");
   const [invDiagnosis, setInvDiagnosis] = useState(null);
   const [invDiagnosing, setInvDiagnosing] = useState(false);
@@ -670,6 +675,16 @@ export default function App() {
       const firstAvailable = ps.find((p) => p.available);
       if (firstAvailable) setProvider(firstAvailable.id);
     }).catch(() => {});
+    // Separate from the providers list on purpose -- see
+    // app/api/routes.py get_byok_status. Off (unavailable) by default: this
+    // app has no auth/upload-ownership model, so a visitor's own key could
+    // otherwise be used to narrate ANY capture on this instance, not just
+    // one they uploaded. An operator opts in explicitly (PARSECAT_ALLOW_BYOK=1)
+    // after accepting that. Defaults to hidden on fetch failure, same as a
+    // closed gate, rather than showing a panel that will just error.
+    api("/llm/byok_status").then((status) => {
+      setByokAvailable(Boolean(status && status.available));
+    }).catch(() => setByokAvailable(false));
   }, []);
 
   const hasInvestigationOption = investigationLabel.trim().length > 0 && captures.length >= 2;
@@ -1175,35 +1190,39 @@ export default function App() {
 
             <PrivacyNotice providers={providers} provider={provider} byokApiKey={byokApiKey} />
 
-            <details className="byok-panel">
-              <summary>Have your own OpenRouter key? Use it instead (optional)</summary>
-              <div className="byok-fields">
-                <label className="inline-label">
-                  OpenRouter API key
-                  <input
-                    type="password"
-                    placeholder="sk-or-..."
-                    value={byokApiKey}
-                    onChange={(e) => setByokApiKey(e.target.value)}
-                    autoComplete="off"
-                  />
-                </label>
-                <label className="inline-label">
-                  Model (optional)
-                  <input
-                    type="text"
-                    placeholder="e.g. anthropic/claude-sonnet-4.5"
-                    value={byokModel}
-                    onChange={(e) => setByokModel(e.target.value)}
-                  />
-                </label>
-                <p className="muted small">
-                  Get a key at <strong>openrouter.ai</strong>. When set, it's used for every
-                  Diagnose/Scan below instead of "Narrated by", sent only with that request (never
-                  stored), and billed to your own OpenRouter account.
-                </p>
-              </div>
-            </details>
+            {byokAvailable && (
+              <details className="byok-panel">
+                <summary>Have your own OpenRouter key? Use it instead (optional)</summary>
+                <div className="byok-fields">
+                  <label className="inline-label">
+                    OpenRouter API key
+                    <input
+                      type="password"
+                      placeholder="sk-or-..."
+                      value={byokApiKey}
+                      onChange={(e) => setByokApiKey(e.target.value)}
+                      autoComplete="off"
+                    />
+                  </label>
+                  <label className="inline-label">
+                    Model (optional)
+                    <input
+                      type="text"
+                      placeholder="e.g. anthropic/claude-sonnet-4.5"
+                      value={byokModel}
+                      onChange={(e) => setByokModel(e.target.value)}
+                    />
+                  </label>
+                  <p className="muted small">
+                    Get a key at <strong>openrouter.ai</strong>. When set, it's used for every
+                    Diagnose/Scan below instead of "Narrated by", sent only with that request (never
+                    stored), and billed to your own OpenRouter account. This deployment has no
+                    per-user accounts: your key narrates whichever capture is selected above, not
+                    only ones you uploaded yourself.
+                  </p>
+                </div>
+              </details>
+            )}
 
             {askScope === "device" && summary && c && (
               <div className="severity-strip">

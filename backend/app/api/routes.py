@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlmodel import Session, select
 
 from app.db import get_session
-from app.llm import list_providers
+from app.llm import byok_allowed, list_providers
 from app.models.db_models import Capture, Device, Investigation, InvestigationCaptureLink
 from app.services.ingestion import empty_bugreport_rejection_message, parse_capture_file
 from app.services.persistence import (
@@ -146,6 +146,16 @@ def upload_capture(
 @router.get("/llm/providers")
 def get_llm_providers():
     return list_providers()
+
+
+@router.get("/llm/byok_status")
+def get_byok_status():
+    # Separate endpoint, not folded into list_providers()'s array response,
+    # so existing callers of that endpoint are untouched. Lets the frontend
+    # hide/disable the BYOK panel instead of letting a visitor type in a key
+    # that will just come back "disabled on this deployment" -- see
+    # app.llm.get_byok_client for why this is off by default.
+    return {"available": byok_allowed()}
 
 
 @router.get("/devices")

@@ -132,3 +132,29 @@ def get_llm_client(provider: str | None = None) -> LLMClient:
         return StubLLMClient()
 
     raise ValueError(f"Unknown LLM provider: {provider!r}")
+
+
+def get_byok_client(api_key: str, model: str | None = None) -> LLMClient:
+    """A visitor-supplied OpenRouter key, used for exactly one narration
+    call and never persisted (not written to .env, not stored in the DB --
+    see reasoning._run_llm, the only caller).
+
+    Deliberately bypasses PARSECAT_ALLOW_LLM_EGRESS and the normal provider
+    dispatch above: that gate exists to stop THIS INSTALL's own configured
+    key from sending an operator's data to a third party by default (the
+    "we do not send data to AI companies" customer-letter commitment, #46).
+    It has nothing to say about a visitor explicitly bringing their own key
+    to send their OWN uploaded data to their own chosen provider -- that's
+    a different consent model, not a bypass of the operator's. Stub (no
+    LLM call at all) remains the default for anyone who does not supply a
+    key, on a public deploy with no server-side key configured.
+
+    OpenRouter specifically (not raw Anthropic/OpenAI) so one key format
+    covers whichever model family the visitor already has -- see
+    DEFAULT_OPENROUTER_MODEL for why this gateway was already the pick for
+    "any of 500+ models without a dedicated client per family".
+    """
+    from app.llm.openai_client import OpenAIClient
+
+    resolved_model = (model or "").strip() or DEFAULT_OPENROUTER_MODEL
+    return OpenAIClient(model=resolved_model, api_key=api_key, base_url=OPENROUTER_BASE_URL)

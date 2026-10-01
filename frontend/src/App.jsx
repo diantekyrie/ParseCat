@@ -278,7 +278,28 @@ function CoverageNotice({ coverage }) {
 // notice still covers the case where egress is allowed and a live provider
 // is selected (including the no-selection default). Only the structured
 // facts bundle is sent, never the raw log file; Stub never leaves this machine.
-function PrivacyNotice({ providers, provider }) {
+//
+// A visitor-supplied BYOK key is a THIRD case, not a variant of the other
+// two: it always wins over "Narrated by" (see get_byok_client), and the key
+// itself is typed into this page and sent to the backend as a form field --
+// "API keys never leave this machine" would be a false claim for it, so
+// that case gets its own honest copy rather than reusing either branch below.
+function PrivacyNotice({ providers, provider, byokApiKey }) {
+  if (byokApiKey.trim()) {
+    return (
+      <div className="privacy-notice">
+        <strong>Data leaving this machine</strong>
+        <p className="muted small">
+          A personal API key is set above — this request sends the extracted fact bundle shown
+          below (never the raw log file) to OpenRouter, using that key, for narration. The key
+          itself is sent with this request and is not stored anywhere server-side; it's held only
+          in this page's memory and is gone on refresh. Clear the field above to go back to
+          "Narrated by" / Stub.
+        </p>
+      </div>
+    );
+  }
+
   const liveProviders = providers.filter((p) => p.id !== "stub" && p.available);
   if (liveProviders.length === 0) return null; // only Stub configured -- nothing leaves this machine
 
@@ -586,6 +607,17 @@ export default function App() {
   const [followUpBusy, setFollowUpBusy] = useState(false);
   const [providers, setProviders] = useState([]);
   const [provider, setProvider] = useState("");
+  // Visitor's own OpenRouter key (BYOK). Deliberately plain component state,
+  // not localStorage/sessionStorage: this never leaves the browser except
+  // as a form field on a diagnose/scan POST, and the simplest way to keep
+  // that true is to not give it a second place to live. Clears on refresh;
+  // when set, it takes priority over whatever "Narrated by" has selected
+  // (see handleScan/handleDiagnose/etc below) and the backend bypasses
+  // PARSECAT_ALLOW_LLM_EGRESS for it -- a visitor's own key sending their
+  // own data is a different consent model than this install's configured
+  // key (see app/llm/__init__.py get_byok_client).
+  const [byokApiKey, setByokApiKey] = useState("");
+  const [byokModel, setByokModel] = useState("");
   const [invQuestion, setInvQuestion] = useState("");
   const [invDiagnosis, setInvDiagnosis] = useState(null);
   const [invDiagnosing, setInvDiagnosing] = useState(false);
@@ -775,6 +807,10 @@ export default function App() {
     try {
       const form = new FormData();
       if (provider) form.append("provider", provider);
+      if (byokApiKey.trim()) {
+        form.append("byok_api_key", byokApiKey.trim());
+        if (byokModel.trim()) form.append("byok_model", byokModel.trim());
+      }
       const data = await api(`/captures/${captureId}/scan`, { method: "POST", body: form });
       setScanByCapture((prev) => ({ ...prev, [captureId]: data }));
     } catch (err) {
@@ -795,6 +831,10 @@ export default function App() {
       const form = new FormData();
       form.append("question", question);
       if (provider) form.append("provider", provider);
+      if (byokApiKey.trim()) {
+        form.append("byok_api_key", byokApiKey.trim());
+        if (byokModel.trim()) form.append("byok_model", byokModel.trim());
+      }
       const data = await api(`/captures/${captureId}/diagnose`, { method: "POST", body: form });
       setDiagnosisByCapture((prev) => ({ ...prev, [captureId]: data }));
       setFollowUpQuestion("");
@@ -827,6 +867,10 @@ export default function App() {
       const form = new FormData();
       form.append("question", askedQuestion);
       if (provider) form.append("provider", provider);
+      if (byokApiKey.trim()) {
+        form.append("byok_api_key", byokApiKey.trim());
+        if (byokModel.trim()) form.append("byok_model", byokModel.trim());
+      }
       form.append("history", JSON.stringify(priorTurns));
       const data = await api(`/captures/${captureId}/diagnose`, { method: "POST", body: form });
       setDiagnosisByCapture((prev) => {
@@ -862,6 +906,10 @@ export default function App() {
       const form = new FormData();
       form.append("question", invQuestion);
       if (provider) form.append("provider", provider);
+      if (byokApiKey.trim()) {
+        form.append("byok_api_key", byokApiKey.trim());
+        if (byokModel.trim()) form.append("byok_model", byokModel.trim());
+      }
       const data = await api(
         `/investigations/${encodeURIComponent(investigationLabel.trim())}/diagnose`,
         { method: "POST", body: form },
@@ -890,6 +938,10 @@ export default function App() {
       const form = new FormData();
       form.append("question", askedQuestion);
       if (provider) form.append("provider", provider);
+      if (byokApiKey.trim()) {
+        form.append("byok_api_key", byokApiKey.trim());
+        if (byokModel.trim()) form.append("byok_model", byokModel.trim());
+      }
       form.append("history", JSON.stringify(priorTurns));
       const data = await api(`/investigations/${encodeURIComponent(label)}/diagnose`, { method: "POST", body: form });
       setInvDiagnosis((existing) => (existing ? {
@@ -1121,7 +1173,37 @@ export default function App() {
               )}
             </div>
 
-            <PrivacyNotice providers={providers} provider={provider} />
+            <PrivacyNotice providers={providers} provider={provider} byokApiKey={byokApiKey} />
+
+            <details className="byok-panel">
+              <summary>Have your own OpenRouter key? Use it instead (optional)</summary>
+              <div className="byok-fields">
+                <label className="inline-label">
+                  OpenRouter API key
+                  <input
+                    type="password"
+                    placeholder="sk-or-..."
+                    value={byokApiKey}
+                    onChange={(e) => setByokApiKey(e.target.value)}
+                    autoComplete="off"
+                  />
+                </label>
+                <label className="inline-label">
+                  Model (optional)
+                  <input
+                    type="text"
+                    placeholder="e.g. anthropic/claude-sonnet-4.5"
+                    value={byokModel}
+                    onChange={(e) => setByokModel(e.target.value)}
+                  />
+                </label>
+                <p className="muted small">
+                  Get a key at <strong>openrouter.ai</strong>. When set, it's used for every
+                  Diagnose/Scan below instead of "Narrated by", sent only with that request (never
+                  stored), and billed to your own OpenRouter account.
+                </p>
+              </div>
+            </details>
 
             {askScope === "device" && summary && c && (
               <div className="severity-strip">

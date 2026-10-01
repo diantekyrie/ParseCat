@@ -277,6 +277,13 @@ def diagnose_capture(
     question: str = Form(...),
     provider: str | None = Form(None),
     history: str | None = Form(None),
+    # Visitor-supplied OpenRouter key, used for exactly this one call and
+    # never persisted (not logged, not written to .env, not stored in the
+    # DB -- see app.llm.get_byok_client). Lets a public deploy with no
+    # server-side key configured still offer real narration to anyone who
+    # brings their own, while defaulting everyone else to Stub.
+    byok_api_key: str | None = Form(None),
+    byok_model: str | None = Form(None),
     session: Session = Depends(get_session),
 ):
     capture = session.get(Capture, capture_id)
@@ -287,6 +294,7 @@ def diagnose_capture(
     result = diagnose(
         session, capture_id, device.label, question,
         provider=provider, history=_parse_history(history),
+        byok_api_key=byok_api_key, byok_model=byok_model,
     )
     return result
 
@@ -295,6 +303,8 @@ def diagnose_capture(
 def scan_capture_route(
     capture_id: int,
     provider: str | None = Form(None),
+    byok_api_key: str | None = Form(None),
+    byok_model: str | None = Form(None),
     session: Session = Depends(get_session),
 ):
     """Auto-scan -- no question required. Gathers every evidence category
@@ -303,7 +313,10 @@ def scan_capture_route(
     if capture is None:
         raise HTTPException(404, "Unknown capture")
     device = session.get(Device, capture.device_id)
-    return scan_capture(session, capture_id, device.label, provider=provider)
+    return scan_capture(
+        session, capture_id, device.label, provider=provider,
+        byok_api_key=byok_api_key, byok_model=byok_model,
+    )
 
 
 @router.post("/investigations/{investigation_label}/diagnose")
@@ -312,6 +325,8 @@ def diagnose_investigation_route(
     question: str = Form(...),
     provider: str | None = Form(None),
     history: str | None = Form(None),
+    byok_api_key: str | None = Form(None),
+    byok_model: str | None = Form(None),
     session: Session = Depends(get_session),
 ):
     investigation = session.exec(
@@ -323,5 +338,6 @@ def diagnose_investigation_route(
     result = diagnose_investigation(
         session, investigation.id, question,
         provider=provider, history=_parse_history(history),
+        byok_api_key=byok_api_key, byok_model=byok_model,
     )
     return result

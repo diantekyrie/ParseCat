@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import shutil
+import os
 import tempfile
 from pathlib import Path
 
@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlmodel import Session, select
 
 from app.db import get_session
-from app.llm import list_providers
+from app.llm import byok_allowed, list_providers
 from app.models.db_models import Capture, Device, Investigation, InvestigationCaptureLink
 from app.services.ingestion import empty_bugreport_rejection_message, parse_capture_file
 from app.services.persistence import (
@@ -23,6 +23,21 @@ from app.services.summary import build_capture_summary, build_merged_summary, ca
 router = APIRouter()
 
 SUPPORTED_UPLOAD_SUFFIXES = {".zip", ".txt", ".pcap", ".pcapng"}
+
+# Real bugreport .zips seen in this repo's own test fixtures run 100-290MB
+# (see e.g. the Portkey bug threads), so this can't be a tiny cap -- but
+# nothing enforced ANY limit before this, on an endpoint that will be public
+# and unauthenticated: a single oversized or repeated upload could fill the
+# host's disk via the NamedTemporaryFile below, with nothing to stop it.
+# Override via env without a code change if a real device's bugreport ever
+# needs more headroom. Read at request time via _max_upload_bytes() so tests
+# (and ops) can change PARSECAT_MAX_UPLOAD_BYTES without reloading the module.
+_DEFAULT_MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+MAX_UPLOAD_BYTES = _DEFAULT_MAX_UPLOAD_BYTES  # documented default; prefer helper
+
+
+def _max_upload_bytes() -> int:
+    return int(os.environ.get("PARSECAT_MAX_UPLOAD_BYTES", str(_DEFAULT_MAX_UPLOAD_BYTES)))
 
 
 def _parse_history(raw: str | None) -> list[dict] | None:
@@ -59,16 +74,36 @@ def upload_capture(
     if suffix not in SUPPORTED_UPLOAD_SUFFIXES:
         raise HTTPException(400, "Expected one of: .zip, .txt, .pcap, .pcapng")
 
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = Path(tmp.name)
-
+    # Bounded chunked copy, not shutil.copyfileobj(file.file, tmp) -- that
+    # trusts the client to stop sending, which an unauthenticated public
+    # endpoint cannot assume. Content-Length is advisory (absent on chunked
+    # transfer-encoding, and nothing stops a client from lying about it), so
+    # this counts actual bytes written and aborts mid-stream rather than
+    # buffering an unbounded upload to disk first and checking after.
+    # Single try/finally so every failure path (413, disconnect, OSError,
+    # parse error) and the success path unlink the NamedTemporaryFile.
+    written = 0
+    tmp_path: Path | None = None
+    max_bytes = _max_upload_bytes()
     try:
-        parsed = parse_capture_file(tmp_path, file.filename)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(422, f"Failed to parse upload: {exc}") from exc
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            while chunk := file.file.read(1024 * 1024):
+                written += len(chunk)
+                if written > max_bytes:
+                    raise HTTPException(
+                        413,
+                        f"Upload exceeds the {max_bytes // (1024 * 1024)}MB limit.",
+                    )
+                tmp.write(chunk)
+
+        try:
+            parsed = parse_capture_file(tmp_path, file.filename)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(422, f"Failed to parse upload: {exc}") from exc
     finally:
-        tmp_path.unlink(missing_ok=True)
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
     # PC-ux-003 / #31: empty .txt (or plain logcat with no bugreport sections)
     # must not become a successful capture row — surface as upload failure so
@@ -111,6 +146,16 @@ def upload_capture(
 @router.get("/llm/providers")
 def get_llm_providers():
     return list_providers()
+
+
+@router.get("/llm/byok_status")
+def get_byok_status():
+    # Separate endpoint, not folded into list_providers()'s array response,
+    # so existing callers of that endpoint are untouched. Lets the frontend
+    # hide/disable the BYOK panel instead of letting a visitor type in a key
+    # that will just come back "disabled on this deployment" -- see
+    # app.llm.get_byok_client for why this is off by default.
+    return {"available": byok_allowed()}
 
 
 @router.get("/devices")
@@ -239,6 +284,13 @@ def diagnose_capture(
     question: str = Form(...),
     provider: str | None = Form(None),
     history: str | None = Form(None),
+    # Visitor-supplied OpenRouter key, used for exactly this one call and
+    # never persisted (not logged, not written to .env, not stored in the
+    # DB -- see app.llm.get_byok_client). Lets a public deploy with no
+    # server-side key configured still offer real narration to anyone who
+    # brings their own, while defaulting everyone else to Stub.
+    byok_api_key: str | None = Form(None),
+    byok_model: str | None = Form(None),
     session: Session = Depends(get_session),
 ):
     capture = session.get(Capture, capture_id)
@@ -249,6 +301,7 @@ def diagnose_capture(
     result = diagnose(
         session, capture_id, device.label, question,
         provider=provider, history=_parse_history(history),
+        byok_api_key=byok_api_key, byok_model=byok_model,
     )
     return result
 
@@ -257,6 +310,8 @@ def diagnose_capture(
 def scan_capture_route(
     capture_id: int,
     provider: str | None = Form(None),
+    byok_api_key: str | None = Form(None),
+    byok_model: str | None = Form(None),
     session: Session = Depends(get_session),
 ):
     """Auto-scan -- no question required. Gathers every evidence category
@@ -265,7 +320,10 @@ def scan_capture_route(
     if capture is None:
         raise HTTPException(404, "Unknown capture")
     device = session.get(Device, capture.device_id)
-    return scan_capture(session, capture_id, device.label, provider=provider)
+    return scan_capture(
+        session, capture_id, device.label, provider=provider,
+        byok_api_key=byok_api_key, byok_model=byok_model,
+    )
 
 
 @router.post("/investigations/{investigation_label}/diagnose")
@@ -274,6 +332,8 @@ def diagnose_investigation_route(
     question: str = Form(...),
     provider: str | None = Form(None),
     history: str | None = Form(None),
+    byok_api_key: str | None = Form(None),
+    byok_model: str | None = Form(None),
     session: Session = Depends(get_session),
 ):
     investigation = session.exec(
@@ -285,5 +345,6 @@ def diagnose_investigation_route(
     result = diagnose_investigation(
         session, investigation.id, question,
         provider=provider, history=_parse_history(history),
+        byok_api_key=byok_api_key, byok_model=byok_model,
     )
     return result

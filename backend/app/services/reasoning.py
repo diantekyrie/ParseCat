@@ -17,7 +17,7 @@ from sqlmodel import Session
 
 from sqlmodel import select
 
-from app.llm import get_llm_client
+from app.llm import get_byok_client, get_llm_client
 from app.models.db_models import (
     AnrBlockingThreadRow,
     AnrMainThreadSnapshotRow,
@@ -1692,6 +1692,7 @@ SCAN_SYSTEM_PROMPT = SYSTEM_PROMPT + """
 
 def scan_capture(
     session: Session, capture_id: int, device_label: str, provider: str | None = None,
+    byok_api_key: str | None = None, byok_model: str | None = None,
 ) -> dict:
     """Auto-scan: gather every evidence category with no question at all,
     rank the findings by computed severity, and narrate. This is the
@@ -1705,7 +1706,9 @@ def scan_capture(
     bundle["scan"] = True
     # Re-attach after ranked_findings so scan findings feed verified_facts.
     attach_verified_facts(bundle)
-    report_text, llm_error = _run_llm(bundle, SCAN_SYSTEM_PROMPT, provider)
+    report_text, llm_error = _run_llm(
+        bundle, SCAN_SYSTEM_PROMPT, provider, byok_api_key=byok_api_key, byok_model=byok_model,
+    )
     return {"bundle": bundle, "report": report_text, "llm_error": llm_error, "provider": provider}
 
 
@@ -1732,6 +1735,7 @@ def _format_history(history: list[dict] | None) -> str:
 
 def _run_llm(
     bundle: dict, system_prompt: str, provider: str | None, history: list[dict] | None = None,
+    byok_api_key: str | None = None, byok_model: str | None = None,
 ) -> tuple[str | None, str | None]:
     user_prompt = (
         _format_history(history) +
@@ -1739,7 +1743,16 @@ def _run_llm(
         "\n\nWrite a diagnosis report answering the question above using only these facts."
     )
     try:
-        llm = get_llm_client(provider)
+        # .strip() before the truthiness check: the frontend trims before
+        # sending, but a raw Form POST (or a future non-browser client)
+        # could still hand this a whitespace-only string, which `if
+        # byok_api_key:` alone would treat as a real key.
+        byok_key = (byok_api_key or "").strip()
+        # A visitor-supplied key always wins over the `provider` dropdown --
+        # see get_byok_client for why this is a distinct consent path, not
+        # a bypass of the operator's own egress gate (and why it's gated
+        # off by default via BYOK_ENV).
+        llm = get_byok_client(byok_key, byok_model) if byok_key else get_llm_client(provider)
         return llm.narrate(system_prompt, user_prompt), None
     except Exception as exc:  # noqa: BLE001 -- LLM narration is a convenience
         # layer on top of already-computed, independently verified facts.
@@ -1752,9 +1765,12 @@ def _run_llm(
 def diagnose(
     session: Session, capture_id: int, device_label: str, question: str,
     provider: str | None = None, history: list[dict] | None = None,
+    byok_api_key: str | None = None, byok_model: str | None = None,
 ) -> dict:
     bundle = build_diagnosis_bundle(session, capture_id, device_label, question)
-    report_text, llm_error = _run_llm(bundle, SYSTEM_PROMPT, provider, history)
+    report_text, llm_error = _run_llm(
+        bundle, SYSTEM_PROMPT, provider, history, byok_api_key=byok_api_key, byok_model=byok_model,
+    )
     return {"bundle": bundle, "report": report_text, "llm_error": llm_error, "provider": provider}
 
 
@@ -1788,6 +1804,7 @@ INVESTIGATION_SYSTEM_PROMPT = SYSTEM_PROMPT + """
 def diagnose_investigation(
     session: Session, investigation_id: int, question: str, provider: str | None = None,
     history: list[dict] | None = None,
+    byok_api_key: str | None = None, byok_model: str | None = None,
 ) -> dict:
     """Runs diagnosis across every capture linked to one investigation,
     merging each capture's independently-built bundle into one combined
@@ -1818,5 +1835,8 @@ def diagnose_investigation(
 
     bundle = {"question": question, "captures": captures_bundle}
     attach_verified_facts(bundle)
-    report_text, llm_error = _run_llm(bundle, INVESTIGATION_SYSTEM_PROMPT, provider, history)
+    report_text, llm_error = _run_llm(
+        bundle, INVESTIGATION_SYSTEM_PROMPT, provider, history,
+        byok_api_key=byok_api_key, byok_model=byok_model,
+    )
     return {"bundle": bundle, "report": report_text, "llm_error": llm_error, "provider": provider}

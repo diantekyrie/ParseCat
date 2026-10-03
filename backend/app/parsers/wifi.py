@@ -9,11 +9,19 @@ state-machine transition log:
       dest=<null> what=ASSOCIATED_BSSID_EVENT screen=off 0 0 BSSID=bc:df:58:b8:1d:51
       Target Bssid=any Last Bssid=bc:df:58:b8:1d:51 roam=false
 
-Only NETWORK_DISCONNECTION_EVENT (with its 802.11 reason code) and
-ASSOCIATED_BSSID_EVENT (with its roam flag) are decoded -- the state
-machine log has dozens of other `what=` event types (AP capability
-updates, screen state, scan requests, ...) that carry no
-connectivity-failure signal and aren't parsed here.
+    rec[4]: time=08-13 14:21:06.993 ... what=SUPPLICANT_STATE_CHANGE_EVENT ...
+      ssid: "pixel_simhouse" bssid: bc:df:58:b8:1d:51 ... state: FOUR_WAY_HANDSHAKE
+
+    rec[246]: ... what=CMD_IPV4_PROVISIONING_SUCCESS ... DhcpResultsParcelable{...}
+
+Decodes disconnection + association (SM), plus supplicant-state /
+NETWORK_CONNECTION / DHCP+IP provisioning events beyond SM disconnect.
+Other `what=` types (AP capability, screen, scans, ...) are skipped.
+
+Invent-nothing: unknown 802.11 reason codes → `Unknown (802.11 reason N)`;
+unknown supplicant `state:` tokens → `Unknown (TOKEN)`. DHCP *failure*
+`rec[]` shapes were not observed in local captures — not invented here
+(see issue #75).
 """
 from __future__ import annotations
 
@@ -34,6 +42,36 @@ DISCONNECT_RE = re.compile(
 ASSOC_RE = re.compile(
     r"BSSID=(?P<bssid>\S+) Target Bssid=\S+ Last Bssid=\S+ roam=(?P<roam>true|false)"
 )
+
+SUPPLICANT_RE = re.compile(
+    r'ssid: "(?P<ssid>[^"]*)" bssid: (?P<bssid>\S+) nid: \d+ frequencyMhz: \d+ state: (?P<state>\S+)'
+)
+
+# NETWORK_CONNECTION_EVENT rest is free-form; grab bssid + quoted ssid.
+NET_CONN_RE = re.compile(
+    r"(?P<bssid>[0-9a-fA-F:]{17})\s+nid=\d+\s+\"(?P<ssid>[^\"]*)\""
+)
+
+# Observed Android SupplicantState names in WifiController rec[] lines.
+# Anything else stays Unknown (TOKEN) — do not invent.
+# Only states observed in real WifiController rec[] lines so far.
+# Additional Android SupplicantState enum values stay Unknown until seen.
+KNOWN_SUPPLICANT_STATES = {
+    "ASSOCIATING",
+    "ASSOCIATED",
+    "FOUR_WAY_HANDSHAKE",
+    "COMPLETED",
+    "DISCONNECTED",
+    "SCANNING",
+}
+
+DHCP_IP_WHATS = {
+    "CMD_PRE_DHCP_ACTION": ("dhcp", "pre_dhcp_action"),
+    "CMD_PRE_DHCP_ACTION_COMPLETE": ("dhcp", "pre_dhcp_action_complete"),
+    "CMD_POST_DHCP_ACTION": ("dhcp", "post_dhcp_action"),
+    "CMD_IPV4_PROVISIONING_SUCCESS": ("ip_provisioning", "success"),
+    "CMD_IP_CONFIGURATION_SUCCESSFUL": ("ip_configuration", "successful"),
+}
 
 # IEEE 802.11 reason codes -- the subset most relevant to diagnosing drops.
 # Anything not listed here is reported as "Unknown (N)", never guessed.
@@ -61,6 +99,12 @@ REASON_CODE_NAMES = {
 
 def _reason_name(code: int) -> str:
     return REASON_CODE_NAMES.get(code, f"Unknown (802.11 reason {code})")
+
+
+def _supplicant_state_name(state: str) -> str:
+    if state in KNOWN_SUPPLICANT_STATES:
+        return state
+    return f"Unknown ({state})"
 
 
 def parse_wifi_events(section: Section) -> list[WifiEvent]:
@@ -91,5 +135,31 @@ def parse_wifi_events(section: Section) -> list[WifiEvent]:
                     reason_code=None, reason_name=None, locally_generated=None,
                     roam=(am.group("roam") == "true"), source_ref=ref,
                 ))
+        elif what == "SUPPLICANT_STATE_CHANGE_EVENT":
+            sm = SUPPLICANT_RE.search(rest)
+            if sm:
+                state_name = _supplicant_state_name(sm.group("state"))
+                out.append(WifiEvent(
+                    timestamp=ts, kind="supplicant_state",
+                    ssid=sm.group("ssid"), bssid=sm.group("bssid"),
+                    reason_code=None, reason_name=state_name,
+                    locally_generated=None, roam=None, source_ref=ref,
+                ))
+        elif what == "NETWORK_CONNECTION_EVENT":
+            nm = NET_CONN_RE.search(rest)
+            if nm:
+                out.append(WifiEvent(
+                    timestamp=ts, kind="network_connection",
+                    ssid=nm.group("ssid"), bssid=nm.group("bssid").lower(),
+                    reason_code=None, reason_name=None,
+                    locally_generated=None, roam=None, source_ref=ref,
+                ))
+        elif what in DHCP_IP_WHATS:
+            kind, outcome = DHCP_IP_WHATS[what]
+            out.append(WifiEvent(
+                timestamp=ts, kind=kind, ssid=None, bssid=None,
+                reason_code=None, reason_name=outcome,
+                locally_generated=None, roam=None, source_ref=ref,
+            ))
 
     return out

@@ -1,4 +1,4 @@
-"""Round 2: Wi-Fi SM synthetic CI fixtures for PC-wifi-002..006 (issue #66).
+"""Wi-Fi SM synthetic CI fixtures for PC-wifi-002..006 (issue #66).
 
 Synthetic WifiController `rec[N]:` lines only — lab SSID/BSSID, no real
 captures/PII. Expected values come from current `wifi.py` behavior
@@ -95,7 +95,8 @@ def test_pc_wifi_002_four_way_handshake_timeout():
 
 def test_pc_wifi_003_non_self_initiated_disconnect():
     """PC-wifi-003: locallyGenerated false (non-self-initiated)."""
-    # reason 0 appears in wifi.py module docstring example with local=false.
+    # Purpose: pin the local == "true" comparison's false branch (002 already
+    # covers locallyGenerated false via reason 15; reason 0 is the docstring example).
     text = _disc_line(
         2, "01-15 10:01:00.100",
         ssid=LAB_SSID, bssid=LAB_BSSID, reason=0, local="false",

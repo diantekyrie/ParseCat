@@ -123,18 +123,42 @@ def list_providers() -> list[dict]:
     return out
 
 
+# Fixed id reported as `narrated_by` when a visitor-supplied (BYOK) key ran
+# the narration (#84). Deliberately a constant: the response must never
+# carry the key, a key prefix, the visitor's model string, or any other
+# echoed request field -- only "which kind of client actually ran".
+BYOK_PROVIDER_ID = "openrouter-byok"
+
+KNOWN_PROVIDER_IDS = frozenset(p["id"] for p in PROVIDERS)
+
+
+def _auto_detect_provider() -> str:
+    egress = llm_egress_allowed()
+    if egress and os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    if egress and os.environ.get("OPENAI_API_KEY"):
+        return "openai"
+    if egress and os.environ.get("OPENROUTER_API_KEY"):
+        return "openrouter"
+    return "stub"
+
+
+def resolve_provider_id(provider: str | None) -> str | None:
+    """The provider id get_llm_client(provider) would actually run, for
+    reporting as `narrated_by` (#84). Returns only an id from the fixed
+    PROVIDERS list -- an unknown/garbage requested id resolves to None
+    (get_llm_client raises for it anyway), never to the echoed string.
+    Does not check the egress gate; callers only report this after the
+    client was successfully built and narrated."""
+    resolved = _auto_detect_provider() if provider is None else provider
+    return resolved if resolved in KNOWN_PROVIDER_IDS else None
+
+
 def get_llm_client(provider: str | None = None) -> LLMClient:
     egress = llm_egress_allowed()
 
     if provider is None:
-        if egress and os.environ.get("ANTHROPIC_API_KEY"):
-            provider = "anthropic"
-        elif egress and os.environ.get("OPENAI_API_KEY"):
-            provider = "openai"
-        elif egress and os.environ.get("OPENROUTER_API_KEY"):
-            provider = "openrouter"
-        else:
-            provider = "stub"
+        provider = _auto_detect_provider()
     elif provider in THIRD_PARTY_PROVIDER_IDS and not egress:
         raise _egress_gate_error(provider)
 

@@ -7,6 +7,8 @@ import {
   answerConfidence,
   flattenVerifiedFacts,
   hasVerifiedFacts,
+  narratedByExportLine,
+  narratedByLabel,
   splitNarrationSections,
 } from "./answerBands";
 import DiagnosisStory, { IdentityStrip } from "./DiagnosisStory";
@@ -827,7 +829,9 @@ export default function App() {
         if (byokModel.trim()) form.append("byok_model", byokModel.trim());
       }
       const data = await api(`/captures/${captureId}/scan`, { method: "POST", body: form });
-      setScanByCapture((prev) => ({ ...prev, [captureId]: data }));
+      // byok_sent is a boolean only (never the key) -- lets the narrated-by
+      // label refuse to claim Stub for a BYOK request (#84).
+      setScanByCapture((prev) => ({ ...prev, [captureId]: { ...data, byok_sent: Boolean(byokApiKey.trim()) } }));
     } catch (err) {
       setError(String(err));
     } finally {
@@ -851,7 +855,7 @@ export default function App() {
         if (byokModel.trim()) form.append("byok_model", byokModel.trim());
       }
       const data = await api(`/captures/${captureId}/diagnose`, { method: "POST", body: form });
-      setDiagnosisByCapture((prev) => ({ ...prev, [captureId]: data }));
+      setDiagnosisByCapture((prev) => ({ ...prev, [captureId]: { ...data, byok_sent: Boolean(byokApiKey.trim()) } }));
       setFollowUpQuestion("");
     } catch (err) {
       setError(String(err));
@@ -898,7 +902,8 @@ export default function App() {
             followUps: [
               ...(existing.followUps || []),
               { question: askedQuestion, report: data.report, llm_error: data.llm_error,
-                provider: data.provider, bundle: data.bundle },
+                provider: data.provider, narrated_by: data.narrated_by,
+                byok_sent: Boolean(byokApiKey.trim()), bundle: data.bundle },
             ],
           },
         };
@@ -929,7 +934,7 @@ export default function App() {
         `/investigations/${encodeURIComponent(investigationLabel.trim())}/diagnose`,
         { method: "POST", body: form },
       );
-      setInvDiagnosis(data);
+      setInvDiagnosis({ ...data, byok_sent: Boolean(byokApiKey.trim()) });
       setInvFollowUpQuestion("");
     } catch (err) {
       setError(String(err));
@@ -964,7 +969,8 @@ export default function App() {
         followUps: [
           ...(existing.followUps || []),
           { question: askedQuestion, report: data.report, llm_error: data.llm_error,
-            provider: data.provider, bundle: data.bundle },
+            provider: data.provider, narrated_by: data.narrated_by,
+            byok_sent: Boolean(byokApiKey.trim()), bundle: data.bundle },
         ],
       } : existing));
       setInvFollowUpQuestion("");
@@ -980,13 +986,14 @@ export default function App() {
     const followUpText = (invDiagnosis.followUps || []).map((turn, i) => [
       "",
       `follow-up ${i + 1}: ${turn.question}`,
+      narratedByExportLine(turn, providers),
       turn.report || `LLM narration failed: ${turn.llm_error}`,
     ].join("\n")).join("\n");
     const report = [
       "ParseCat investigation diagnosis export",
       `investigation: ${investigationLabel}`,
       `captures: ${invDiagnosis.bundle.captures.map((c) => `#${c.capture_id} (${c.device_label})`).join(", ")}`,
-      `provider: ${invDiagnosis.provider || "auto"}`,
+      narratedByExportLine(invDiagnosis, providers),
       "",
       "question:",
       invDiagnosis.bundle.question,
@@ -1042,12 +1049,13 @@ export default function App() {
     const followUpText = (diagnosis.followUps || []).map((turn, i) => [
       "",
       `follow-up ${i + 1}: ${turn.question}`,
+      narratedByExportLine(turn, providers),
       turn.report || `LLM narration failed: ${turn.llm_error}`,
     ].join("\n")).join("\n");
     const report = [
       "ParseCat diagnosis export",
       `capture: #${selectedCaptureId}${targetCapture ? ` ${targetCapture.original_filename}` : ""}`,
-      `provider: ${diagnosis.provider || "auto"}`,
+      narratedByExportLine(diagnosis, providers),
       "",
       "question:",
       diagnosis.bundle.question,
@@ -1267,7 +1275,7 @@ export default function App() {
                     <NarrationBand
                       report={scan.report}
                       llmError={scan.llm_error}
-                      providerLabel={scan.provider ? (providers.find((p) => p.id === scan.provider)?.label || scan.provider) : null}
+                      providerLabel={narratedByLabel(scan, providers)}
                     />
                   </div>
                 )}
@@ -1321,7 +1329,7 @@ export default function App() {
                     <NarrationBand
                       report={diagnosis.report}
                       llmError={diagnosis.llm_error}
-                      providerLabel={diagnosis.provider ? (providers.find((p) => p.id === diagnosis.provider)?.label || diagnosis.provider) : null}
+                      providerLabel={narratedByLabel(diagnosis, providers)}
                     />
 
                     {(diagnosis.followUps || []).map((turn, i) => (
@@ -1335,7 +1343,7 @@ export default function App() {
                           deviceLabel={deviceLabel}
                         />
                         <VerifiedFromLogBand bundle={turn.bundle} />
-                        <NarrationBand report={turn.report} llmError={turn.llm_error} />
+                        <NarrationBand report={turn.report} llmError={turn.llm_error} providerLabel={narratedByLabel(turn, providers)} />
                       </div>
                     ))}
 
@@ -1419,7 +1427,7 @@ export default function App() {
                     <NarrationBand
                       report={invDiagnosis.report}
                       llmError={invDiagnosis.llm_error}
-                      providerLabel={invDiagnosis.provider ? (providers.find((p) => p.id === invDiagnosis.provider)?.label || invDiagnosis.provider) : null}
+                      providerLabel={narratedByLabel(invDiagnosis, providers)}
                     />
 
                     {(invDiagnosis.followUps || []).map((turn, i) => (
@@ -1437,7 +1445,7 @@ export default function App() {
                           }
                         />
                         <VerifiedFromLogBand bundle={turn.bundle} />
-                        <NarrationBand report={turn.report} llmError={turn.llm_error} />
+                        <NarrationBand report={turn.report} llmError={turn.llm_error} providerLabel={narratedByLabel(turn, providers)} />
                       </div>
                     ))}
 

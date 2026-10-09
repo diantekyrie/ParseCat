@@ -1733,6 +1733,24 @@ def _format_history(history: list[dict] | None) -> str:
     )
 
 
+# Key-shaped tokens that must never reach `llm_error` (which goes straight
+# to the UI): any "sk-..." token -- full OpenRouter/OpenAI/Anthropic keys,
+# bare prefixes like "sk-or-v1", and masked forms like "sk-or-...abcd" --
+# plus any long opaque token that could be some other provider's key.
+_KEY_LIKE_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_.\-]*|(?<![A-Za-z0-9])[A-Za-z0-9_\-]{32,}")
+
+
+def _redact_llm_error(message: str, key: str | None) -> str:
+    """Strip key material from a provider exception's text before it is
+    returned as `llm_error`. Keeps the rest (e.g. "Error code: 401") so the
+    visitor still gets a useful status class. Never log the raw message."""
+    if key:
+        for fragment in sorted({key, key[:8]}, key=len, reverse=True):
+            if len(fragment) >= 4:
+                message = message.replace(fragment, "[redacted]")
+    return _KEY_LIKE_RE.sub("[redacted]", message)
+
+
 def _run_llm(
     bundle: dict, system_prompt: str, provider: str | None, history: list[dict] | None = None,
     byok_api_key: str | None = None, byok_model: str | None = None,
@@ -1742,6 +1760,7 @@ def _run_llm(
         "Verified fact bundle (JSON):\n\n" + json.dumps(bundle, indent=2, default=str) +
         "\n\nWrite a diagnosis report answering the question above using only these facts."
     )
+    byok_key = ""
     try:
         # .strip() before the truthiness check: the frontend trims before
         # sending, but a raw Form POST (or a future non-browser client)
@@ -1758,8 +1777,10 @@ def _run_llm(
         # layer on top of already-computed, independently verified facts.
         # A provider outage, quota error, or bad key should degrade to
         # "here are the facts, narration failed" -- never a 500 that hides
-        # the verification work that already succeeded.
-        return None, str(exc)
+        # the verification work that already succeeded. The message is
+        # redacted (a provider 401 can echo the key) and deliberately not
+        # logged server-side.
+        return None, _redact_llm_error(str(exc), byok_key or None)
 
 
 def diagnose(

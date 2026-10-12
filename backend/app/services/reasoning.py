@@ -1733,10 +1733,14 @@ def _format_history(history: list[dict] | None) -> str:
     )
 
 
-# Key-shaped tokens that must never reach `llm_error` (which goes straight
-# to the UI): any "sk-..." token -- full OpenRouter/OpenAI/Anthropic keys,
-# bare prefixes like "sk-or-v1", and masked forms like "sk-or-...abcd" --
-# plus any long opaque token that could be some other provider's key.
+# Best-effort redaction for `llm_error` (which goes straight to the UI).
+# `_redact_llm_error` strips: the supplied BYOK key and its first 8 chars;
+# any "sk-..." token (full OpenRouter/OpenAI/Anthropic-style keys, bare
+# prefixes like "sk-or-v1", masked forms like "sk-or-...abcd"); and any
+# opaque run of 32+ chars (which can also hide long model/request ids).
+# NOT covered, by decision (Founders Engineer + Arch on #86): masked non-"sk-"
+# keys such as "AIza...wxyz", and a bare masked last-4 ("...abcd",
+# "key ending abcd"). A last-4 alone is not usable as a key.
 _KEY_LIKE_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_.\-]*|(?<![A-Za-z0-9])[A-Za-z0-9_\-]{32,}")
 
 

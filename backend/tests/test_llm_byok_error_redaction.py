@@ -128,3 +128,9 @@ def test_run_llm_redacts_key_and_key_like_tokens_directly(monkeypatch):
     for needle in (*FORBIDDEN, "sk-ant-api03-XYZxyz123456"):
         assert needle not in llm_error
     assert "401" in llm_error
+
+
+@pytest.mark.parametrize("key", [None, DUMMY_KEY])
+def test_benign_error_text_survives_unchanged(key):
+    benign = "Error code: 429 rate limited"
+    assert reasoning._redact_llm_error(benign, key) == benign

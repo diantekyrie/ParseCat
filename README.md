@@ -279,7 +279,7 @@ instead"), confirmed live against the real API rather than assumed.
 
 If narration fails for any reason (bad/missing key, quota, wrong
 model/endpoint), the request still returns `200` with the full verified
-fact bundle intact and `report: null` / `llm_error: "<the actual error>"` --
+fact bundle intact and `report: null` / `llm_error: "<provider error, key-like tokens redacted>"` --
 narration is a convenience layer on top of the independently-verified
 facts, never a single point of failure for them.
 

@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import router
+from app.auth import BasicAuthMiddleware
 from app.db import init_db
 from app.parsers import WANTED_SECTIONS
 
@@ -38,6 +39,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Added LAST so it sits OUTERMOST (Starlette applies middleware in reverse
+# registration order) -- every request, including a CORS preflight that
+# never reaches here (see BasicAuthMiddleware's own OPTIONS carve-out), hits
+# this gate before the API router or the static frontend below ever see it.
+# See app/auth.py for the full design: shared-credential, fails closed if
+# unset -- this is the "add some auth" branch, not main.
+app.add_middleware(BasicAuthMiddleware)
 
 app.include_router(router, prefix="/api")
 

@@ -10,7 +10,7 @@ import {
   splitNarrationSections,
 } from "./answerBands";
 import DiagnosisStory, { IdentityStrip } from "./DiagnosisStory";
-import { getAuthHeader, notifyUnauthorized } from "./authSession.js";
+import { getAuthHeader, logoutSession, notifyUnauthorized, refreshAccessToken } from "./authSession.js";
 
 const SEVERITY_COLOR = { critical: "var(--red)", warning: "var(--amber)", info: "var(--blue)" };
 const CONFIDENCE_COLOR = { HIGH: "var(--green)", MEDIUM: "var(--amber)", LOW: "var(--orange)", UNCONFIRMED: "var(--muted)" };
@@ -21,16 +21,22 @@ const TABS = [
   { id: "timeline", label: "Timeline" },
 ];
 
-async function api(path, opts) {
+async function api(path, opts, _isRetry = false) {
   const res = await fetch(`/api${path}`, {
     ...opts,
     headers: { ...(opts?.headers || {}), ...getAuthHeader() },
   });
+  if (res.status === 401 && !_isRetry) {
+    // The access token expired mid-session (it's short-lived on purpose --
+    // see backend/app/auth.py). Try the httpOnly refresh cookie once before
+    // bothering the user with a login screen -- this is what makes a long
+    // Diagnose/Scan session survive past 15 minutes without interruption.
+    // Only falls through to notifyUnauthorized() below if THAT also fails,
+    // meaning the refresh token itself is gone, not just this access token.
+    const refreshed = await refreshAccessToken();
+    if (refreshed) return api(path, opts, true);
+  }
   if (res.status === 401) {
-    // Session expired or was never valid (shouldn't normally happen -- this
-    // component only mounts after LoginGate already has a token -- but a
-    // timeout mid-session lands here). Flips the app back to the login
-    // screen; see authSession.js and LoginGate.jsx.
     notifyUnauthorized();
   }
   if (!res.ok) {
@@ -419,6 +425,15 @@ function SettingsPanel({
             </p>
           </>
         )}
+      </section>
+
+      <section className="panel settings-panel">
+        <h2>Session</h2>
+        <p className="muted small">
+          Revokes this browser's login server-side (not just a local clear) -- you'll need to sign in
+          again here. Other browsers or devices you're signed into stay signed in.
+        </p>
+        <button type="button" className="secondary-btn" onClick={logoutSession}>Sign out</button>
       </section>
     </div>
   );

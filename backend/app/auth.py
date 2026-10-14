@@ -14,22 +14,31 @@ beats building and securing a registration flow, and it keeps the same
 "configure via Render env vars" workflow already used for every other knob
 in this app (PARSECAT_ALLOW_LLM_EGRESS, PARSECAT_ALLOW_BYOK, ...).
 
-Session tokens are unchanged in shape from the shared-credential version:
-POST /api/auth/login exchanges credentials for a short-lived, signed Bearer
-token (now carrying a user id, not just "logged in or not"); the frontend
-holds it only in a JS module variable (frontend/src/authSession.js), never
-localStorage/cookies, so a refresh always starts from "no token" and
-re-shows the login screen; the token also carries its own server-checked
-expiry (PARSECAT_SESSION_TIMEOUT_SECONDS, default 900s / 15 min). See
-LoginGate.jsx -- the frontend needed zero changes for this: same request/
-response shape as before, just a real account behind it now.
+Two-token design, the standard web pattern, not the original single-token
+one: a short-lived, signed, STATELESS access token (unchanged in shape --
+Bearer header, carries the user id, PARSECAT_SESSION_TIMEOUT_SECONDS,
+default 900s / 15 min, held only in frontend JS memory, never persisted)
+plus a long-lived, STATEFUL refresh token behind an httpOnly cookie
+(PARSECAT_REFRESH_TOKEN_DAYS, default 30). The access token alone used to
+also be what survived (or didn't) a page refresh -- forcing a real login on
+every refresh, which turned out to be more friction than intended. The
+refresh token is what makes a refresh painless now: it rides along
+automatically in the cookie (httpOnly, so frontend JS never even sees it,
+which is also why it can't live in the same plain-JS-variable spot as the
+access token), and LoginGate.jsx exchanges it for a fresh access token
+silently on load via POST /api/auth/refresh -- a real login screen only
+shows up once the refresh token itself is gone (expired, or the person
+clicked "Sign out," which revokes it server-side via POST /api/auth/logout
+rather than just discarding the cookie).
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import os
 import secrets
 import time
+from datetime import datetime, timedelta, timezone
 
 import bcrypt
 from fastapi import FastAPI, HTTPException, Request
@@ -38,17 +47,24 @@ from sqlmodel import Session, select
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
-from app.models.db_models import User
+from app.models.db_models import RefreshToken, User
 
 BOOTSTRAP_USERS_ENV = "PARSECAT_BOOTSTRAP_USERS"
 SESSION_TIMEOUT_ENV = "PARSECAT_SESSION_TIMEOUT_SECONDS"
 _DEFAULT_SESSION_TIMEOUT_SECONDS = 15 * 60
+REFRESH_TOKEN_DAYS_ENV = "PARSECAT_REFRESH_TOKEN_DAYS"
+_DEFAULT_REFRESH_TOKEN_DAYS = 30
+REFRESH_COOKIE_NAME = "parsecat_refresh"
 
 # Exempt so a host's liveness probe (Render's optional Health Check Path, or
-# any uptime monitor) can work without a session, and so /api/auth/login
-# itself is reachable before anyone has a token to send -- a login endpoint
-# that required being already logged in would be unusable.
-_EXEMPT_PATHS = frozenset({"/api/health", "/api/auth/login"})
+# any uptime monitor) can work without a session, and so the auth endpoints
+# themselves are reachable before anyone has a valid access token: login
+# obviously (nobody has anything yet), refresh (its whole point is getting
+# a new access token WITHOUT one), and logout (must work even if the access
+# token already expired -- the point is killing the refresh cookie).
+_EXEMPT_PATHS = frozenset({
+    "/api/health", "/api/auth/login", "/api/auth/refresh", "/api/auth/logout",
+})
 
 # Signs session tokens. Generated fresh every process start, never persisted
 # -- a restart invalidates every outstanding session, which fits the intent
@@ -114,6 +130,85 @@ def _session_timeout_seconds() -> int:
     return value if value > 0 else _DEFAULT_SESSION_TIMEOUT_SECONDS
 
 
+def _refresh_token_days() -> int:
+    raw = os.environ.get(REFRESH_TOKEN_DAYS_ENV)
+    if not raw:
+        return _DEFAULT_REFRESH_TOKEN_DAYS
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_REFRESH_TOKEN_DAYS
+    return value if value > 0 else _DEFAULT_REFRESH_TOKEN_DAYS
+
+
+def _hash_refresh_token(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def issue_refresh_token(session: Session, user_id: int) -> tuple[str, int]:
+    """Mints a new refresh token for this user. Returns (raw_token,
+    max_age_seconds) -- raw_token goes straight into the cookie and is
+    never stored; only its hash is (see RefreshToken.token_hash), same
+    reasoning as password hashing: a DB leak alone shouldn't hand out a
+    usable credential.
+    """
+    raw = secrets.token_urlsafe(32)
+    days = _refresh_token_days()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=days)
+    session.add(RefreshToken(user_id=user_id, token_hash=_hash_refresh_token(raw), expires_at=expires_at))
+    session.commit()
+    return raw, days * 86400
+
+
+def consume_refresh_token(session: Session, raw: str | None) -> int | None:
+    """Validates a refresh cookie value against the DB. Returns the user_id
+    if it's a real, unrevoked, unexpired token, else None. Doesn't rotate
+    or consume in the single-use sense (the name is about validating a use,
+    not invalidating after one) -- the same refresh token keeps working
+    until its fixed expiry or an explicit /api/auth/logout revokes it,
+    trading a little security (a stolen token stays valid for its full
+    lifetime) for a lot of simplicity (no rotation bookkeeping, no reuse-
+    detection) on a small-team internal tool where that's the right trade.
+    """
+    if not raw:
+        return None
+    row = session.exec(select(RefreshToken).where(RefreshToken.token_hash == _hash_refresh_token(raw))).first()
+    if row is None or row.revoked_at is not None:
+        return None
+    if row.expires_at <= datetime.now(timezone.utc):
+        return None
+    return row.user_id
+
+
+def revoke_refresh_token(session: Session, raw: str | None) -> None:
+    """Used by POST /api/auth/logout -- an actual server-side revocation,
+    not just the browser discarding its cookie (which would leave the
+    token itself still valid if it had been copied out beforehand).
+    """
+    if not raw:
+        return
+    row = session.exec(select(RefreshToken).where(RefreshToken.token_hash == _hash_refresh_token(raw))).first()
+    if row is not None and row.revoked_at is None:
+        row.revoked_at = datetime.now(timezone.utc)
+        session.add(row)
+        session.commit()
+
+
+def _is_https(request: Request) -> bool:
+    """Whether to mark the refresh cookie Secure (HTTPS-only). Render (and
+    most hosts) terminate TLS at a proxy and forward to this process over
+    plain HTTP, so request.url.scheme alone would read "http" even in
+    production -- X-Forwarded-Proto is what the proxy actually sets to
+    tell us the original scheme. Falls back to request.url.scheme for
+    local dev (`uvicorn` with no proxy in front), where Secure correctly
+    ends up False so the cookie still gets set at all over plain http.
+    """
+    forwarded = request.headers.get("x-forwarded-proto")
+    if forwarded:
+        return forwarded.split(",")[0].strip().lower() == "https"
+    return request.url.scheme == "https"
+
+
 def issue_session_token(user_id: int, now: float | None = None) -> tuple[str, int]:
     """Mint a signed, self-expiring token for this user. Returns
     (token, expires_in_seconds).
@@ -167,15 +262,23 @@ class LoginRequest(BaseModel):
     password: str
 
 
+def _set_refresh_cookie(response: JSONResponse, raw_token: str, max_age: int, secure: bool) -> None:
+    response.set_cookie(
+        REFRESH_COOKIE_NAME, raw_token, max_age=max_age, httponly=True, secure=secure,
+        samesite="strict", path="/api/auth",
+    )
+
+
 def register_auth_routes(application: FastAPI) -> None:
-    """POST /api/auth/login -- exempt from SessionAuthMiddleware (see
-    _EXEMPT_PATHS) since nobody has a token yet when they call it.
+    """POST /api/auth/login, /api/auth/refresh, /api/auth/logout -- all
+    exempt from SessionAuthMiddleware (see _EXEMPT_PATHS); see this
+    module's docstring for the two-token design these implement.
     """
     from app.db import get_session
     from fastapi import Depends
 
     @application.post("/api/auth/login")
-    def login(body: LoginRequest, session: Session = Depends(get_session)):
+    def login(body: LoginRequest, request: Request, session: Session = Depends(get_session)):
         user = session.exec(select(User).where(User.username == body.username)).first()
         if user is not None:
             password_ok = _verify_password(body.password, user.password_hash)
@@ -195,8 +298,43 @@ def register_auth_routes(application: FastAPI) -> None:
                 )
             raise HTTPException(status_code=401, detail="Incorrect username or password.")
 
-        token, expires_in = issue_session_token(user.id)
-        return {"token": token, "expires_in": expires_in}
+        access_token, expires_in = issue_session_token(user.id)
+        refresh_raw, refresh_max_age = issue_refresh_token(session, user.id)
+        response = JSONResponse({"token": access_token, "expires_in": expires_in})
+        _set_refresh_cookie(response, refresh_raw, refresh_max_age, _is_https(request))
+        return response
+
+    @application.post("/api/auth/refresh")
+    def refresh(request: Request, session: Session = Depends(get_session)):
+        """Exchanges the httpOnly refresh cookie for a new access token --
+        this is what LoginGate.jsx calls silently on page load instead of
+        showing the login form, and what App.jsx's api() helper retries
+        through once on an unexpected 401 before giving up and showing it.
+        """
+        raw = request.cookies.get(REFRESH_COOKIE_NAME)
+        user_id = consume_refresh_token(session, raw)
+        if user_id is None:
+            response = JSONResponse(
+                status_code=401,
+                content={"detail": "Refresh token missing, invalid, or expired; please sign in again."},
+            )
+            response.delete_cookie(REFRESH_COOKIE_NAME, path="/api/auth")
+            return response
+        access_token, expires_in = issue_session_token(user_id)
+        return {"token": access_token, "expires_in": expires_in}
+
+    @application.post("/api/auth/logout")
+    def logout(request: Request, session: Session = Depends(get_session)):
+        """Revokes the refresh token server-side (see revoke_refresh_token)
+        and clears the cookie -- not just a client-side token drop, so a
+        copy of the cookie made before logout stops working too.
+        """
+        raw = request.cookies.get(REFRESH_COOKIE_NAME)
+        if raw:
+            revoke_refresh_token(session, raw)
+        response = JSONResponse({"logged_out": True})
+        response.delete_cookie(REFRESH_COOKIE_NAME, path="/api/auth")
+        return response
 
 
 class SessionAuthMiddleware(BaseHTTPMiddleware):

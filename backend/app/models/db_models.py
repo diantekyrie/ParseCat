@@ -73,6 +73,27 @@ class User(SQLModel, table=True):
     byok_model: Optional[str] = None
 
 
+class RefreshToken(SQLModel, table=True):
+    """Long-lived credential behind the httpOnly refresh cookie (see
+    app/auth.py's refresh-token flow). Stored hashed, never the raw value --
+    same spirit as User.password_hash, a DB leak shouldn't hand out usable
+    tokens. Unlike the short-lived, stateless access token, this is a real
+    DB row, which is what makes POST /api/auth/logout an actual revocation
+    rather than just the browser discarding a cookie it still technically
+    could have reused.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    token_hash: str = Field(index=True, unique=True)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(AwareUTCDateTime(), nullable=False),
+    )
+    expires_at: datetime = Field(sa_column=Column(AwareUTCDateTime(), nullable=False))
+    revoked_at: Optional[datetime] = Field(default=None, sa_column=Column(AwareUTCDateTime(), nullable=True))
+
+
 class Device(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("owner_user_id", "label", name="uq_device_owner_label"),)
 

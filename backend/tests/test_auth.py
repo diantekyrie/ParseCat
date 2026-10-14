@@ -162,3 +162,78 @@ def test_login_correct_credentials_issues_usable_token():
         r = c.get("/api/no-such-route", headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 404  # past the gate, same as test_valid_token_passes_through
     app.dependency_overrides.clear()
+
+
+# --- Refresh-token flow (POST /api/auth/refresh, POST /api/auth/logout) ----
+
+def test_login_sets_refresh_cookie():
+    c, _ = _client_with_user()
+    with c:
+        login = c.post("/api/auth/login", json={"username": TEST_USERNAME, "password": TEST_PASSWORD})
+    assert "parsecat_refresh" in login.cookies
+    app.dependency_overrides.clear()
+
+
+def test_refresh_with_valid_cookie_issues_a_usable_access_token():
+    c, _ = _client_with_user()
+    with c:
+        c.post("/api/auth/login", json={"username": TEST_USERNAME, "password": TEST_PASSWORD})
+        # No Authorization header at all here -- the httpOnly cookie the
+        # client is still holding from login is what authorizes this call,
+        # same as a page refresh with no in-memory access token left.
+        refresh = c.post("/api/auth/refresh")
+        assert refresh.status_code == 200
+        new_token = refresh.json()["token"]
+        assert refresh.json()["expires_in"] > 0
+
+        r = c.get("/api/no-such-route", headers={"Authorization": f"Bearer {new_token}"})
+    assert r.status_code == 404  # past the gate
+    app.dependency_overrides.clear()
+
+
+def test_refresh_with_no_cookie_is_401():
+    c, _ = _client_with_user()
+    with c:
+        r = c.post("/api/auth/refresh")  # never logged in -- no cookie to send
+    assert r.status_code == 401
+    app.dependency_overrides.clear()
+
+
+def test_refresh_with_garbage_cookie_is_401():
+    c, _ = _client_with_user()
+    with c:
+        c.cookies.set("parsecat_refresh", "not-a-real-token")
+        r = c.post("/api/auth/refresh")
+    assert r.status_code == 401
+    app.dependency_overrides.clear()
+
+
+def test_logout_revokes_the_refresh_token_server_side():
+    c, _ = _client_with_user()
+    with c:
+        login = c.post("/api/auth/login", json={"username": TEST_USERNAME, "password": TEST_PASSWORD})
+        raw_cookie = login.cookies.get("parsecat_refresh")
+        assert raw_cookie
+
+        logout = c.post("/api/auth/logout")
+        assert logout.status_code == 200
+
+        # Re-present the exact same raw cookie value explicitly, bypassing
+        # whatever the test client's own jar did with logout's Set-Cookie --
+        # proves the token itself is dead server-side, not just forgotten
+        # client-side (the real-world case this guards: a cookie copied out
+        # before logout should not keep working).
+        c.cookies.set("parsecat_refresh", raw_cookie)
+        r = c.post("/api/auth/refresh")
+    assert r.status_code == 401
+    app.dependency_overrides.clear()
+
+
+def test_logout_also_clears_the_cookie_for_the_normal_client():
+    c, _ = _client_with_user()
+    with c:
+        c.post("/api/auth/login", json={"username": TEST_USERNAME, "password": TEST_PASSWORD})
+        c.post("/api/auth/logout")
+        r = c.post("/api/auth/refresh")  # client's own jar should no longer carry the cookie
+    assert r.status_code == 401
+    app.dependency_overrides.clear()

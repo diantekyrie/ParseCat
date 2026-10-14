@@ -30,6 +30,8 @@ pass provider=<id> explicitly rather than relying on ambient .env state.
 """
 from __future__ import annotations
 
+import base64
+
 import pytest
 
 
@@ -40,3 +42,39 @@ def _no_real_llm_keys_in_tests():
     for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "PARSECAT_ALLOW_LLM_EGRESS"):
         os.environ.pop(key, None)
     yield
+
+
+# app/auth.py's BasicAuthMiddleware fails CLOSED by design when
+# PARSECAT_AUTH_USERNAME / PARSECAT_AUTH_PASSWORD are unset -- correct for a
+# real deploy (this branch exists specifically so a misconfigured one does
+# NOT silently serve the app wide open), but it would 401/503 every
+# HTTP-level test in this suite otherwise. Fixed test credentials for the
+# whole session, same shape as the fixture above (deterministic test
+# environment), just setting rather than stripping. test_auth.py itself
+# overrides/clears these locally (monkeypatch) to exercise the gate's own
+# unconfigured/wrong-credential/missing-header branches.
+TEST_AUTH_USERNAME = "test-user"
+TEST_AUTH_PASSWORD = "test-pass"
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _fixed_basic_auth_credentials():
+    import os
+
+    os.environ["PARSECAT_AUTH_USERNAME"] = TEST_AUTH_USERNAME
+    os.environ["PARSECAT_AUTH_PASSWORD"] = TEST_AUTH_PASSWORD
+    yield
+
+
+def basic_auth_headers() -> dict[str, str]:
+    """Authorization header matching the fixed test credentials above --
+    pass to TestClient(app, headers=basic_auth_headers()) wherever a test
+    constructs a client directly, so it isn't 401'd by BasicAuthMiddleware.
+
+    Named to avoid pytest collecting this as a test itself (anything
+    literally named test_* in a test file/module is fair game for pytest's
+    default collection, even a plain helper with no assertions in it).
+    """
+    token = base64.b64encode(f"{TEST_AUTH_USERNAME}:{TEST_AUTH_PASSWORD}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+

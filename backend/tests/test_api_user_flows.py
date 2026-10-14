@@ -28,6 +28,7 @@ from sqlmodel import Session, SQLModel, create_engine
 from app.api.routes import SUPPORTED_UPLOAD_SUFFIXES  # noqa: F401 (documents the contract this file tests against)
 from app.db import get_session
 from app.main import app
+from tests.conftest import basic_auth_headers
 
 
 @pytest.fixture
@@ -48,7 +49,7 @@ def client():
             yield session
 
     app.dependency_overrides[get_session] = _override_session
-    with TestClient(app) as c:
+    with TestClient(app, headers=basic_auth_headers()) as c:
         yield c
     app.dependency_overrides.clear()
 

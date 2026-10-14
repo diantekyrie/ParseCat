@@ -356,6 +356,74 @@ function PrivacyNotice({ providers, provider, byokApiKey, byokAccountConfigured 
   );
 }
 
+// A dedicated settings view rather than an inline <details> in the ASK
+// panel -- that panel grew the page every time it was open, right next to
+// a results area already prone to pushing the page tall (see the
+// max-height/overflow additions on .finding-list/.verified-fact-list
+// below). Account-level settings belong somewhere stable, not jostling for
+// space with whatever capture is currently selected.
+function SettingsPanel({
+  byokAvailable, byokAccountConfigured, byokAccountModel,
+  byokApiKey, setByokApiKey, byokModel, setByokModel,
+  byokSaving, byokSaveError, saveAccountByok, clearAccountByok,
+}) {
+  return (
+    <div className="settings-view">
+      <section className="panel settings-panel">
+        <h2>Your OpenRouter key</h2>
+        {!byokAvailable ? (
+          <p className="muted small">
+            This deployment hasn't turned on BYOK (bring-your-own-key) narration. Ask whoever runs it
+            to set PARSECAT_ALLOW_BYOK to enable this.
+          </p>
+        ) : (
+          <>
+            {byokAccountConfigured && (
+              <p className="muted small byok-saved-notice">
+                Saved to your account{byokAccountModel ? ` — model: ${byokAccountModel}` : ""}. Used
+                automatically on every Diagnose/Scan unless you type a different key below.
+                {" "}
+                <button type="button" className="link-btn" onClick={clearAccountByok} disabled={byokSaving}>
+                  Clear saved key
+                </button>
+              </p>
+            )}
+            <label className="inline-label">
+              OpenRouter API key
+              <input
+                type="password"
+                placeholder="sk-or-..."
+                value={byokApiKey}
+                onChange={(e) => setByokApiKey(e.target.value)}
+                autoComplete="off"
+              />
+            </label>
+            <label className="inline-label">
+              Model (optional)
+              <input
+                type="text"
+                placeholder="e.g. anthropic/claude-sonnet-4.5"
+                value={byokModel}
+                onChange={(e) => setByokModel(e.target.value)}
+              />
+            </label>
+            <button type="button" onClick={saveAccountByok} disabled={byokSaving || !byokApiKey.trim()}>
+              {byokSaving ? "Saving..." : "Save to my account"}
+            </button>
+            {byokSaveError && <div className="error">{byokSaveError}</div>}
+            <p className="muted small">
+              Get a key at <strong>openrouter.ai</strong>, billed to your own OpenRouter account. Typed
+              above without saving, it's used only for the next Diagnose/Scan you run and never stored.
+              Saving it keeps it on your account for every future request — used only for captures you
+              own, never a coworker's.
+            </p>
+          </>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function TriageControls({
   appFilter,
   setAppFilter,
@@ -660,6 +728,7 @@ export default function App() {
   const [invDiagnosing, setInvDiagnosing] = useState(false);
   const [invFollowUpQuestion, setInvFollowUpQuestion] = useState("");
   const [invFollowUpBusy, setInvFollowUpBusy] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [appFilter, setAppFilter] = useState("");
   const [timelineFilter, setTimelineFilter] = useState("");
   const [incidentTime, setIncidentTime] = useState("");
@@ -1139,8 +1208,26 @@ export default function App() {
       <header className="topbar">
         <div className="brand">ParseCat</div>
         <div className="tagline">Device log diagnosis, backed by parsed facts, not vibes.</div>
+        <button type="button" className="secondary-btn settings-toggle" onClick={() => setShowSettings((v) => !v)}>
+          {showSettings ? "Back to dashboard" : "Settings"}
+        </button>
       </header>
 
+      {showSettings ? (
+        <SettingsPanel
+          byokAvailable={byokAvailable}
+          byokAccountConfigured={byokAccountConfigured}
+          byokAccountModel={byokAccountModel}
+          byokApiKey={byokApiKey}
+          setByokApiKey={setByokApiKey}
+          byokModel={byokModel}
+          setByokModel={setByokModel}
+          byokSaving={byokSaving}
+          byokSaveError={byokSaveError}
+          saveAccountByok={saveAccountByok}
+          clearAccountByok={clearAccountByok}
+        />
+      ) : (
       <div className="layout">
         <aside className="sidebar">
           <section className="panel">
@@ -1266,52 +1353,15 @@ export default function App() {
             />
 
             {byokAvailable && (
-              <details className="byok-panel" open={byokAccountConfigured}>
-                <summary>Your OpenRouter key (optional)</summary>
-                <div className="byok-fields">
-                  {byokAccountConfigured && (
-                    <p className="muted small byok-saved-notice">
-                      Saved to your account{byokAccountModel ? ` — model: ${byokAccountModel}` : ""}.
-                      Used automatically on Diagnose/Scan below unless you type a different key here.
-                      {" "}
-                      <button
-                        type="button" className="link-btn" onClick={clearAccountByok} disabled={byokSaving}
-                      >
-                        Clear saved key
-                      </button>
-                    </p>
-                  )}
-                  <label className="inline-label">
-                    OpenRouter API key
-                    <input
-                      type="password"
-                      placeholder="sk-or-..."
-                      value={byokApiKey}
-                      onChange={(e) => setByokApiKey(e.target.value)}
-                      autoComplete="off"
-                    />
-                  </label>
-                  <label className="inline-label">
-                    Model (optional)
-                    <input
-                      type="text"
-                      placeholder="e.g. anthropic/claude-sonnet-4.5"
-                      value={byokModel}
-                      onChange={(e) => setByokModel(e.target.value)}
-                    />
-                  </label>
-                  <button type="button" onClick={saveAccountByok} disabled={byokSaving || !byokApiKey.trim()}>
-                    {byokSaving ? "Saving..." : "Save to my account"}
-                  </button>
-                  {byokSaveError && <div className="error">{byokSaveError}</div>}
-                  <p className="muted small">
-                    Get a key at <strong>openrouter.ai</strong>, billed to your own OpenRouter account.
-                    Typed above without saving, it's used only for this one Diagnose/Scan request and
-                    never stored. Saving it keeps it on your account for every future request — used
-                    only for captures you own, never a coworker's.
-                  </p>
-                </div>
-              </details>
+              <p className="muted small byok-settings-pointer">
+                {byokAccountConfigured
+                  ? `Using your saved OpenRouter key${byokAccountModel ? ` (${byokAccountModel})` : ""}.`
+                  : "Have your own OpenRouter key?"}
+                {" "}
+                <button type="button" className="link-btn" onClick={() => setShowSettings(true)}>
+                  Manage it in Settings
+                </button>
+              </p>
             )}
 
             {askScope === "device" && summary && c && (
@@ -2149,6 +2199,7 @@ export default function App() {
           )}
         </main>
       </div>
+      )}
 
       <style>{`
         :root {
@@ -2162,6 +2213,10 @@ export default function App() {
         .topbar { padding: 20px 28px; border-bottom: 1px solid var(--panel-border); display: flex; align-items: baseline; gap: 14px; }
         .brand { font-size: 22px; font-weight: 800; color: var(--accent); letter-spacing: -0.5px; }
         .tagline { color: var(--muted); font-size: 13px; }
+        .settings-toggle { margin-left: auto; margin-bottom: 0; align-self: center; }
+        .settings-view { max-width: 640px; margin: 28px auto; padding: 0 28px; }
+        .settings-panel h2 { margin-top: 0; }
+        .byok-settings-pointer { margin: 0 0 14px; }
         .layout { display: grid; grid-template-columns: 300px 1fr; gap: 20px; padding: 20px 28px; align-items: start; }
         .sidebar { display: flex; flex-direction: column; gap: 16px; position: sticky; top: 20px; }
         .main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
@@ -2234,7 +2289,7 @@ export default function App() {
         .scan-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
         .finding-tally { display: flex; gap: 16px; margin-bottom: 10px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
         .finding-count b { font-size: 15px; }
-        .finding-list { list-style: none; margin: 0 0 4px; padding: 0; display: flex; flex-direction: column; gap: 7px; }
+        .finding-list { list-style: none; margin: 0 0 4px; padding: 0; display: flex; flex-direction: column; gap: 7px; max-height: 420px; overflow-y: auto; }
         .finding-list li { background: #0e1420; border: 1px solid var(--panel-border); border-left: 3px solid var(--muted); border-radius: 6px; padding: 9px 12px; }
         .finding-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
         .finding-occ { font-family: ui-monospace, monospace; font-size: 12px; color: var(--amber); font-weight: 700; }
@@ -2250,7 +2305,7 @@ export default function App() {
         .answer-band-note { margin: 0 0 10px; }
         .verified-subhead { margin: 12px 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
         .empty-verified { color: var(--amber); font-weight: 600; margin: 8px 0 0; }
-        .verified-fact-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+        .verified-fact-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; max-height: 420px; overflow-y: auto; }
         .verified-fact { background: #10151f; border: 1px solid #1c2433; border-radius: 6px; padding: 8px 10px; }
         .verified-fact-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
         .verified-cat { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); font-weight: 700; }

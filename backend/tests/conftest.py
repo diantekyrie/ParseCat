@@ -44,41 +44,32 @@ def _no_real_llm_keys_in_tests():
     yield
 
 
-# app/auth.py's SessionAuthMiddleware fails CLOSED by design when
-# PARSECAT_AUTH_USERNAME / PARSECAT_AUTH_PASSWORD are unset -- correct for a
-# real deploy (this branch exists specifically so a misconfigured one does
-# NOT silently serve the app wide open), but it would 401/503 every
-# HTTP-level test in this suite otherwise. Fixed test credentials for the
-# whole session, same shape as the fixture above (deterministic test
-# environment), just setting rather than stripping. test_auth.py itself
-# overrides/clears these locally (monkeypatch) to exercise the gate's own
-# unconfigured/wrong-credential/expired-token branches, and exercises the
-# real POST /api/auth/login flow rather than this shortcut.
-TEST_AUTH_USERNAME = "test-user"
-TEST_AUTH_PASSWORD = "test-pass"
-
-
-@pytest.fixture(autouse=True, scope="session")
-def _fixed_basic_auth_credentials():
-    import os
-
-    os.environ["PARSECAT_AUTH_USERNAME"] = TEST_AUTH_USERNAME
-    os.environ["PARSECAT_AUTH_PASSWORD"] = TEST_AUTH_PASSWORD
-    yield
+# app/auth.py's SessionAuthMiddleware fails every /api/* request that lacks
+# a valid session token -- correct for a real deploy, but it would 401 every
+# HTTP-level test in this suite otherwise. A fixed numeric id, not a real
+# provisioned User row: these call sites (test_api_user_flows.py and
+# friends) only need a token that gets them PAST the gate as some
+# consistent "logged-in user" so owner-scoped queries behave sensibly
+# within one test's own temp DB -- they aren't exercising the login flow or
+# real account data, so there's no need for an actual User row to exist.
+# test_auth.py is the one file that tests the real POST /api/auth/login
+# path end to end, including seeding a real user.
+TEST_USER_ID = 1
 
 
 def auth_headers() -> dict[str, str]:
-    """Authorization header carrying a freshly-minted, valid session token --
-    pass to TestClient(app, headers=auth_headers()) wherever a test
-    constructs a client directly, so it isn't 401'd by SessionAuthMiddleware.
-    Mints the token directly via issue_session_token() rather than going
-    through POST /api/auth/login, since these call sites only need a client
-    that's already past the gate, not to exercise the login flow itself.
+    """Authorization header carrying a freshly-minted, valid session token
+    for TEST_USER_ID -- pass to TestClient(app, headers=auth_headers())
+    wherever a test constructs a client directly, so it isn't 401'd by
+    SessionAuthMiddleware. Mints the token directly via issue_session_token()
+    rather than going through POST /api/auth/login, since these call sites
+    only need a client that's already past the gate, not to exercise the
+    login flow itself.
 
     Named to avoid pytest collecting this as a test itself (anything
     literally named test_* in a test file/module is fair game for pytest's
     default collection, even a plain helper with no assertions in it).
     """
-    token, _ = issue_session_token()
+    token, _ = issue_session_token(TEST_USER_ID)
     return {"Authorization": f"Bearer {token}"}
 

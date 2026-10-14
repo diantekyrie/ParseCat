@@ -6,11 +6,13 @@ import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
 from sqlmodel import Session, select
 
+from app.auth import get_current_user_id
 from app.db import get_session
 from app.llm import byok_allowed, list_providers
-from app.models.db_models import Capture, Device, Investigation, InvestigationCaptureLink
+from app.models.db_models import Capture, Device, Investigation, InvestigationCaptureLink, User
 from app.services.ingestion import empty_bugreport_rejection_message, parse_capture_file
 from app.services.persistence import (
     DeviceIdentityMismatchError,
@@ -38,6 +40,22 @@ MAX_UPLOAD_BYTES = _DEFAULT_MAX_UPLOAD_BYTES  # documented default; prefer helpe
 
 def _max_upload_bytes() -> int:
     return int(os.environ.get("PARSECAT_MAX_UPLOAD_BYTES", str(_DEFAULT_MAX_UPLOAD_BYTES)))
+
+
+def _resolve_byok(
+    byok_api_key: str | None, byok_model: str | None, user: User | None,
+) -> tuple[str | None, str | None]:
+    """A one-off key typed into this request always wins (lets anyone
+    override their saved key, or use BYOK without saving one at all); the
+    user's saved account key (see /api/account/byok below) is the fallback
+    so narration works without retyping a key on every call.
+    """
+    key = (byok_api_key or "").strip()
+    if key:
+        return key, ((byok_model or "").strip() or None)
+    if user is not None and user.byok_api_key:
+        return user.byok_api_key, user.byok_model
+    return None, None
 
 
 def _parse_history(raw: str | None) -> list[dict] | None:
@@ -69,6 +87,7 @@ def upload_capture(
     investigation_label: str | None = Form(None),
     file: UploadFile = File(...),
     session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
 ):
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in SUPPORTED_UPLOAD_SUFFIXES:
@@ -118,6 +137,7 @@ def upload_capture(
         capture = persist_capture(
             session, device_label, file.filename, parsed,
             investigation_label=clean_investigation_label or None,
+            owner_user_id=current_user_id,
         )
     except DeviceIdentityMismatchError as exc:
         raise HTTPException(status_code=409, detail=exc.as_api_detail()) from exc
@@ -149,35 +169,105 @@ def get_llm_providers():
 
 
 @router.get("/llm/byok_status")
-def get_byok_status():
+def get_byok_status(
+    session: Session = Depends(get_session), current_user_id: int = Depends(get_current_user_id),
+):
     # Separate endpoint, not folded into list_providers()'s array response,
     # so existing callers of that endpoint are untouched. Lets the frontend
     # hide/disable the BYOK panel instead of letting a visitor type in a key
     # that will just come back "disabled on this deployment" -- see
-    # app.llm.get_byok_client for why this is off by default.
-    return {"available": byok_allowed()}
+    # app.llm.get_byok_client for why this is off by default. `configured`
+    # is this user's own saved key (never the key itself -- see
+    # /api/account/byok below), separate from `available` (whether the
+    # deployment allows BYOK at all).
+    user = session.get(User, current_user_id)
+    return {
+        "available": byok_allowed(),
+        "configured": bool(user and user.byok_api_key),
+        "model": user.byok_model if user else None,
+    }
+
+
+class ByokSettings(BaseModel):
+    api_key: str
+    model: str | None = None
+
+
+@router.put("/account/byok")
+def set_account_byok(
+    body: ByokSettings,
+    session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """Saves this user's own OpenRouter key to their account so it's used
+    automatically on diagnose/scan calls that don't include a one-off key
+    (see _resolve_byok above) -- no more retyping it every request. Write
+    -only from the client's perspective: this is the only route that
+    accepts the raw key; nothing ever echoes it back (see get_byok_status
+    and the User model's docstring for why that boundary is the real
+    protection here, not encryption at rest).
+    """
+    key = body.api_key.strip()
+    if not key:
+        raise HTTPException(400, "api_key is required (use DELETE /api/account/byok to clear it)")
+    user = session.get(User, current_user_id)
+    if user is None:
+        raise HTTPException(404, "Unknown account")
+    user.byok_api_key = key
+    user.byok_model = (body.model or "").strip() or None
+    session.add(user)
+    session.commit()
+    return {"configured": True, "model": user.byok_model}
+
+
+@router.delete("/account/byok")
+def clear_account_byok(
+    session: Session = Depends(get_session), current_user_id: int = Depends(get_current_user_id),
+):
+    user = session.get(User, current_user_id)
+    if user is None:
+        raise HTTPException(404, "Unknown account")
+    user.byok_api_key = None
+    user.byok_model = None
+    session.add(user)
+    session.commit()
+    return {"configured": False, "model": None}
 
 
 @router.get("/devices")
-def list_devices(include_archived: bool = False, session: Session = Depends(get_session)):
-    query = select(Device)
+def list_devices(
+    include_archived: bool = False,
+    session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    query = select(Device).where(Device.owner_user_id == current_user_id)
     if not include_archived:
         query = query.where(Device.archived == False)  # noqa: E712
     return session.exec(query).all()
 
 
 @router.post("/devices/{device_label}/archive")
-def archive_device(device_label: str, session: Session = Depends(get_session)):
-    return _set_device_archived(session, device_label, True)
+def archive_device(
+    device_label: str,
+    session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    return _set_device_archived(session, device_label, True, current_user_id)
 
 
 @router.post("/devices/{device_label}/unarchive")
-def unarchive_device(device_label: str, session: Session = Depends(get_session)):
-    return _set_device_archived(session, device_label, False)
+def unarchive_device(
+    device_label: str,
+    session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    return _set_device_archived(session, device_label, False, current_user_id)
 
 
-def _set_device_archived(session: Session, device_label: str, archived: bool):
-    device = session.exec(select(Device).where(Device.label == device_label)).first()
+def _set_device_archived(session: Session, device_label: str, archived: bool, owner_user_id: int):
+    device = session.exec(
+        select(Device).where(Device.label == device_label, Device.owner_user_id == owner_user_id)
+    ).first()
     if device is None:
         raise HTTPException(404, "Unknown device")
     # Archiving only hides a device from GET /devices (and the frontend's
@@ -192,26 +282,42 @@ def _set_device_archived(session: Session, device_label: str, archived: bool):
 
 
 @router.get("/investigations")
-def list_investigations(include_archived: bool = False, session: Session = Depends(get_session)):
-    query = select(Investigation)
+def list_investigations(
+    include_archived: bool = False,
+    session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    query = select(Investigation).where(Investigation.owner_user_id == current_user_id)
     if not include_archived:
         query = query.where(Investigation.archived == False)  # noqa: E712
     return session.exec(query).all()
 
 
 @router.post("/investigations/{investigation_label}/archive")
-def archive_investigation(investigation_label: str, session: Session = Depends(get_session)):
-    return _set_investigation_archived(session, investigation_label, True)
+def archive_investigation(
+    investigation_label: str,
+    session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    return _set_investigation_archived(session, investigation_label, True, current_user_id)
 
 
 @router.post("/investigations/{investigation_label}/unarchive")
-def unarchive_investigation(investigation_label: str, session: Session = Depends(get_session)):
-    return _set_investigation_archived(session, investigation_label, False)
+def unarchive_investigation(
+    investigation_label: str,
+    session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    return _set_investigation_archived(session, investigation_label, False, current_user_id)
 
 
-def _set_investigation_archived(session: Session, investigation_label: str, archived: bool):
+def _set_investigation_archived(
+    session: Session, investigation_label: str, archived: bool, owner_user_id: int,
+):
     investigation = session.exec(
-        select(Investigation).where(Investigation.label == investigation_label)
+        select(Investigation).where(
+            Investigation.label == investigation_label, Investigation.owner_user_id == owner_user_id,
+        )
     ).first()
     if investigation is None:
         raise HTTPException(404, "Unknown investigation")
@@ -223,9 +329,15 @@ def _set_investigation_archived(session: Session, investigation_label: str, arch
 
 
 @router.get("/investigations/{investigation_label}/captures")
-def list_investigation_captures(investigation_label: str, session: Session = Depends(get_session)):
+def list_investigation_captures(
+    investigation_label: str,
+    session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+):
     investigation = session.exec(
-        select(Investigation).where(Investigation.label == investigation_label)
+        select(Investigation).where(
+            Investigation.label == investigation_label, Investigation.owner_user_id == current_user_id,
+        )
     ).first()
     if investigation is None:
         raise HTTPException(404, "Unknown investigation")
@@ -238,9 +350,15 @@ def list_investigation_captures(investigation_label: str, session: Session = Dep
 
 
 @router.get("/investigations/{investigation_label}/summary")
-def investigation_merged_summary(investigation_label: str, session: Session = Depends(get_session)):
+def investigation_merged_summary(
+    investigation_label: str,
+    session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+):
     investigation = session.exec(
-        select(Investigation).where(Investigation.label == investigation_label)
+        select(Investigation).where(
+            Investigation.label == investigation_label, Investigation.owner_user_id == current_user_id,
+        )
     ).first()
     if investigation is None:
         raise HTTPException(404, "Unknown investigation")
@@ -253,8 +371,14 @@ def investigation_merged_summary(investigation_label: str, session: Session = De
 
 
 @router.get("/devices/{device_label}/captures")
-def list_captures(device_label: str, session: Session = Depends(get_session)):
-    device = session.exec(select(Device).where(Device.label == device_label)).first()
+def list_captures(
+    device_label: str,
+    session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    device = session.exec(
+        select(Device).where(Device.label == device_label, Device.owner_user_id == current_user_id)
+    ).first()
     if device is None:
         raise HTTPException(404, "Unknown device")
     captures = session.exec(select(Capture).where(Capture.device_id == device.id)).all()
@@ -262,17 +386,43 @@ def list_captures(device_label: str, session: Session = Depends(get_session)):
 
 
 @router.get("/devices/{device_label}/summary")
-def device_merged_summary(device_label: str, session: Session = Depends(get_session)):
-    device = session.exec(select(Device).where(Device.label == device_label)).first()
+def device_merged_summary(
+    device_label: str,
+    session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    device = session.exec(
+        select(Device).where(Device.label == device_label, Device.owner_user_id == current_user_id)
+    ).first()
     if device is None:
         raise HTTPException(404, "Unknown device")
     capture_ids = session.exec(select(Capture.id).where(Capture.device_id == device.id)).all()
     return build_merged_summary(session, capture_ids)
 
 
-@router.get("/captures/{capture_id}/summary")
-def capture_summary(capture_id: int, session: Session = Depends(get_session)):
+def _owned_capture(session: Session, capture_id: int, owner_user_id: int) -> Capture | None:
+    """Capture has no owner column of its own -- ownership is inherited
+    through its Device (see Device.owner_user_id). 404 (not 403) for a
+    capture that exists but belongs to someone else, same as a capture_id
+    that doesn't exist at all -- doesn't confirm to a guesser which ids are
+    real on this instance.
+    """
     capture = session.get(Capture, capture_id)
+    if capture is None:
+        return None
+    device = session.get(Device, capture.device_id)
+    if device is None or device.owner_user_id != owner_user_id:
+        return None
+    return capture
+
+
+@router.get("/captures/{capture_id}/summary")
+def capture_summary(
+    capture_id: int,
+    session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    capture = _owned_capture(session, capture_id, current_user_id)
     if capture is None:
         raise HTTPException(404, "Unknown capture")
     return build_capture_summary(session, capture_id)
@@ -292,16 +442,20 @@ def diagnose_capture(
     byok_api_key: str | None = Form(None),
     byok_model: str | None = Form(None),
     session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
 ):
-    capture = session.get(Capture, capture_id)
+    capture = _owned_capture(session, capture_id, current_user_id)
     if capture is None:
         raise HTTPException(404, "Unknown capture")
     device = session.get(Device, capture.device_id)
+    resolved_key, resolved_model = _resolve_byok(
+        byok_api_key, byok_model, session.get(User, current_user_id),
+    )
 
     result = diagnose(
         session, capture_id, device.label, question,
         provider=provider, history=_parse_history(history),
-        byok_api_key=byok_api_key, byok_model=byok_model,
+        byok_api_key=resolved_key, byok_model=resolved_model,
     )
     return result
 
@@ -313,16 +467,20 @@ def scan_capture_route(
     byok_api_key: str | None = Form(None),
     byok_model: str | None = Form(None),
     session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
 ):
     """Auto-scan -- no question required. Gathers every evidence category
     and returns severity-ranked findings plus a narrated summary."""
-    capture = session.get(Capture, capture_id)
+    capture = _owned_capture(session, capture_id, current_user_id)
     if capture is None:
         raise HTTPException(404, "Unknown capture")
     device = session.get(Device, capture.device_id)
+    resolved_key, resolved_model = _resolve_byok(
+        byok_api_key, byok_model, session.get(User, current_user_id),
+    )
     return scan_capture(
         session, capture_id, device.label, provider=provider,
-        byok_api_key=byok_api_key, byok_model=byok_model,
+        byok_api_key=resolved_key, byok_model=resolved_model,
     )
 
 
@@ -335,16 +493,22 @@ def diagnose_investigation_route(
     byok_api_key: str | None = Form(None),
     byok_model: str | None = Form(None),
     session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
 ):
     investigation = session.exec(
-        select(Investigation).where(Investigation.label == investigation_label)
+        select(Investigation).where(
+            Investigation.label == investigation_label, Investigation.owner_user_id == current_user_id,
+        )
     ).first()
     if investigation is None:
         raise HTTPException(404, "Unknown investigation")
+    resolved_key, resolved_model = _resolve_byok(
+        byok_api_key, byok_model, session.get(User, current_user_id),
+    )
 
     result = diagnose_investigation(
         session, investigation.id, question,
         provider=provider, history=_parse_history(history),
-        byok_api_key=byok_api_key, byok_model=byok_model,
+        byok_api_key=resolved_key, byok_model=resolved_model,
     )
     return result

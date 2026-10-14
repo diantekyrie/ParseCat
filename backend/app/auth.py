@@ -1,38 +1,28 @@
-"""Shared-credential session auth for the whole app (API + static frontend).
+"""Per-user account auth for the whole app (API + static frontend).
 
-Deliberately NOT per-user accounts. ParseCat still has no ownership model --
-see the data-segmentation question this branch was spun off to answer: this
-does not segment captures between the people who know the one shared
-credential, any more than main does. It answers a narrower, real threat
-instead -- an open public URL with no login at all is exactly what gets
-found by automated scanners and randoms, not just people who were handed
-the link on purpose. One shared username/password keeps out everyone who
-doesn't have BOTH the link and the credential; it does not give the small
-group who do have it separate, private views of each other's uploads,
-which stays unchanged from main.
+Replaces the earlier shared-single-password design on this branch: with one
+password known to everyone, any of the small group could see every other
+coworker's uploaded captures (there was never a real ownership boundary,
+just a lock on the front door). Real accounts fix that at the data layer --
+see Device.owner_user_id / Investigation.owner_user_id in db_models.py and
+every owner-scoped query in app/api/routes.py -- not just at login.
 
-PARSECAT_AUTH_USERNAME / PARSECAT_AUTH_PASSWORD, required together. Unlike
-this app's other env-gated features (PARSECAT_ALLOW_LLM_EGRESS,
-PARSECAT_ALLOW_BYOK), which default OFF/safe when unset, this one fails
-CLOSED when unset: this branch's whole purpose is "the authed deploy", so a
-misconfigured deploy that forgot to set credentials must not silently serve
-the app wide open -- every request gets refused with a clear 503 telling
-the operator what's missing, the same way AnthropicClient refuses to run
-with no ANTHROPIC_API_KEY rather than silently no-op.
+No self-service signup. Accounts are provisioned by the operator via
+PARSECAT_BOOTSTRAP_USERS at startup (see provision_bootstrap_users()), not
+created through the API -- for a handful of known coworkers, one env var
+beats building and securing a registration flow, and it keeps the same
+"configure via Render env vars" workflow already used for every other knob
+in this app (PARSECAT_ALLOW_LLM_EGRESS, PARSECAT_ALLOW_BYOK, ...).
 
-This is session-token auth, not raw HTTP Basic: a browser that's been given
-Basic credentials once caches and silently replays them on every later
-request, including after a page refresh -- the opposite of what was asked
-for here ("make them log in again on refresh, or after 10-15 minutes").
-Instead, POST /api/auth/login exchanges username+password for a short-lived,
-signed Bearer token; the frontend holds that token ONLY in a JS module
-variable (frontend/src/authSession.js), never localStorage/sessionStorage/a
-cookie, so a refresh always starts from "no token" and re-shows the login
-screen. The token also carries its own server-checked expiry
-(PARSECAT_SESSION_TIMEOUT_SECONDS, default 900s / 15 min), so a tab left
-open and idle loses access even without a refresh. Bearer-in-header rather
-than a cookie also sidesteps CSRF by construction -- nothing is attached to
-a request automatically, the frontend has to put it there deliberately.
+Session tokens are unchanged in shape from the shared-credential version:
+POST /api/auth/login exchanges credentials for a short-lived, signed Bearer
+token (now carrying a user id, not just "logged in or not"); the frontend
+holds it only in a JS module variable (frontend/src/authSession.js), never
+localStorage/cookies, so a refresh always starts from "no token" and
+re-shows the login screen; the token also carries its own server-checked
+expiry (PARSECAT_SESSION_TIMEOUT_SECONDS, default 900s / 15 min). See
+LoginGate.jsx -- the frontend needed zero changes for this: same request/
+response shape as before, just a real account behind it now.
 """
 from __future__ import annotations
 
@@ -41,14 +31,16 @@ import os
 import secrets
 import time
 
-from fastapi import FastAPI, HTTPException
+import bcrypt
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+from sqlmodel import Session, select
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-AUTH_USERNAME_ENV = "PARSECAT_AUTH_USERNAME"
-AUTH_PASSWORD_ENV = "PARSECAT_AUTH_PASSWORD"
+from app.models.db_models import User
+
+BOOTSTRAP_USERS_ENV = "PARSECAT_BOOTSTRAP_USERS"
 SESSION_TIMEOUT_ENV = "PARSECAT_SESSION_TIMEOUT_SECONDS"
 _DEFAULT_SESSION_TIMEOUT_SECONDS = 15 * 60
 
@@ -58,28 +50,57 @@ _DEFAULT_SESSION_TIMEOUT_SECONDS = 15 * 60
 # that required being already logged in would be unusable.
 _EXEMPT_PATHS = frozenset({"/api/health", "/api/auth/login"})
 
-
-def _is_api_path(path: str) -> bool:
-    return path == "/api" or path.startswith("/api/")
-
 # Signs session tokens. Generated fresh every process start, never persisted
 # -- a restart invalidates every outstanding session, which fits the intent
 # here (periodic forced re-auth) rather than something to work around.
 _SESSION_SECRET = secrets.token_bytes(32)
 
+# Paid at login time whenever the username doesn't match a real account, so
+# a request for a nonexistent user costs roughly the same wall-clock time as
+# one for a real user with a wrong password (bcrypt.checkpw is the
+# expensive step; skipping it for "no such user" would otherwise make that
+# case measurably faster, leaking which usernames exist).
+_DUMMY_PASSWORD_HASH = bcrypt.hashpw(b"not-a-real-account", bcrypt.gensalt()).decode("utf-8")
 
-def _configured_credentials() -> tuple[str, str] | None:
-    """Read at request time (not cached at import/startup), matching this
-    codebase's existing pattern for env-gated behavior (llm_egress_allowed(),
-    byok_allowed(), _max_upload_bytes()) -- so tests can monkeypatch the env
-    per-case without reimporting the module, and a config change only needs
-    a process restart, not a code change.
+
+def _is_api_path(path: str) -> bool:
+    return path == "/api" or path.startswith("/api/")
+
+
+def _hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except ValueError:
+        return False  # malformed stored hash -- treat as "doesn't match", never crash the login route
+
+
+def provision_bootstrap_users(session: Session) -> None:
+    """Creates any account named in PARSECAT_BOOTSTRAP_USERS that doesn't
+    already exist. Format: "user1:password1,user2:password2". Only CREATES
+    missing accounts -- never touches an existing user's password, so an
+    operator can't accidentally reset everyone's login by redeploying with
+    the var still set (which is the normal case: nothing here removes it
+    after first use). Add a new entry and redeploy to add a new coworker;
+    existing ones are untouched.
     """
-    username = os.environ.get(AUTH_USERNAME_ENV)
-    password = os.environ.get(AUTH_PASSWORD_ENV)
-    if not username or not password:
-        return None
-    return username, password
+    raw = os.environ.get(BOOTSTRAP_USERS_ENV, "")
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        username, _, password = entry.partition(":")
+        username, password = username.strip(), password.strip()
+        if not username or not password:
+            continue
+        exists = session.exec(select(User.id).where(User.username == username)).first()
+        if exists is not None:
+            continue
+        session.add(User(username=username, password_hash=_hash_password(password)))
+    session.commit()
 
 
 def _session_timeout_seconds() -> int:
@@ -93,39 +114,52 @@ def _session_timeout_seconds() -> int:
     return value if value > 0 else _DEFAULT_SESSION_TIMEOUT_SECONDS
 
 
-def issue_session_token(now: float | None = None) -> tuple[str, int]:
-    """Mint a signed, self-expiring token. Returns (token, expires_in_seconds).
+def issue_session_token(user_id: int, now: float | None = None) -> tuple[str, int]:
+    """Mint a signed, self-expiring token for this user. Returns
+    (token, expires_in_seconds).
 
-    Format is "<expires_at_epoch>.<hmac_hex>" -- not a JWT, because the only
-    claim this needs is "not expired yet" and a bespoke library dependency
-    buys nothing a single HMAC comparison doesn't already give.
+    Format is "<user_id>:<expires_at_epoch>.<hmac_hex>" -- not a JWT,
+    because the only claims this needs are "which user" and "not expired
+    yet," and a bespoke library dependency buys nothing a single HMAC
+    comparison doesn't already give.
     """
     timeout = _session_timeout_seconds()
     expires_at = int((now if now is not None else time.time())) + timeout
-    payload = str(expires_at)
+    payload = f"{user_id}:{expires_at}"
     sig = hmac.new(_SESSION_SECRET, payload.encode(), "sha256").hexdigest()
     return f"{payload}.{sig}", timeout
 
 
-def _verify_session_token(token: str) -> bool:
+def _verify_session_token(token: str) -> int | None:
+    """Returns the token's user_id if it's validly signed and not expired, else None."""
     payload, sep, sig = token.partition(".")
-    if not sep or not payload.isdigit():
-        return False
+    if not sep:
+        return None
     expected_sig = hmac.new(_SESSION_SECRET, payload.encode(), "sha256").hexdigest()
     if not secrets.compare_digest(sig, expected_sig):
-        return False
-    return int(payload) > time.time()
+        return None
+    user_part, colon, exp_part = payload.partition(":")
+    if not colon or not user_part.isdigit() or not exp_part.isdigit():
+        return None
+    if int(exp_part) <= time.time():
+        return None
+    return int(user_part)
 
 
-def _credentials_match(given_user: str, given_pass: str, expected_user: str, expected_pass: str) -> bool:
-    # Both comparisons always run (never short-circuited on the username
-    # alone) so a wrong username doesn't return measurably faster than a
-    # right one -- secrets.compare_digest is constant-time per call, and
-    # `and` here still evaluates the right side even when the left is
-    # False, so timing stays equivalent either way.
-    user_ok = secrets.compare_digest(given_user, expected_user)
-    pass_ok = secrets.compare_digest(given_pass, expected_pass)
-    return user_ok and pass_ok
+def get_current_user_id(request: Request) -> int:
+    """FastAPI dependency for routes that need to know who's asking.
+    SessionAuthMiddleware already rejected anything without a valid token
+    before a route handler ever runs, and stashes the user id on
+    request.state -- this just surfaces it with a typed, explicit
+    dependency instead of routes reaching into request.state directly.
+    The 401 here is unreachable in production (the middleware already
+    would have returned one) but keeps this safe rather than returning
+    None if that invariant is ever broken.
+    """
+    user_id = getattr(request.state, "user_id", None)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Not authenticated.")
+    return user_id
 
 
 class LoginRequest(BaseModel):
@@ -137,32 +171,39 @@ def register_auth_routes(application: FastAPI) -> None:
     """POST /api/auth/login -- exempt from SessionAuthMiddleware (see
     _EXEMPT_PATHS) since nobody has a token yet when they call it.
     """
+    from app.db import get_session
+    from fastapi import Depends
 
     @application.post("/api/auth/login")
-    def login(body: LoginRequest):
-        configured = _configured_credentials()
-        if configured is None:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    f"This deployment requires {AUTH_USERNAME_ENV} and "
-                    f"{AUTH_PASSWORD_ENV} to both be set, and is refusing "
-                    "all requests until they are."
-                ),
-            )
-        expected_user, expected_pass = configured
-        if not _credentials_match(body.username, body.password, expected_user, expected_pass):
+    def login(body: LoginRequest, session: Session = Depends(get_session)):
+        user = session.exec(select(User).where(User.username == body.username)).first()
+        if user is not None:
+            password_ok = _verify_password(body.password, user.password_hash)
+        else:
+            _verify_password(body.password, _DUMMY_PASSWORD_HASH)  # pay the same bcrypt cost either way
+            password_ok = False
+
+        if not password_ok:
+            any_user = session.exec(select(User.id).limit(1)).first()
+            if any_user is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"No accounts have been provisioned yet. Set {BOOTSTRAP_USERS_ENV} "
+                        "(e.g. \"alice:somepassword\") and redeploy."
+                    ),
+                )
             raise HTTPException(status_code=401, detail="Incorrect username or password.")
-        token, expires_in = issue_session_token()
+
+        token, expires_in = issue_session_token(user.id)
         return {"token": token, "expires_in": expires_in}
 
 
 class SessionAuthMiddleware(BaseHTTPMiddleware):
     """Wraps the ENTIRE app -- API routes, the static frontend mount, and
     the SPA catch-all alike -- added last in main.py so it sits outermost
-    and runs before any of them. A request with no valid session token never
-    reaches the static bundle, the health check's internals (moot, it's
-    exempt), or a single API route.
+    and runs before any of them. A request with no valid session token
+    never reaches a single /api/* route.
     """
 
     async def dispatch(self, request: Request, call_next):
@@ -179,11 +220,10 @@ class SessionAuthMiddleware(BaseHTTPMiddleware):
         # deadlock where the login screen's own JS/CSS couldn't load without
         # a token you can only get from... the login screen. The bundle is
         # just the client-side app shell with no capture data or secrets
-        # baked in (a BYOK key, for instance, is typed in and sent per
-        # request, never embedded in the build) -- every actual read of
-        # device/capture data still goes through a gated /api/* call, so
-        # this doesn't hand out anything an unauthenticated visitor couldn't
-        # already infer from the public GitHub repo this is built from.
+        # baked in -- every actual read of device/capture data still goes
+        # through a gated, owner-scoped /api/* call, so this doesn't hand
+        # out anything an unauthenticated visitor couldn't already infer
+        # from the public GitHub repo this is built from.
         if (
             request.method == "OPTIONS"
             or request.url.path in _EXEMPT_PATHS
@@ -191,24 +231,14 @@ class SessionAuthMiddleware(BaseHTTPMiddleware):
         ):
             return await call_next(request)
 
-        if _configured_credentials() is None:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "detail": (
-                        f"This deployment requires {AUTH_USERNAME_ENV} and "
-                        f"{AUTH_PASSWORD_ENV} to both be set, and is refusing "
-                        "all requests until they are."
-                    ),
-                },
-            )
-
         header = request.headers.get("authorization", "")
         token = header[len("Bearer "):] if header.startswith("Bearer ") else None
-        if not token or not _verify_session_token(token):
+        user_id = _verify_session_token(token) if token else None
+        if user_id is None:
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Session expired or invalid; please sign in again."},
             )
 
+        request.state.user_id = user_id
         return await call_next(request)

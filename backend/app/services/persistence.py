@@ -120,14 +120,23 @@ def _identity_values(info: DeviceInfo | DeviceInfoRow | None) -> dict[str, str]:
     return values
 
 
-def check_device_label_identity(session: Session, device_label: str, parsed: ParsedCapture) -> None:
+def check_device_label_identity(
+    session: Session, device_label: str, parsed: ParsedCapture, owner_user_id: int | None = None,
+) -> None:
     """Compare incoming hardware identity against captures already on this label.
 
     Mismatch of any overlapping identity field refuses persist. Incoming
     capture with no comparable identity warns and still persists, because
     blocking would drop partial dumps. A new label has nothing to compare.
+
+    Scoped to owner_user_id (defaults to None for synthetic/unit tests that
+    don't authenticate) so two different accounts' devices named the same
+    thing -- e.g. both coworkers calling theirs "pixel" -- are unrelated and
+    never compared against each other.
     """
-    device = session.exec(select(Device).where(Device.label == device_label)).first()
+    device = session.exec(
+        select(Device).where(Device.label == device_label, Device.owner_user_id == owner_user_id)
+    ).first()
     if device is None:
         return
 
@@ -173,22 +182,28 @@ def check_device_label_identity(session: Session, device_label: str, parsed: Par
         raise DeviceIdentityMismatchError(device_label, mismatched)
 
 
-def get_or_create_device(session: Session, device_label: str) -> Device:
-    device = session.exec(select(Device).where(Device.label == device_label)).first()
+def get_or_create_device(session: Session, device_label: str, owner_user_id: int | None = None) -> Device:
+    device = session.exec(
+        select(Device).where(Device.label == device_label, Device.owner_user_id == owner_user_id)
+    ).first()
     if device is None:
-        device = Device(label=device_label)
+        device = Device(label=device_label, owner_user_id=owner_user_id)
         session.add(device)
         session.commit()
         session.refresh(device)
     return device
 
 
-def get_or_create_investigation(session: Session, investigation_label: str) -> Investigation:
+def get_or_create_investigation(
+    session: Session, investigation_label: str, owner_user_id: int | None = None,
+) -> Investigation:
     investigation = session.exec(
-        select(Investigation).where(Investigation.label == investigation_label)
+        select(Investigation).where(
+            Investigation.label == investigation_label, Investigation.owner_user_id == owner_user_id,
+        )
     ).first()
     if investigation is None:
-        investigation = Investigation(label=investigation_label)
+        investigation = Investigation(label=investigation_label, owner_user_id=owner_user_id)
         session.add(investigation)
         session.commit()
         session.refresh(investigation)
@@ -211,9 +226,10 @@ def persist_capture(
     parsed: ParsedCapture,
     captured_at: datetime | None = None,
     investigation_label: str | None = None,
+    owner_user_id: int | None = None,
 ) -> Capture:
-    check_device_label_identity(session, device_label, parsed)
-    device = get_or_create_device(session, device_label)
+    check_device_label_identity(session, device_label, parsed, owner_user_id)
+    device = get_or_create_device(session, device_label, owner_user_id)
 
     capture = Capture(
         device_id=device.id,
@@ -226,7 +242,7 @@ def persist_capture(
     session.refresh(capture)
 
     if investigation_label:
-        investigation = get_or_create_investigation(session, investigation_label)
+        investigation = get_or_create_investigation(session, investigation_label, owner_user_id)
         session.add(InvestigationCaptureLink(
             investigation_id=investigation.id,
             capture_id=capture.id,

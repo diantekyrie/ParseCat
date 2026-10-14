@@ -94,7 +94,7 @@ export default function LoginGate() {
           <button type="submit" className="login-submit" disabled={busy || !username || !password}>
             {busy ? "Signing in..." : "Sign in"}
           </button>
-          <p className="login-footnote">Access is limited to people with the shared credential.</p>
+          <p className="login-footnote">Access is limited to people with a provisioned account.</p>
         </form>
       </div>
     );

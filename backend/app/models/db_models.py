@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Column, Dialect, types
+from sqlalchemy import Column, Dialect, UniqueConstraint, types
 from sqlalchemy.types import TypeDecorator
 from sqlmodel import Field, SQLModel
 
@@ -46,9 +46,44 @@ class AwareUTCDateTime(TypeDecorator):
         return value.astimezone(timezone.utc)
 
 
-class Device(SQLModel, table=True):
+class User(SQLModel, table=True):
+    """An account under the per-user login (see app/auth.py). Deliberately
+    no self-service signup: accounts are provisioned by the operator via
+    PARSECAT_BOOTSTRAP_USERS at startup, not created through the API --
+    see provision_bootstrap_users().
+    """
+
     id: Optional[int] = Field(default=None, primary_key=True)
-    label: str = Field(index=True, unique=True)  # user-chosen identifier, e.g. serial or nickname
+    username: str = Field(index=True, unique=True)
+    password_hash: str
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(AwareUTCDateTime(), nullable=False),
+    )
+    # Personal BYOK (OpenRouter) key -- see app/api/routes.py's
+    # /api/account/byok endpoints and app/services/reasoning.py's use of it
+    # as the fallback when a diagnose/scan request doesn't include a
+    # one-off key. Stored as plaintext, not encrypted at rest: this is a
+    # small-team internal tool on a single SQLite file, not a service that
+    # holds other people's keys at scale, and PUT /api/account/byok is the
+    # only write path while GET only ever reports whether one is set (never
+    # echoes the value back) -- see routes.py for why that boundary matters
+    # more here than encryption would.
+    byok_api_key: Optional[str] = None
+    byok_model: Optional[str] = None
+
+
+class Device(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("owner_user_id", "label", name="uq_device_owner_label"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    label: str = Field(index=True)  # user-chosen identifier, e.g. serial or nickname -- unique per owner, not globally
+    # Nullable so synthetic/unit tests that construct a Device without an
+    # authenticated request still work (see persistence.py's default), but
+    # every device created through the real upload API always has one --
+    # see app/auth.py get_current_user_id and app/db.py's backfill for
+    # anything pre-existing from before this column existed.
+    owner_user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(AwareUTCDateTime(), nullable=False),
@@ -79,8 +114,11 @@ class Capture(SQLModel, table=True):
 
 
 class Investigation(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("owner_user_id", "label", name="uq_investigation_owner_label"),)
+
     id: Optional[int] = Field(default=None, primary_key=True)
-    label: str = Field(index=True, unique=True)
+    label: str = Field(index=True)  # unique per owner, not globally -- see Device.label
+    owner_user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)  # see Device.owner_user_id
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(AwareUTCDateTime(), nullable=False),

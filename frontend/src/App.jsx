@@ -295,18 +295,30 @@ function CoverageNotice({ coverage }) {
 // itself is typed into this page and sent to the backend as a form field --
 // "API keys never leave this machine" would be a false claim for it, so
 // that case gets its own honest copy rather than reusing either branch below.
-function PrivacyNotice({ providers, provider, byokApiKey }) {
+function PrivacyNotice({ providers, provider, byokApiKey, byokAccountConfigured }) {
   if (byokApiKey.trim()) {
     return (
       <div className="privacy-notice">
         <strong>Data leaving this machine</strong>
         <p className="muted small">
           A personal API key is set above — this request sends the extracted fact bundle shown
-          below (never the raw log file) to OpenRouter, using that key, for narration. The key
-          itself is sent with this request and is not stored anywhere server-side; it's held only
-          in this page's memory and is gone on refresh. This deployment has no per-user accounts,
-          so this applies to whichever capture is currently selected, not only ones uploaded under
-          this key. Clear the field above to go back to "Narrated by" / Stub.
+          below (never the raw log file) to OpenRouter, using that key, for narration. Typed here
+          without saving it to your account, the key is sent only with this one request and held
+          nowhere else — gone on refresh. ParseCat has per-user accounts, so this only ever applies
+          to captures you own; a coworker's uploads are never reachable with your key. Clear the
+          field above to go back to "Narrated by" / Stub.
+        </p>
+      </div>
+    );
+  }
+  if (byokAccountConfigured) {
+    return (
+      <div className="privacy-notice">
+        <strong>Data leaving this machine</strong>
+        <p className="muted small">
+          Your saved account key (see "Your OpenRouter key" below) is used for this request — the
+          extracted fact bundle shown below (never the raw log file) goes to OpenRouter for
+          narration, for captures you own only.
         </p>
       </div>
     );
@@ -634,6 +646,15 @@ export default function App() {
   // see the fetch below and app/llm/__init__.py byok_allowed(). Starts
   // false (hidden) until the check resolves, same as a closed gate.
   const [byokAvailable, setByokAvailable] = useState(false);
+  // Whether the logged-in account has a key SAVED server-side (PUT/DELETE
+  // /api/account/byok) -- separate from byokApiKey above, which is this
+  // request's one-off override field. Saved keys use their own account's
+  // data only (see app/api/routes.py _resolve_byok + per-user ownership),
+  // so this is safe in a way it wasn't before accounts existed.
+  const [byokAccountConfigured, setByokAccountConfigured] = useState(false);
+  const [byokAccountModel, setByokAccountModel] = useState(null);
+  const [byokSaving, setByokSaving] = useState(false);
+  const [byokSaveError, setByokSaveError] = useState(null);
   const [invQuestion, setInvQuestion] = useState("");
   const [invDiagnosis, setInvDiagnosis] = useState(null);
   const [invDiagnosing, setInvDiagnosing] = useState(false);
@@ -687,16 +708,56 @@ export default function App() {
       if (firstAvailable) setProvider(firstAvailable.id);
     }).catch(() => {});
     // Separate from the providers list on purpose -- see
-    // app/api/routes.py get_byok_status. Off (unavailable) by default: this
-    // app has no auth/upload-ownership model, so a visitor's own key could
-    // otherwise be used to narrate ANY capture on this instance, not just
-    // one they uploaded. An operator opts in explicitly (PARSECAT_ALLOW_BYOK=1)
-    // after accepting that. Defaults to hidden on fetch failure, same as a
-    // closed gate, rather than showing a panel that will just error.
+    // app/api/routes.py get_byok_status. `available` stays an explicit
+    // operator opt-in (PARSECAT_ALLOW_BYOK=1) regardless of accounts
+    // existing; `configured`/`model` are this logged-in user's own saved
+    // key (see byokAccountConfigured above). Defaults to hidden/unset on
+    // fetch failure, same as a closed gate, rather than showing a panel
+    // that will just error.
     api("/llm/byok_status").then((status) => {
       setByokAvailable(Boolean(status && status.available));
+      setByokAccountConfigured(Boolean(status && status.configured));
+      setByokAccountModel(status && status.model ? status.model : null);
     }).catch(() => setByokAvailable(false));
   }, []);
+
+  async function saveAccountByok() {
+    if (!byokApiKey.trim()) return;
+    setByokSaving(true);
+    setByokSaveError(null);
+    try {
+      const data = await api("/account/byok", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_key: byokApiKey.trim(), model: byokModel.trim() || null }),
+      });
+      setByokAccountConfigured(true);
+      setByokAccountModel(data.model || null);
+      // Clear the one-off fields now that it's saved -- otherwise they'd
+      // keep "overriding" the just-saved value (per _resolve_byok, a typed
+      // key always wins), which looks like the save did nothing.
+      setByokApiKey("");
+      setByokModel("");
+    } catch (err) {
+      setByokSaveError(err.message);
+    } finally {
+      setByokSaving(false);
+    }
+  }
+
+  async function clearAccountByok() {
+    setByokSaving(true);
+    setByokSaveError(null);
+    try {
+      await api("/account/byok", { method: "DELETE" });
+      setByokAccountConfigured(false);
+      setByokAccountModel(null);
+    } catch (err) {
+      setByokSaveError(err.message);
+    } finally {
+      setByokSaving(false);
+    }
+  }
 
   const hasInvestigationOption = investigationLabel.trim().length > 0 && captures.length >= 2;
   // Falls back to "device" scope automatically if the investigation option
@@ -1199,12 +1260,27 @@ export default function App() {
               )}
             </div>
 
-            <PrivacyNotice providers={providers} provider={provider} byokApiKey={byokApiKey} />
+            <PrivacyNotice
+              providers={providers} provider={provider} byokApiKey={byokApiKey}
+              byokAccountConfigured={byokAccountConfigured}
+            />
 
             {byokAvailable && (
-              <details className="byok-panel">
-                <summary>Have your own OpenRouter key? Use it instead (optional)</summary>
+              <details className="byok-panel" open={byokAccountConfigured}>
+                <summary>Your OpenRouter key (optional)</summary>
                 <div className="byok-fields">
+                  {byokAccountConfigured && (
+                    <p className="muted small byok-saved-notice">
+                      Saved to your account{byokAccountModel ? ` — model: ${byokAccountModel}` : ""}.
+                      Used automatically on Diagnose/Scan below unless you type a different key here.
+                      {" "}
+                      <button
+                        type="button" className="link-btn" onClick={clearAccountByok} disabled={byokSaving}
+                      >
+                        Clear saved key
+                      </button>
+                    </p>
+                  )}
                   <label className="inline-label">
                     OpenRouter API key
                     <input
@@ -1224,12 +1300,15 @@ export default function App() {
                       onChange={(e) => setByokModel(e.target.value)}
                     />
                   </label>
+                  <button type="button" onClick={saveAccountByok} disabled={byokSaving || !byokApiKey.trim()}>
+                    {byokSaving ? "Saving..." : "Save to my account"}
+                  </button>
+                  {byokSaveError && <div className="error">{byokSaveError}</div>}
                   <p className="muted small">
-                    Get a key at <strong>openrouter.ai</strong>. When set, it's used for every
-                    Diagnose/Scan below instead of "Narrated by", sent only with that request (never
-                    stored), and billed to your own OpenRouter account. This deployment has no
-                    per-user accounts: your key narrates whichever capture is selected above, not
-                    only ones you uploaded yourself.
+                    Get a key at <strong>openrouter.ai</strong>, billed to your own OpenRouter account.
+                    Typed above without saving, it's used only for this one Diagnose/Scan request and
+                    never stored. Saving it keeps it on your account for every future request — used
+                    only for captures you own, never a coworker's.
                   </p>
                 </div>
               </details>
@@ -2125,6 +2204,12 @@ export default function App() {
         button:disabled { opacity: 0.4; cursor: not-allowed; }
         .secondary-btn { margin-bottom: 10px; background: #273247; color: var(--text); }
         .secondary-btn:hover:not(:disabled) { background: #32405a; }
+        .link-btn {
+          padding: 0; background: none; border: none; color: var(--accent); font-weight: 600;
+          font-size: inherit; text-decoration: underline; cursor: pointer;
+        }
+        .link-btn:hover:not(:disabled) { background: none; color: var(--accent-dark); }
+        .byok-saved-notice { margin-bottom: 8px; }
         .error { color: var(--red); padding: 12px; border: 1px solid var(--red); border-radius: 6px; white-space: pre-wrap; font-size: 13px; }
         .muted { color: var(--muted); }
         .small { font-size: 12px; }

@@ -33,11 +33,12 @@ def _headers(user_id: int) -> dict[str, str]:
 def client():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
-    # The device/investigation/capture routes only ever check a token's user
-    # id against owner_user_id columns, so most tests below don't need real
-    # User rows -- but PUT/DELETE /api/account/byok write to the User table
-    # itself and 404 without one (see routes.py), so both ids are seeded
-    # here with an explicit primary key matching the token each test mints.
+    # Every route here only ever checks a token's user id against
+    # owner_user_id columns (or writes a UserByokKey row keyed by it) --
+    # none of them actually need a real User row to exist. Seeded anyway
+    # with explicit primary keys matching each test's minted token, since
+    # it costs nothing and keeps this fixture honest about what a real
+    # login would look like.
     with Session(engine) as session:
         session.add(User(id=USER_A_ID, username="user-a", password_hash="unused-in-these-tests"))
         session.add(User(id=USER_B_ID, username="user-b", password_hash="unused-in-these-tests"))
@@ -134,38 +135,60 @@ def test_cannot_read_another_users_investigation(client):
     assert as_other.status_code == 404
 
 
-# --- Personal BYOK settings (/api/account/byok) -----------------------------
+# --- Personal BYOK settings (/api/account/byok/{provider}) -----------------
 
-def test_byok_status_defaults_to_unconfigured(client):
+def test_byok_status_defaults_to_unconfigured_for_every_provider(client):
     r = client.get("/api/llm/byok_status", headers=_headers(USER_A_ID))
     assert r.status_code == 200
-    assert r.json()["configured"] is False
+    providers = r.json()["providers"]
+    assert set(providers) == {"anthropic", "openai", "grok", "openrouter"}
+    assert all(p["configured"] is False for p in providers.values())
 
 
-def test_set_and_clear_account_byok_key(client):
+def test_set_and_clear_account_byok_key_for_one_provider(client):
     put = client.put(
-        "/api/account/byok",
-        json={"api_key": "sk-or-fake-key", "model": "anthropic/claude-3-haiku"},
+        "/api/account/byok/anthropic",
+        json={"api_key": "sk-ant-fake-key", "model": "claude-opus-5-5"},
         headers=_headers(USER_A_ID),
     )
     assert put.status_code == 200
-    assert put.json() == {"configured": True, "model": "anthropic/claude-3-haiku"}
+    assert put.json() == {"provider": "anthropic", "configured": True, "model": "claude-opus-5-5"}
 
     status = client.get("/api/llm/byok_status", headers=_headers(USER_A_ID)).json()
-    assert status["configured"] is True
-    assert status["model"] == "anthropic/claude-3-haiku"
-    assert "sk-or-fake-key" not in str(status)  # the raw key is never echoed back
+    assert status["providers"]["anthropic"] == {"configured": True, "model": "claude-opus-5-5"}
+    assert status["providers"]["openai"] == {"configured": False, "model": None}  # untouched
+    assert "sk-ant-fake-key" not in str(status)  # the raw key is never echoed back
 
-    delete = client.delete("/api/account/byok", headers=_headers(USER_A_ID))
+    delete = client.delete("/api/account/byok/anthropic", headers=_headers(USER_A_ID))
     assert delete.status_code == 200
-    assert delete.json() == {"configured": False, "model": None}
+    assert delete.json() == {"provider": "anthropic", "configured": False, "model": None}
 
     status_after = client.get("/api/llm/byok_status", headers=_headers(USER_A_ID)).json()
-    assert status_after["configured"] is False
+    assert status_after["providers"]["anthropic"]["configured"] is False
+
+
+def test_set_account_byok_key_rejects_unknown_provider(client):
+    r = client.put(
+        "/api/account/byok/not-a-real-provider",
+        json={"api_key": "whatever"},
+        headers=_headers(USER_A_ID),
+    )
+    assert r.status_code == 404
+
+
+def test_account_byok_keys_are_per_provider_for_the_same_user(client):
+    client.put("/api/account/byok/anthropic", json={"api_key": "ant-key"}, headers=_headers(USER_A_ID))
+    client.put("/api/account/byok/openai", json={"api_key": "oai-key"}, headers=_headers(USER_A_ID))
+
+    status = client.get("/api/llm/byok_status", headers=_headers(USER_A_ID)).json()["providers"]
+    assert status["anthropic"]["configured"] is True
+    assert status["openai"]["configured"] is True
+    assert status["grok"]["configured"] is False
+    assert status["openrouter"]["configured"] is False
 
 
 def test_account_byok_key_is_private_to_each_user(client):
-    client.put("/api/account/byok", json={"api_key": "a-secret-key"}, headers=_headers(USER_A_ID))
+    client.put("/api/account/byok/anthropic", json={"api_key": "a-secret-key"}, headers=_headers(USER_A_ID))
 
     status_b = client.get("/api/llm/byok_status", headers=_headers(USER_B_ID)).json()
-    assert status_b["configured"] is False
+    assert status_b["providers"]["anthropic"]["configured"] is False

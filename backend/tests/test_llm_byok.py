@@ -1,12 +1,14 @@
-"""Visitor-supplied ("bring your own key") OpenRouter access.
+"""User-supplied ("bring your own key") LLM access.
 
-Lets a public deploy with NO server-side LLM key configured still offer
-real narration to a visitor who pastes in their own OpenRouter key, while
+Lets someone use their own key for a provider this deployment hasn't
+configured server-side (or doesn't want to pay for on their behalf), while
 everyone else gets Stub (see app/llm/__init__.py get_byok_client's
 docstring for why this is a distinct consent path from the operator's own
-PARSECAT_ALLOW_LLM_EGRESS gate, not a bypass of it). No real network calls
-here -- same boundary as test_llm_openrouter_gateway.py: construction and
-dispatch-priority only.
+PARSECAT_ALLOW_LLM_EGRESS gate, not a bypass of it). Originally OpenRouter-
+only; covers all of BYOK_PROVIDER_IDS now (anthropic/openai/grok/
+openrouter) -- a direct vendor key, not just an OpenRouter gateway key. No
+real network calls here -- same boundary as test_llm_openrouter_gateway.py:
+construction and dispatch-priority only.
 """
 from __future__ import annotations
 
@@ -16,12 +18,18 @@ import pytest
 
 from app.llm import (
     BYOK_ENV,
+    BYOK_PROVIDER_IDS,
+    DEFAULT_GROK_MODEL,
     DEFAULT_OPENROUTER_MODEL,
     EGRESS_ENV,
     OPENROUTER_BASE_URL,
+    XAI_BASE_URL,
     byok_allowed,
     get_byok_client,
 )
+from app.llm.anthropic_client import AnthropicClient
+from app.llm.anthropic_client import DEFAULT_MODEL as ANTHROPIC_DEFAULT_MODEL
+from app.llm.openai_client import DEFAULT_MODEL as OPENAI_DEFAULT_MODEL
 from app.llm.openai_client import OpenAIClient
 from app.services import reasoning
 
@@ -59,12 +67,18 @@ def test_byok_non_truthy_values_deny(monkeypatch, value):
 
 def test_byok_client_raises_when_gate_closed():
     with pytest.raises(RuntimeError, match="BYOK is disabled"):
-        get_byok_client("visitor-key-123")
+        get_byok_client("openrouter", "visitor-key-123")
+
+
+def test_byok_client_rejects_an_unsupported_provider(monkeypatch):
+    monkeypatch.setenv(BYOK_ENV, "1")
+    with pytest.raises(ValueError, match="not supported"):
+        get_byok_client("stub", "visitor-key-123")
 
 
 def test_byok_client_points_at_openrouter_with_the_default_model(monkeypatch):
     monkeypatch.setenv(BYOK_ENV, "1")
-    client = get_byok_client("visitor-key-123")
+    client = get_byok_client("openrouter", "visitor-key-123")
     assert isinstance(client, OpenAIClient)
     assert client._model == DEFAULT_OPENROUTER_MODEL
     assert str(client._client.base_url).rstrip("/") == OPENROUTER_BASE_URL
@@ -72,13 +86,13 @@ def test_byok_client_points_at_openrouter_with_the_default_model(monkeypatch):
 
 def test_byok_client_respects_an_explicit_model_override(monkeypatch):
     monkeypatch.setenv(BYOK_ENV, "1")
-    client = get_byok_client("visitor-key-123", model="x-ai/grok-4")
+    client = get_byok_client("openrouter", "visitor-key-123", model="x-ai/grok-4")
     assert client._model == "x-ai/grok-4"
 
 
 def test_byok_client_ignores_blank_model_and_uses_default(monkeypatch):
     monkeypatch.setenv(BYOK_ENV, "1")
-    client = get_byok_client("visitor-key-123", model="   ")
+    client = get_byok_client("openrouter", "visitor-key-123", model="   ")
     assert client._model == DEFAULT_OPENROUTER_MODEL
 
 
@@ -87,8 +101,44 @@ def test_byok_bypasses_the_egress_gate_with_no_server_env_configured(monkeypatch
     # works with EGRESS_ENV unset/false and no server-side key env vars at
     # all, once BYOK_ENV itself is on.
     monkeypatch.setenv(BYOK_ENV, "1")
-    client = get_byok_client("visitor-key-123")
+    client = get_byok_client("openrouter", "visitor-key-123")
     assert isinstance(client, OpenAIClient)
+
+
+# --- Direct vendor providers (not just the OpenRouter gateway) -------------
+
+def test_byok_provider_ids_cover_all_four():
+    assert BYOK_PROVIDER_IDS == {"anthropic", "openai", "grok", "openrouter"}
+
+
+def test_byok_client_anthropic_uses_the_supplied_key_and_default_model(monkeypatch):
+    monkeypatch.setenv(BYOK_ENV, "1")
+    client = get_byok_client("anthropic", "visitor-anthropic-key")
+    assert isinstance(client, AnthropicClient)
+    assert client._model == ANTHROPIC_DEFAULT_MODEL
+    assert client._client.api_key == "visitor-anthropic-key"
+
+
+def test_byok_client_anthropic_respects_model_override(monkeypatch):
+    monkeypatch.setenv(BYOK_ENV, "1")
+    client = get_byok_client("anthropic", "visitor-anthropic-key", model="claude-opus-5-5")
+    assert client._model == "claude-opus-5-5"
+
+
+def test_byok_client_openai_uses_the_supplied_key_and_default_model(monkeypatch):
+    monkeypatch.setenv(BYOK_ENV, "1")
+    client = get_byok_client("openai", "visitor-openai-key")
+    assert isinstance(client, OpenAIClient)
+    assert client._model == OPENAI_DEFAULT_MODEL
+    assert str(client._client.base_url).rstrip("/") == "https://api.openai.com/v1"
+
+
+def test_byok_client_grok_points_at_xai_with_the_default_model(monkeypatch):
+    monkeypatch.setenv(BYOK_ENV, "1")
+    client = get_byok_client("grok", "visitor-grok-key")
+    assert isinstance(client, OpenAIClient)
+    assert client._model == DEFAULT_GROK_MODEL
+    assert str(client._client.base_url).rstrip("/") == XAI_BASE_URL
 
 
 def test_run_llm_prefers_byok_over_the_provider_dropdown(monkeypatch):
@@ -108,7 +158,7 @@ def test_run_llm_prefers_byok_over_the_provider_dropdown(monkeypatch):
 
     assert report == "byok report"
     assert llm_error is None
-    get_byok_mock.assert_called_once_with("visitor-key", "some/model")
+    get_byok_mock.assert_called_once_with("anthropic", "visitor-key", "some/model")
     get_llm_mock.assert_not_called()
 
 

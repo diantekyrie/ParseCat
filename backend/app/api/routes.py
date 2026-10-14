@@ -11,8 +11,8 @@ from sqlmodel import Session, select
 
 from app.auth import get_current_user_id
 from app.db import get_session
-from app.llm import byok_allowed, list_providers
-from app.models.db_models import Capture, Device, Investigation, InvestigationCaptureLink, User
+from app.llm import BYOK_PROVIDER_IDS, byok_allowed, list_providers
+from app.models.db_models import Capture, Device, Investigation, InvestigationCaptureLink, User, UserByokKey
 from app.services.ingestion import empty_bugreport_rejection_message, parse_capture_file
 from app.services.persistence import (
     DeviceIdentityMismatchError,
@@ -43,18 +43,31 @@ def _max_upload_bytes() -> int:
 
 
 def _resolve_byok(
-    byok_api_key: str | None, byok_model: str | None, user: User | None,
+    provider: str | None, byok_api_key: str | None, byok_model: str | None,
+    session: Session, owner_user_id: int,
 ) -> tuple[str | None, str | None]:
-    """A one-off key typed into this request always wins (lets anyone
-    override their saved key, or use BYOK without saving one at all); the
-    user's saved account key (see /api/account/byok below) is the fallback
-    so narration works without retyping a key on every call.
+    """Returns (api_key, model) to use as BYOK for `provider`, or (None,
+    None) if no BYOK key applies -- the caller falls through to the
+    operator's configured key (or Stub) for `provider` in that case.
+
+    Only applies when `provider` -- the "Narrated by" selection -- is
+    itself one of the BYOK-capable ids (app.llm.BYOK_PROVIDER_IDS): there's
+    nothing for a saved Anthropic key to override if Stub or an unknown
+    provider is selected. A one-off key typed into this request always
+    wins over a saved one (lets anyone override, or use BYOK without
+    saving); the per-provider saved key (PUT /api/account/byok/{provider})
+    is the fallback so narration works without retyping a key every call.
     """
+    if provider not in BYOK_PROVIDER_IDS:
+        return None, None
     key = (byok_api_key or "").strip()
     if key:
         return key, ((byok_model or "").strip() or None)
-    if user is not None and user.byok_api_key:
-        return user.byok_api_key, user.byok_model
+    row = session.exec(
+        select(UserByokKey).where(UserByokKey.user_id == owner_user_id, UserByokKey.provider == provider)
+    ).first()
+    if row is not None:
+        return row.api_key, row.model
     return None, None
 
 
@@ -174,17 +187,20 @@ def get_byok_status(
 ):
     # Separate endpoint, not folded into list_providers()'s array response,
     # so existing callers of that endpoint are untouched. Lets the frontend
-    # hide/disable the BYOK panel instead of letting a visitor type in a key
+    # hide/disable BYOK entirely instead of letting someone type in a key
     # that will just come back "disabled on this deployment" -- see
-    # app.llm.get_byok_client for why this is off by default. `configured`
-    # is this user's own saved key (never the key itself -- see
-    # /api/account/byok below), separate from `available` (whether the
-    # deployment allows BYOK at all).
-    user = session.get(User, current_user_id)
+    # app.llm.get_byok_client for why this is off by default. `available`
+    # is deployment-wide (PARSECAT_ALLOW_BYOK); `providers` is this user's
+    # own saved keys, one entry per app.llm.BYOK_PROVIDER_IDS, never the
+    # key itself -- see /api/account/byok/{provider} below.
+    rows = session.exec(select(UserByokKey).where(UserByokKey.user_id == current_user_id)).all()
+    by_provider = {row.provider: {"configured": True, "model": row.model} for row in rows}
     return {
         "available": byok_allowed(),
-        "configured": bool(user and user.byok_api_key),
-        "model": user.byok_model if user else None,
+        "providers": {
+            pid: by_provider.get(pid, {"configured": False, "model": None})
+            for pid in BYOK_PROVIDER_IDS
+        },
     }
 
 
@@ -193,45 +209,58 @@ class ByokSettings(BaseModel):
     model: str | None = None
 
 
-@router.put("/account/byok")
+@router.put("/account/byok/{provider}")
 def set_account_byok(
+    provider: str,
     body: ByokSettings,
     session: Session = Depends(get_session),
     current_user_id: int = Depends(get_current_user_id),
 ):
-    """Saves this user's own OpenRouter key to their account so it's used
-    automatically on diagnose/scan calls that don't include a one-off key
-    (see _resolve_byok above) -- no more retyping it every request. Write
-    -only from the client's perspective: this is the only route that
-    accepts the raw key; nothing ever echoes it back (see get_byok_status
-    and the User model's docstring for why that boundary is the real
-    protection here, not encryption at rest).
+    """Saves this user's own key for one provider (anthropic/openai/grok/
+    openrouter) to their account, so it's used automatically on diagnose/
+    scan calls for that provider that don't include a one-off key (see
+    _resolve_byok above) -- no more retyping it every request. Write-only
+    from the client's perspective: this is the only route that accepts the
+    raw key; nothing ever echoes it back (see get_byok_status and
+    UserByokKey's docstring for why that boundary is the real protection
+    here, not encryption at rest).
     """
+    if provider not in BYOK_PROVIDER_IDS:
+        raise HTTPException(404, f"Unknown BYOK provider {provider!r}")
     key = body.api_key.strip()
     if not key:
-        raise HTTPException(400, "api_key is required (use DELETE /api/account/byok to clear it)")
-    user = session.get(User, current_user_id)
-    if user is None:
-        raise HTTPException(404, "Unknown account")
-    user.byok_api_key = key
-    user.byok_model = (body.model or "").strip() or None
-    session.add(user)
+        raise HTTPException(
+            400, f"api_key is required (use DELETE /api/account/byok/{provider} to clear it)",
+        )
+    model = (body.model or "").strip() or None
+    existing = session.exec(
+        select(UserByokKey).where(UserByokKey.user_id == current_user_id, UserByokKey.provider == provider)
+    ).first()
+    if existing is not None:
+        existing.api_key = key
+        existing.model = model
+        session.add(existing)
+    else:
+        session.add(UserByokKey(user_id=current_user_id, provider=provider, api_key=key, model=model))
     session.commit()
-    return {"configured": True, "model": user.byok_model}
+    return {"provider": provider, "configured": True, "model": model}
 
 
-@router.delete("/account/byok")
+@router.delete("/account/byok/{provider}")
 def clear_account_byok(
-    session: Session = Depends(get_session), current_user_id: int = Depends(get_current_user_id),
+    provider: str,
+    session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
 ):
-    user = session.get(User, current_user_id)
-    if user is None:
-        raise HTTPException(404, "Unknown account")
-    user.byok_api_key = None
-    user.byok_model = None
-    session.add(user)
-    session.commit()
-    return {"configured": False, "model": None}
+    if provider not in BYOK_PROVIDER_IDS:
+        raise HTTPException(404, f"Unknown BYOK provider {provider!r}")
+    existing = session.exec(
+        select(UserByokKey).where(UserByokKey.user_id == current_user_id, UserByokKey.provider == provider)
+    ).first()
+    if existing is not None:
+        session.delete(existing)
+        session.commit()
+    return {"provider": provider, "configured": False, "model": None}
 
 
 @router.get("/devices")
@@ -434,11 +463,11 @@ def diagnose_capture(
     question: str = Form(...),
     provider: str | None = Form(None),
     history: str | None = Form(None),
-    # Visitor-supplied OpenRouter key, used for exactly this one call and
+    # One-off key for THIS call, for whichever provider is selected above,
     # never persisted (not logged, not written to .env, not stored in the
-    # DB -- see app.llm.get_byok_client). Lets a public deploy with no
-    # server-side key configured still offer real narration to anyone who
-    # brings their own, while defaulting everyone else to Stub.
+    # DB -- see app.llm.get_byok_client). A user's own saved key (PUT
+    # /api/account/byok/{provider}) is the fallback when this is blank --
+    # see _resolve_byok.
     byok_api_key: str | None = Form(None),
     byok_model: str | None = Form(None),
     session: Session = Depends(get_session),
@@ -449,7 +478,7 @@ def diagnose_capture(
         raise HTTPException(404, "Unknown capture")
     device = session.get(Device, capture.device_id)
     resolved_key, resolved_model = _resolve_byok(
-        byok_api_key, byok_model, session.get(User, current_user_id),
+        provider, byok_api_key, byok_model, session, current_user_id,
     )
 
     result = diagnose(
@@ -476,7 +505,7 @@ def scan_capture_route(
         raise HTTPException(404, "Unknown capture")
     device = session.get(Device, capture.device_id)
     resolved_key, resolved_model = _resolve_byok(
-        byok_api_key, byok_model, session.get(User, current_user_id),
+        provider, byok_api_key, byok_model, session, current_user_id,
     )
     return scan_capture(
         session, capture_id, device.label, provider=provider,
@@ -503,7 +532,7 @@ def diagnose_investigation_route(
     if investigation is None:
         raise HTTPException(404, "Unknown investigation")
     resolved_key, resolved_model = _resolve_byok(
-        byok_api_key, byok_model, session.get(User, current_user_id),
+        provider, byok_api_key, byok_model, session, current_user_id,
     )
 
     result = diagnose_investigation(

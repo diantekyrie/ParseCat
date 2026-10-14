@@ -1748,11 +1748,14 @@ def _run_llm(
         # could still hand this a whitespace-only string, which `if
         # byok_api_key:` alone would treat as a real key.
         byok_key = (byok_api_key or "").strip()
-        # A visitor-supplied key always wins over the `provider` dropdown --
-        # see get_byok_client for why this is a distinct consent path, not
-        # a bypass of the operator's own egress gate (and why it's gated
-        # off by default via BYOK_ENV).
-        llm = get_byok_client(byok_key, byok_model) if byok_key else get_llm_client(provider)
+        # A user's own key always wins over the operator's configured key
+        # for whichever provider is selected -- see get_byok_client for why
+        # this is a distinct consent path (and why it's gated off by
+        # default via BYOK_ENV). The caller (app/api/routes.py's
+        # _resolve_byok) only ever hands byok_api_key through when
+        # `provider` is itself BYOK-capable, so `provider` here is already
+        # the right one to use for the BYOK client too.
+        llm = get_byok_client(provider, byok_key, byok_model) if byok_key else get_llm_client(provider)
         return llm.narrate(system_prompt, user_prompt), None
     except Exception as exc:  # noqa: BLE001 -- LLM narration is a convenience
         # layer on top of already-computed, independently verified facts.

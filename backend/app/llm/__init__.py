@@ -5,11 +5,11 @@ LLMClient -- never import a concrete client directly, so swapping/adding
 providers stays invisible to callers.
 
 `provider` is an explicit id ("anthropic" | "openai" | "openai-codex" |
-"openrouter" | "stub"). Passing None falls back to auto-detection:
+"grok" | "openrouter" | "stub"). Passing None falls back to auto-detection:
 ANTHROPIC_API_KEY takes precedence if set, then OPENAI_API_KEY, then
-OPENROUTER_API_KEY, otherwise the deterministic stub. "openai-codex" is
-never auto-selected -- it's only reachable by explicit choice, same as
-today.
+XAI_API_KEY, then OPENROUTER_API_KEY, otherwise the deterministic stub.
+"openai-codex" is never auto-selected -- it's only reachable by explicit
+choice, same as today.
 
 Third-party egress (Anthropic / OpenAI / OpenRouter) is default-deny.
 Keys alone do not send a Diagnose/Scan fact bundle off-machine. Set
@@ -44,20 +44,35 @@ OPENROUTER_MODEL_ENV = "OPENROUTER_MODEL"
 # new provider id per model.
 DEFAULT_OPENROUTER_MODEL = "anthropic/claude-sonnet-4.5"
 
+# xAI's API is OpenAI-compatible (same chat.completions request/response
+# shape), so this reuses OpenAIClient with a different base_url rather than
+# a dedicated client class -- same pattern as the "openrouter" provider.
+XAI_BASE_URL = "https://api.x.ai/v1"
+XAI_MODEL_ENV = "XAI_MODEL"
+DEFAULT_GROK_MODEL = "grok-4"
+
 # Opt-in kill-switch for shipping fact bundles to third-party LLM vendors.
 # Unset / false => Diagnose/Scan stay local (stub only), even when API keys
 # are present. Required for an honest "we do not send data to AI companies"
 # customer letter; disclosure alone is not a stop on send.
 EGRESS_ENV = "PARSECAT_ALLOW_LLM_EGRESS"
-THIRD_PARTY_PROVIDER_IDS = frozenset({"anthropic", "openai", "openai-codex", "openrouter"})
+THIRD_PARTY_PROVIDER_IDS = frozenset({"anthropic", "openai", "openai-codex", "grok", "openrouter"})
 
 PROVIDERS = [
     {"id": "anthropic", "label": "Claude (Anthropic)", "requires_env": "ANTHROPIC_API_KEY"},
     {"id": "openai", "label": "GPT (OpenAI)", "requires_env": "OPENAI_API_KEY"},
     {"id": "openai-codex", "label": "Codex (OpenAI)", "requires_env": "OPENAI_API_KEY"},
+    {"id": "grok", "label": "Grok (xAI)", "requires_env": "XAI_API_KEY"},
     {"id": "openrouter", "label": "OpenRouter (multi-model gateway)", "requires_env": "OPENROUTER_API_KEY"},
     {"id": "stub", "label": "Stub (no LLM, echoes facts)", "requires_env": None},
 ]
+
+# Providers a user can bring their own key for (see get_byok_client and
+# app/api/routes.py's /api/account/byok/{provider} endpoints). Everything
+# here except "openrouter" is a direct vendor API -- BYOK originally only
+# covered OpenRouter (one key format for any model family); this is the
+# generalization to a user's own direct Anthropic/OpenAI/xAI keys too.
+BYOK_PROVIDER_IDS = frozenset({"anthropic", "openai", "grok", "openrouter"})
 
 
 def llm_egress_allowed() -> bool:
@@ -131,6 +146,8 @@ def get_llm_client(provider: str | None = None) -> LLMClient:
             provider = "anthropic"
         elif egress and os.environ.get("OPENAI_API_KEY"):
             provider = "openai"
+        elif egress and os.environ.get("XAI_API_KEY"):
+            provider = "grok"
         elif egress and os.environ.get("OPENROUTER_API_KEY"):
             provider = "openrouter"
         else:
@@ -147,6 +164,13 @@ def get_llm_client(provider: str | None = None) -> LLMClient:
     if provider == "openai-codex":
         from app.llm.openai_client import OpenAIClient
         return OpenAIClient(model=os.environ.get(CODEX_MODEL_ENV, DEFAULT_CODEX_MODEL))
+    if provider == "grok":
+        from app.llm.openai_client import OpenAIClient
+        api_key = os.environ.get("XAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("XAI_API_KEY is not set")
+        model = os.environ.get(XAI_MODEL_ENV, DEFAULT_GROK_MODEL)
+        return OpenAIClient(model=model, api_key=api_key, base_url=XAI_BASE_URL)
     if provider == "openrouter":
         from app.llm.openai_client import OpenAIClient
         api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -161,10 +185,18 @@ def get_llm_client(provider: str | None = None) -> LLMClient:
     raise ValueError(f"Unknown LLM provider: {provider!r}")
 
 
-def get_byok_client(api_key: str, model: str | None = None) -> LLMClient:
-    """A visitor-supplied OpenRouter key, used for exactly one narration
-    call and never persisted (not written to .env, not stored in the DB --
-    see reasoning._run_llm, the only caller).
+def get_byok_client(provider: str, api_key: str, model: str | None = None) -> LLMClient:
+    """A user's own key for one of BYOK_PROVIDER_IDS, used for exactly one
+    narration call and never persisted here (the caller -- see
+    app/api/routes.py's /api/account/byok/{provider} -- decides whether to
+    persist it in UserByokKey; this function just uses whatever it's
+    handed).
+
+    Originally OpenRouter-only (one key format covers any model family via
+    OpenRouter's gateway); generalized to also accept a user's own direct
+    Anthropic/OpenAI/xAI key once per-user ownership existed to make that
+    safe -- see the correction below, still true for every provider this
+    covers.
 
     Gated by BYOK_ENV (default off), checked here rather than only at the
     route layer, so there is exactly one place this can be skipped from.
@@ -175,33 +207,44 @@ def get_byok_client(api_key: str, model: str | None = None) -> LLMClient:
     Correction on an earlier version of this docstring, caught in review
     (PR #83) before this ever reached a public deploy: this was described
     as "a visitor's own key sending their OWN uploaded data" and framed as
-    bypassing PARSECAT_ALLOW_LLM_EGRESS on that basis -- that was wrong.
-    ParseCat has no auth or upload-ownership model at all: every capture_id
-    is readable and diagnose/scan-able by anyone who can reach this API, so
-    a visitor's key can request narration of ANY capture on this instance,
-    not just one they uploaded. PARSECAT_ALLOW_LLM_EGRESS correctly stays
-    irrelevant to that fact (it governs the operator's OWN configured key,
-    a different and still-true consent story, #46) -- but BYOK itself
-    needed its own gate instead of being treated as automatically fine
-    because it's additive. Real fix (per-upload/session ownership, or
-    binding to localhost) is tracked separately; this gate is what keeps it
-    off by default until one of those lands.
-
-    OpenRouter specifically (not raw Anthropic/OpenAI) so one key format
-    covers whichever model family the visitor already has -- see
-    DEFAULT_OPENROUTER_MODEL for why this gateway was already the pick for
-    "any of 500+ models without a dedicated client per family".
+    bypassing PARSECAT_ALLOW_LLM_EGRESS on that basis -- that was wrong AT
+    THE TIME, because ParseCat had no auth or upload-ownership model at
+    all: every capture_id was readable and diagnose/scan-able by anyone who
+    could reach the API, so a visitor's key could narrate ANY capture on
+    the instance, not just one they'd uploaded. That gap is why BYOK_ENV
+    exists as its own gate rather than trusting this to be automatically
+    fine. It's since been fixed at the data layer (see Device.owner_user_id
+    / Investigation.owner_user_id and the per-user-scoped routes in
+    app/api/routes.py) -- every diagnose/scan call this function's result
+    ever narrates has already been confirmed to belong to the user whose
+    key this is, by the time it reaches here. BYOK_ENV stays as an explicit
+    operator opt-in regardless, same shape as EGRESS_ENV for the operator's
+    own key (#46) -- a deployment can still choose not to let egress happen
+    through this path at all.
     """
     if not byok_allowed():
         raise RuntimeError(
             f"BYOK is disabled on this deployment: set {BYOK_ENV}=1 to allow "
-            f"visitor-supplied keys. Off by default because this app has no "
-            f"per-upload ownership model -- a visitor's key could otherwise "
-            f"be used to narrate ANY capture on this instance, not just "
-            f"their own. Only enable this on a host where that's acceptable "
-            f"(e.g. a private/localhost-only deployment)."
+            f"users to supply their own keys."
         )
-    from app.llm.openai_client import OpenAIClient
+    if provider not in BYOK_PROVIDER_IDS:
+        raise ValueError(f"BYOK is not supported for provider {provider!r}")
 
-    resolved_model = (model or "").strip() or DEFAULT_OPENROUTER_MODEL
-    return OpenAIClient(model=resolved_model, api_key=api_key, base_url=OPENROUTER_BASE_URL)
+    if provider == "anthropic":
+        from app.llm.anthropic_client import DEFAULT_MODEL, AnthropicClient
+        resolved_model = (model or "").strip() or DEFAULT_MODEL
+        return AnthropicClient(model=resolved_model, api_key=api_key)
+    if provider == "openai":
+        from app.llm.openai_client import DEFAULT_MODEL, OpenAIClient
+        resolved_model = (model or "").strip() or DEFAULT_MODEL
+        return OpenAIClient(model=resolved_model, api_key=api_key)
+    if provider == "grok":
+        from app.llm.openai_client import OpenAIClient
+        resolved_model = (model or "").strip() or DEFAULT_GROK_MODEL
+        return OpenAIClient(model=resolved_model, api_key=api_key, base_url=XAI_BASE_URL)
+    if provider == "openrouter":
+        from app.llm.openai_client import OpenAIClient
+        resolved_model = (model or "").strip() or DEFAULT_OPENROUTER_MODEL
+        return OpenAIClient(model=resolved_model, api_key=api_key, base_url=OPENROUTER_BASE_URL)
+
+    raise AssertionError(f"unreachable: provider {provider!r} is in BYOK_PROVIDER_IDS but unhandled")

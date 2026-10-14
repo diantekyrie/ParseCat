@@ -296,35 +296,39 @@ function CoverageNotice({ coverage }) {
 // is selected (including the no-selection default). Only the structured
 // facts bundle is sent, never the raw log file; Stub never leaves this machine.
 //
-// A visitor-supplied BYOK key is a THIRD case, not a variant of the other
-// two: it always wins over "Narrated by" (see get_byok_client), and the key
-// itself is typed into this page and sent to the backend as a form field --
-// "API keys never leave this machine" would be a false claim for it, so
-// that case gets its own honest copy rather than reusing either branch below.
-function PrivacyNotice({ providers, provider, byokApiKey, byokAccountConfigured }) {
-  if (byokApiKey.trim()) {
+// A BYOK key is a THIRD case, not a variant of the other two: it always
+// wins over "Narrated by"'s operator-configured key (see get_byok_client),
+// and -- for a one-off, unsaved key -- the key itself is typed into this
+// page and sent to the backend as a form field, so "API keys never leave
+// this machine" would be a false claim for it; that case gets its own
+// honest copy rather than reusing either branch below. Which of the two
+// BYOK branches applies depends on the CURRENTLY SELECTED "Narrated by"
+// provider -- a saved Anthropic key does nothing while OpenAI is selected.
+function PrivacyNotice({ providers, provider, byokDraftKey, byokStatus }) {
+  const providerLabel = providers.find((p) => p.id === provider)?.label || provider;
+  if ((byokDraftKey || "").trim()) {
     return (
       <div className="privacy-notice">
         <strong>Data leaving this machine</strong>
         <p className="muted small">
-          A personal API key is set above — this request sends the extracted fact bundle shown
-          below (never the raw log file) to OpenRouter, using that key, for narration. Typed here
-          without saving it to your account, the key is sent only with this one request and held
-          nowhere else — gone on refresh. ParseCat has per-user accounts, so this only ever applies
-          to captures you own; a coworker's uploads are never reachable with your key. Clear the
-          field above to go back to "Narrated by" / Stub.
+          A personal API key is set above for {providerLabel} — this request sends the extracted
+          fact bundle shown below (never the raw log file) to {providerLabel}, using that key, for
+          narration. Typed here without saving it to your account, the key is sent only with this
+          one request and held nowhere else — gone on refresh. ParseCat has per-user accounts, so
+          this only ever applies to captures you own; a coworker's uploads are never reachable with
+          your key. Clear the field in Settings to go back to the account-saved key (if any) or Stub.
         </p>
       </div>
     );
   }
-  if (byokAccountConfigured) {
+  if (byokStatus?.[provider]?.configured) {
     return (
       <div className="privacy-notice">
         <strong>Data leaving this machine</strong>
         <p className="muted small">
-          Your saved account key (see "Your OpenRouter key" below) is used for this request — the
-          extracted fact bundle shown below (never the raw log file) goes to OpenRouter for
-          narration, for captures you own only.
+          Your saved {providerLabel} key (see Settings) is used for this request — the extracted
+          fact bundle shown below (never the raw log file) goes to {providerLabel} for narration,
+          for captures you own only.
         </p>
       </div>
     );
@@ -362,6 +366,64 @@ function PrivacyNotice({ providers, provider, byokApiKey, byokAccountConfigured 
   );
 }
 
+// One row per provider in Settings -- id/label match app/llm/__init__.py's
+// PROVIDERS list, and keyHint/modelPlaceholder are just UI copy, not sent
+// anywhere. "Narrated by" selects WHICH of these applies on a given
+// Diagnose/Scan call; see _resolve_byok in routes.py.
+const BYOK_PROVIDERS = [
+  { id: "anthropic", label: "Claude (Anthropic)", keyHint: "sk-ant-...", modelPlaceholder: "e.g. claude-sonnet-5-5" },
+  { id: "openai", label: "GPT (OpenAI)", keyHint: "sk-...", modelPlaceholder: "e.g. gpt-4.1" },
+  { id: "grok", label: "Grok (xAI)", keyHint: "xai-...", modelPlaceholder: "e.g. grok-4" },
+  { id: "openrouter", label: "OpenRouter (multi-model gateway)", keyHint: "sk-or-...", modelPlaceholder: "e.g. anthropic/claude-sonnet-4.5" },
+];
+const BYOK_PROVIDER_ID_SET = new Set(BYOK_PROVIDERS.map((p) => p.id));
+
+function ByokProviderCard({
+  providerId, label, keyHint, modelPlaceholder,
+  status, draft, setDraftApiKey, setDraftModel,
+  saving, error, onSave, onClear,
+}) {
+  const configured = Boolean(status?.configured);
+  return (
+    <div className="byok-provider-card">
+      <h3>{label}</h3>
+      {configured && (
+        <p className="muted small byok-saved-notice">
+          Saved to your account{status.model ? ` — model: ${status.model}` : ""}. Used automatically
+          when "Narrated by" is set to {label}, unless you type a different key below.
+          {" "}
+          <button type="button" className="link-btn" onClick={() => onClear(providerId)} disabled={saving}>
+            Clear saved key
+          </button>
+        </p>
+      )}
+      <label className="inline-label">
+        API key
+        <input
+          type="password"
+          placeholder={keyHint}
+          value={draft.apiKey}
+          onChange={(e) => setDraftApiKey(providerId, e.target.value)}
+          autoComplete="off"
+        />
+      </label>
+      <label className="inline-label">
+        Model (optional)
+        <input
+          type="text"
+          placeholder={modelPlaceholder}
+          value={draft.model}
+          onChange={(e) => setDraftModel(providerId, e.target.value)}
+        />
+      </label>
+      <button type="button" onClick={() => onSave(providerId)} disabled={saving || !draft.apiKey.trim()}>
+        {saving ? "Saving..." : "Save to my account"}
+      </button>
+      {error && <div className="error">{error}</div>}
+    </div>
+  );
+}
+
 // A dedicated settings view rather than an inline <details> in the ASK
 // panel -- that panel grew the page every time it was open, right next to
 // a results area already prone to pushing the page tall (see the
@@ -369,14 +431,13 @@ function PrivacyNotice({ providers, provider, byokApiKey, byokAccountConfigured 
 // below). Account-level settings belong somewhere stable, not jostling for
 // space with whatever capture is currently selected.
 function SettingsPanel({
-  byokAvailable, byokAccountConfigured, byokAccountModel,
-  byokApiKey, setByokApiKey, byokModel, setByokModel,
-  byokSaving, byokSaveError, saveAccountByok, clearAccountByok,
+  byokAvailable, byokStatus, byokDrafts, setByokDraftApiKey, setByokDraftModel,
+  byokSavingProvider, byokSaveErrors, saveAccountByok, clearAccountByok,
 }) {
   return (
     <div className="settings-view">
       <section className="panel settings-panel">
-        <h2>Your OpenRouter key</h2>
+        <h2>Your LLM keys</h2>
         {!byokAvailable ? (
           <p className="muted small">
             This deployment hasn't turned on BYOK (bring-your-own-key) narration. Ask whoever runs it
@@ -384,45 +445,29 @@ function SettingsPanel({
           </p>
         ) : (
           <>
-            {byokAccountConfigured && (
-              <p className="muted small byok-saved-notice">
-                Saved to your account{byokAccountModel ? ` — model: ${byokAccountModel}` : ""}. Used
-                automatically on every Diagnose/Scan unless you type a different key below.
-                {" "}
-                <button type="button" className="link-btn" onClick={clearAccountByok} disabled={byokSaving}>
-                  Clear saved key
-                </button>
-              </p>
-            )}
-            <label className="inline-label">
-              OpenRouter API key
-              <input
-                type="password"
-                placeholder="sk-or-..."
-                value={byokApiKey}
-                onChange={(e) => setByokApiKey(e.target.value)}
-                autoComplete="off"
-              />
-            </label>
-            <label className="inline-label">
-              Model (optional)
-              <input
-                type="text"
-                placeholder="e.g. anthropic/claude-sonnet-4.5"
-                value={byokModel}
-                onChange={(e) => setByokModel(e.target.value)}
-              />
-            </label>
-            <button type="button" onClick={saveAccountByok} disabled={byokSaving || !byokApiKey.trim()}>
-              {byokSaving ? "Saving..." : "Save to my account"}
-            </button>
-            {byokSaveError && <div className="error">{byokSaveError}</div>}
             <p className="muted small">
-              Get a key at <strong>openrouter.ai</strong>, billed to your own OpenRouter account. Typed
-              above without saving, it's used only for the next Diagnose/Scan you run and never stored.
-              Saving it keeps it on your account for every future request — used only for captures you
-              own, never a coworker's.
+              Typed below without saving, a key is used only for the next Diagnose/Scan you run (while
+              "Narrated by" is set to that provider) and never stored. Saving keeps it on your account
+              for every future request — used only for captures you own, never a coworker's. Billed to
+              your own account with that provider either way.
             </p>
+            {BYOK_PROVIDERS.map((p) => (
+              <ByokProviderCard
+                key={p.id}
+                providerId={p.id}
+                label={p.label}
+                keyHint={p.keyHint}
+                modelPlaceholder={p.modelPlaceholder}
+                status={byokStatus[p.id]}
+                draft={byokDrafts[p.id]}
+                setDraftApiKey={setByokDraftApiKey}
+                setDraftModel={setByokDraftModel}
+                saving={byokSavingProvider === p.id}
+                error={byokSaveErrors[p.id]}
+                onSave={saveAccountByok}
+                onClear={clearAccountByok}
+              />
+            ))}
           </>
         )}
       </section>
@@ -714,30 +759,55 @@ export default function App() {
   const [followUpBusy, setFollowUpBusy] = useState(false);
   const [providers, setProviders] = useState([]);
   const [provider, setProvider] = useState("");
-  // Visitor's own OpenRouter key (BYOK). Deliberately plain component state,
-  // not localStorage/sessionStorage: this never leaves the browser except
-  // as a form field on a diagnose/scan POST, and the simplest way to keep
-  // that true is to not give it a second place to live. Clears on refresh;
-  // when set, it takes priority over whatever "Narrated by" has selected
-  // (see handleScan/handleDiagnose/etc below) and the backend bypasses
-  // PARSECAT_ALLOW_LLM_EGRESS for it -- a visitor's own key sending their
-  // own data is a different consent model than this install's configured
-  // key (see app/llm/__init__.py get_byok_client).
-  const [byokApiKey, setByokApiKey] = useState("");
-  const [byokModel, setByokModel] = useState("");
+  // One-off draft key/model per provider (anthropic/openai/grok/
+  // openrouter -- see BYOK_PROVIDERS), keyed by provider id. Deliberately
+  // plain component state, not localStorage/sessionStorage: a draft never
+  // leaves the browser except as a form field on a diagnose/scan POST for
+  // whichever provider is currently selected in "Narrated by" (see
+  // handleScan/handleDiagnose/etc below), and the simplest way to keep
+  // that true is to not give it a second place to live. Clears on refresh.
+  // When a draft for the selected provider is set, it takes priority over
+  // that provider's saved account key (byokStatus below) -- see
+  // app/api/routes.py's _resolve_byok.
+  const [byokDrafts, setByokDrafts] = useState({
+    anthropic: { apiKey: "", model: "" },
+    openai: { apiKey: "", model: "" },
+    grok: { apiKey: "", model: "" },
+    openrouter: { apiKey: "", model: "" },
+  });
+  function setByokDraftApiKey(providerId, value) {
+    setByokDrafts((prev) => ({ ...prev, [providerId]: { ...prev[providerId], apiKey: value } }));
+  }
+  function setByokDraftModel(providerId, value) {
+    setByokDrafts((prev) => ({ ...prev, [providerId]: { ...prev[providerId], model: value } }));
+  }
+  // Appends a one-off byok_api_key/byok_model form field for whichever
+  // provider is CURRENTLY selected in "Narrated by" -- a no-op when that
+  // provider isn't BYOK-capable (Stub, Codex) or has no draft key typed,
+  // in which case the backend falls through to that provider's saved
+  // account key (if any) or the operator's configured key. Shared by every
+  // Diagnose/Scan call site below instead of repeating this per call.
+  function appendByokFields(form) {
+    if (!BYOK_PROVIDER_ID_SET.has(provider)) return;
+    const draft = byokDrafts[provider];
+    if (draft && draft.apiKey.trim()) {
+      form.append("byok_api_key", draft.apiKey.trim());
+      if (draft.model.trim()) form.append("byok_model", draft.model.trim());
+    }
+  }
   // Whether THIS deployment allows BYOK at all (PARSECAT_ALLOW_BYOK) --
   // see the fetch below and app/llm/__init__.py byok_allowed(). Starts
   // false (hidden) until the check resolves, same as a closed gate.
   const [byokAvailable, setByokAvailable] = useState(false);
-  // Whether the logged-in account has a key SAVED server-side (PUT/DELETE
-  // /api/account/byok) -- separate from byokApiKey above, which is this
-  // request's one-off override field. Saved keys use their own account's
-  // data only (see app/api/routes.py _resolve_byok + per-user ownership),
-  // so this is safe in a way it wasn't before accounts existed.
-  const [byokAccountConfigured, setByokAccountConfigured] = useState(false);
-  const [byokAccountModel, setByokAccountModel] = useState(null);
-  const [byokSaving, setByokSaving] = useState(false);
-  const [byokSaveError, setByokSaveError] = useState(null);
+  // Per-provider: whether the logged-in account has a key SAVED server-side
+  // (PUT/DELETE /api/account/byok/{provider}) -- separate from byokDrafts
+  // above, which are this request's one-off override fields. Saved keys use
+  // their own account's data only (see app/api/routes.py _resolve_byok +
+  // per-user ownership), so this is safe in a way it wasn't before accounts
+  // existed. {[providerId]: {configured, model}}.
+  const [byokStatus, setByokStatus] = useState({});
+  const [byokSavingProvider, setByokSavingProvider] = useState(null);
+  const [byokSaveErrors, setByokSaveErrors] = useState({});
   const [invQuestion, setInvQuestion] = useState("");
   const [invDiagnosis, setInvDiagnosis] = useState(null);
   const [invDiagnosing, setInvDiagnosing] = useState(false);
@@ -794,52 +864,50 @@ export default function App() {
     // Separate from the providers list on purpose -- see
     // app/api/routes.py get_byok_status. `available` stays an explicit
     // operator opt-in (PARSECAT_ALLOW_BYOK=1) regardless of accounts
-    // existing; `configured`/`model` are this logged-in user's own saved
-    // key (see byokAccountConfigured above). Defaults to hidden/unset on
-    // fetch failure, same as a closed gate, rather than showing a panel
-    // that will just error.
+    // existing; `providers` is this logged-in user's own saved keys, one
+    // entry per BYOK_PROVIDERS id (see byokStatus above). Defaults to
+    // hidden/empty on fetch failure, same as a closed gate, rather than
+    // showing a panel that will just error.
     api("/llm/byok_status").then((status) => {
       setByokAvailable(Boolean(status && status.available));
-      setByokAccountConfigured(Boolean(status && status.configured));
-      setByokAccountModel(status && status.model ? status.model : null);
+      setByokStatus((status && status.providers) || {});
     }).catch(() => setByokAvailable(false));
   }, []);
 
-  async function saveAccountByok() {
-    if (!byokApiKey.trim()) return;
-    setByokSaving(true);
-    setByokSaveError(null);
+  async function saveAccountByok(providerId) {
+    const draft = byokDrafts[providerId];
+    if (!draft.apiKey.trim()) return;
+    setByokSavingProvider(providerId);
+    setByokSaveErrors((prev) => ({ ...prev, [providerId]: null }));
     try {
-      const data = await api("/account/byok", {
+      const data = await api(`/account/byok/${providerId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ api_key: byokApiKey.trim(), model: byokModel.trim() || null }),
+        body: JSON.stringify({ api_key: draft.apiKey.trim(), model: draft.model.trim() || null }),
       });
-      setByokAccountConfigured(true);
-      setByokAccountModel(data.model || null);
-      // Clear the one-off fields now that it's saved -- otherwise they'd
-      // keep "overriding" the just-saved value (per _resolve_byok, a typed
-      // key always wins), which looks like the save did nothing.
-      setByokApiKey("");
-      setByokModel("");
+      setByokStatus((prev) => ({ ...prev, [providerId]: { configured: true, model: data.model || null } }));
+      // Clear this provider's one-off fields now that it's saved --
+      // otherwise they'd keep "overriding" the just-saved value (per
+      // _resolve_byok, a typed key always wins), which looks like the
+      // save did nothing.
+      setByokDrafts((prev) => ({ ...prev, [providerId]: { apiKey: "", model: "" } }));
     } catch (err) {
-      setByokSaveError(err.message);
+      setByokSaveErrors((prev) => ({ ...prev, [providerId]: err.message }));
     } finally {
-      setByokSaving(false);
+      setByokSavingProvider(null);
     }
   }
 
-  async function clearAccountByok() {
-    setByokSaving(true);
-    setByokSaveError(null);
+  async function clearAccountByok(providerId) {
+    setByokSavingProvider(providerId);
+    setByokSaveErrors((prev) => ({ ...prev, [providerId]: null }));
     try {
-      await api("/account/byok", { method: "DELETE" });
-      setByokAccountConfigured(false);
-      setByokAccountModel(null);
+      await api(`/account/byok/${providerId}`, { method: "DELETE" });
+      setByokStatus((prev) => ({ ...prev, [providerId]: { configured: false, model: null } }));
     } catch (err) {
-      setByokSaveError(err.message);
+      setByokSaveErrors((prev) => ({ ...prev, [providerId]: err.message }));
     } finally {
-      setByokSaving(false);
+      setByokSavingProvider(null);
     }
   }
 
@@ -978,10 +1046,7 @@ export default function App() {
     try {
       const form = new FormData();
       if (provider) form.append("provider", provider);
-      if (byokApiKey.trim()) {
-        form.append("byok_api_key", byokApiKey.trim());
-        if (byokModel.trim()) form.append("byok_model", byokModel.trim());
-      }
+      appendByokFields(form);
       const data = await api(`/captures/${captureId}/scan`, { method: "POST", body: form });
       setScanByCapture((prev) => ({ ...prev, [captureId]: data }));
     } catch (err) {
@@ -1002,10 +1067,7 @@ export default function App() {
       const form = new FormData();
       form.append("question", question);
       if (provider) form.append("provider", provider);
-      if (byokApiKey.trim()) {
-        form.append("byok_api_key", byokApiKey.trim());
-        if (byokModel.trim()) form.append("byok_model", byokModel.trim());
-      }
+      appendByokFields(form);
       const data = await api(`/captures/${captureId}/diagnose`, { method: "POST", body: form });
       setDiagnosisByCapture((prev) => ({ ...prev, [captureId]: data }));
       setFollowUpQuestion("");
@@ -1038,10 +1100,7 @@ export default function App() {
       const form = new FormData();
       form.append("question", askedQuestion);
       if (provider) form.append("provider", provider);
-      if (byokApiKey.trim()) {
-        form.append("byok_api_key", byokApiKey.trim());
-        if (byokModel.trim()) form.append("byok_model", byokModel.trim());
-      }
+      appendByokFields(form);
       form.append("history", JSON.stringify(priorTurns));
       const data = await api(`/captures/${captureId}/diagnose`, { method: "POST", body: form });
       setDiagnosisByCapture((prev) => {
@@ -1077,10 +1136,7 @@ export default function App() {
       const form = new FormData();
       form.append("question", invQuestion);
       if (provider) form.append("provider", provider);
-      if (byokApiKey.trim()) {
-        form.append("byok_api_key", byokApiKey.trim());
-        if (byokModel.trim()) form.append("byok_model", byokModel.trim());
-      }
+      appendByokFields(form);
       const data = await api(
         `/investigations/${encodeURIComponent(investigationLabel.trim())}/diagnose`,
         { method: "POST", body: form },
@@ -1109,10 +1165,7 @@ export default function App() {
       const form = new FormData();
       form.append("question", askedQuestion);
       if (provider) form.append("provider", provider);
-      if (byokApiKey.trim()) {
-        form.append("byok_api_key", byokApiKey.trim());
-        if (byokModel.trim()) form.append("byok_model", byokModel.trim());
-      }
+      appendByokFields(form);
       form.append("history", JSON.stringify(priorTurns));
       const data = await api(`/investigations/${encodeURIComponent(label)}/diagnose`, { method: "POST", body: form });
       setInvDiagnosis((existing) => (existing ? {
@@ -1231,14 +1284,12 @@ export default function App() {
       {showSettings ? (
         <SettingsPanel
           byokAvailable={byokAvailable}
-          byokAccountConfigured={byokAccountConfigured}
-          byokAccountModel={byokAccountModel}
-          byokApiKey={byokApiKey}
-          setByokApiKey={setByokApiKey}
-          byokModel={byokModel}
-          setByokModel={setByokModel}
-          byokSaving={byokSaving}
-          byokSaveError={byokSaveError}
+          byokStatus={byokStatus}
+          byokDrafts={byokDrafts}
+          setByokDraftApiKey={setByokDraftApiKey}
+          setByokDraftModel={setByokDraftModel}
+          byokSavingProvider={byokSavingProvider}
+          byokSaveErrors={byokSaveErrors}
           saveAccountByok={saveAccountByok}
           clearAccountByok={clearAccountByok}
         />
@@ -1363,15 +1414,18 @@ export default function App() {
             </div>
 
             <PrivacyNotice
-              providers={providers} provider={provider} byokApiKey={byokApiKey}
-              byokAccountConfigured={byokAccountConfigured}
+              providers={providers} provider={provider}
+              byokDraftKey={byokDrafts[provider]?.apiKey}
+              byokStatus={byokStatus}
             />
 
             {byokAvailable && (
               <p className="muted small byok-settings-pointer">
-                {byokAccountConfigured
-                  ? `Using your saved OpenRouter key${byokAccountModel ? ` (${byokAccountModel})` : ""}.`
-                  : "Have your own OpenRouter key?"}
+                {byokStatus[provider]?.configured
+                  ? `Using your saved ${providers.find((p) => p.id === provider)?.label || provider} key${
+                      byokStatus[provider].model ? ` (${byokStatus[provider].model})` : ""
+                    }.`
+                  : "Have your own key for Claude, GPT, Grok, or OpenRouter?"}
                 {" "}
                 <button type="button" className="link-btn" onClick={() => setShowSettings(true)}>
                   Manage it in Settings
@@ -2232,6 +2286,9 @@ export default function App() {
         .settings-view { max-width: 640px; margin: 28px auto; padding: 0 28px; }
         .settings-panel h2 { margin-top: 0; }
         .byok-settings-pointer { margin: 0 0 14px; }
+        .byok-provider-card { border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px 14px; margin: 14px 0; background: #0e1420; }
+        .byok-provider-card h3 { margin: 0 0 8px; font-size: 14px; }
+        .byok-provider-card button { margin-top: 4px; }
         .layout { display: grid; grid-template-columns: 300px 1fr; gap: 20px; padding: 20px 28px; align-items: start; }
         .sidebar { display: flex; flex-direction: column; gap: 16px; position: sticky; top: 20px; }
         .main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }

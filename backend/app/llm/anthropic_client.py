@@ -11,13 +11,16 @@ DEFAULT_MODEL = "claude-sonnet-5"
 
 
 class AnthropicClient(LLMClient):
-    def __init__(self, model: str = DEFAULT_MODEL):
+    def __init__(self, model: str = DEFAULT_MODEL, api_key: str | None = None):
         import anthropic  # imported lazily so the stub path has no hard dependency
 
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
+        # api_key override lets a caller point this at a visitor's own key
+        # (BYOK -- see app/llm/__init__.py get_byok_client) instead of this
+        # deployment's own ANTHROPIC_API_KEY.
+        resolved_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        if not resolved_key:
             raise RuntimeError("ANTHROPIC_API_KEY is not set")
-        self._client = anthropic.Anthropic(api_key=api_key)
+        self._client = anthropic.Anthropic(api_key=resolved_key)
         self._model = model
 
     def narrate(self, system_prompt: str, user_prompt: str) -> str:

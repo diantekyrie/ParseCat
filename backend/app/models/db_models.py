@@ -60,17 +60,36 @@ class User(SQLModel, table=True):
         default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(AwareUTCDateTime(), nullable=False),
     )
-    # Personal BYOK (OpenRouter) key -- see app/api/routes.py's
-    # /api/account/byok endpoints and app/services/reasoning.py's use of it
-    # as the fallback when a diagnose/scan request doesn't include a
-    # one-off key. Stored as plaintext, not encrypted at rest: this is a
-    # small-team internal tool on a single SQLite file, not a service that
-    # holds other people's keys at scale, and PUT /api/account/byok is the
-    # only write path while GET only ever reports whether one is set (never
-    # echoes the value back) -- see routes.py for why that boundary matters
-    # more here than encryption would.
-    byok_api_key: Optional[str] = None
-    byok_model: Optional[str] = None
+
+
+class UserByokKey(SQLModel, table=True):
+    """One user's own key for one third-party LLM provider -- see
+    app.llm.BYOK_PROVIDER_IDS (anthropic/openai/grok/openrouter) and
+    app/api/routes.py's /api/account/byok/{provider} endpoints. A separate
+    table, not columns on User, because BYOK now spans 4 distinct provider
+    APIs rather than being OpenRouter-only (its original, narrower design);
+    one row per (user, provider) lets someone save a key for just the
+    providers they actually have, not all-or-nothing.
+
+    Stored as plaintext, not encrypted at rest: this is a small-team
+    internal tool on a single SQLite file, not a service that holds other
+    people's keys at scale, and PUT /api/account/byok/{provider} is the
+    only write path while GET only ever reports whether one is set (never
+    echoes the value back) -- see routes.py for why that boundary matters
+    more here than encryption would.
+    """
+
+    __table_args__ = (UniqueConstraint("user_id", "provider", name="uq_byok_user_provider"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    provider: str = Field(index=True)  # one of app.llm.BYOK_PROVIDER_IDS
+    api_key: str
+    model: Optional[str] = None
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(AwareUTCDateTime(), nullable=False),
+    )
 
 
 class RefreshToken(SQLModel, table=True):

@@ -1,23 +1,24 @@
-"""app/auth.py's BasicAuthMiddleware: the gate itself, not the routes behind it.
+"""app/auth.py: SessionAuthMiddleware and POST /api/auth/login.
 
 Uses TestClient(app) directly against whatever path -- these tests care only
 about which status code the GATE produces (503 refused / 401 challenged /
-passed-through-to-routing), not about what any particular route does. A
-protected path that doesn't exist (e.g. "/no-such-route") is deliberate: once
-a request clears the gate it falls through to normal FastAPI routing, which
-404s for an unknown path -- a result clearly distinct from the gate's own 503
-and 401, proving the request got past the gate rather than merely not being
-blocked for some other reason.
+passed through), not about what any particular route does. "/no-such-route"
+is deliberate: it isn't a real API route, so once a request clears the gate
+it falls through to the SPA catch-all (app/main.py mount_frontend), whose
+response (200 index.html fallback, or 404 if frontend/dist wasn't built)
+depends on local build state -- what every "passes through" assertion below
+checks is that the status is NOT the gate's own 401/503, not which of those
+downstream outcomes it got.
 """
 from __future__ import annotations
 
-import base64
+import time
 
 from fastapi.testclient import TestClient
 
-from app.auth import AUTH_PASSWORD_ENV, AUTH_USERNAME_ENV
+from app.auth import AUTH_PASSWORD_ENV, AUTH_USERNAME_ENV, issue_session_token
 from app.main import app
-from tests.conftest import TEST_AUTH_PASSWORD, TEST_AUTH_USERNAME, basic_auth_headers
+from tests.conftest import TEST_AUTH_PASSWORD, TEST_AUTH_USERNAME, auth_headers
 
 
 def _client() -> TestClient:
@@ -54,36 +55,64 @@ def test_unconfigured_credentials_still_pass_options_through(monkeypatch):
     assert r.status_code != 401
 
 
-def test_configured_missing_header_is_401_with_challenge():
+def test_unconfigured_credentials_login_is_503(monkeypatch):
+    monkeypatch.delenv(AUTH_USERNAME_ENV, raising=False)
+    monkeypatch.delenv(AUTH_PASSWORD_ENV, raising=False)
+    with _client() as c:
+        r = c.post("/api/auth/login", json={"username": "x", "password": "y"})
+    assert r.status_code == 503
+
+
+def test_configured_missing_header_is_401():
     with _client() as c:
         r = c.get("/no-such-route")
-    assert r.status_code == 401
-    assert r.headers["www-authenticate"] == 'Basic realm="ParseCat"'
-
-
-def test_configured_wrong_username_is_401():
-    token = base64.b64encode(f"wrong-user:{TEST_AUTH_PASSWORD}".encode()).decode()
-    with _client() as c:
-        r = c.get("/no-such-route", headers={"Authorization": f"Basic {token}"})
-    assert r.status_code == 401
-
-
-def test_configured_wrong_password_is_401():
-    token = base64.b64encode(f"{TEST_AUTH_USERNAME}:wrong-pass".encode()).decode()
-    with _client() as c:
-        r = c.get("/no-such-route", headers={"Authorization": f"Basic {token}"})
     assert r.status_code == 401
 
 
 def test_configured_malformed_header_is_401():
     with _client() as c:
-        r = c.get("/no-such-route", headers={"Authorization": "not-even-basic"})
+        r = c.get("/no-such-route", headers={"Authorization": "not-even-bearer"})
     assert r.status_code == 401
 
 
-def test_configured_correct_credentials_pass_through():
+def test_configured_garbage_token_is_401():
     with _client() as c:
-        r = c.get("/no-such-route", headers=basic_auth_headers())
-    # Cleared the gate -- 404 from normal routing, not the gate's own codes.
-    assert r.status_code == 404
+        r = c.get("/no-such-route", headers={"Authorization": "Bearer not-a-real-token"})
+    assert r.status_code == 401
+
+
+def test_configured_expired_token_is_401():
+    token, _ = issue_session_token(now=time.time() - 10_000)
+    with _client() as c:
+        r = c.get("/no-such-route", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 401
+
+
+def test_configured_valid_token_passes_through():
+    with _client() as c:
+        r = c.get("/no-such-route", headers=auth_headers())
     assert r.status_code not in (401, 503)
+
+
+def test_login_wrong_username_is_401():
+    with _client() as c:
+        r = c.post("/api/auth/login", json={"username": "wrong-user", "password": TEST_AUTH_PASSWORD})
+    assert r.status_code == 401
+
+
+def test_login_wrong_password_is_401():
+    with _client() as c:
+        r = c.post("/api/auth/login", json={"username": TEST_AUTH_USERNAME, "password": "wrong-pass"})
+    assert r.status_code == 401
+
+
+def test_login_correct_credentials_issues_usable_token():
+    with _client() as c:
+        login = c.post("/api/auth/login", json={"username": TEST_AUTH_USERNAME, "password": TEST_AUTH_PASSWORD})
+        assert login.status_code == 200
+        body = login.json()
+        assert body["expires_in"] > 0
+        token = body["token"]
+
+        r = c.get("/no-such-route", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code not in (401, 503)  # past the gate, same as the test above

@@ -30,9 +30,9 @@ pass provider=<id> explicitly rather than relying on ambient .env state.
 """
 from __future__ import annotations
 
-import base64
-
 import pytest
+
+from app.auth import issue_session_token
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -44,7 +44,7 @@ def _no_real_llm_keys_in_tests():
     yield
 
 
-# app/auth.py's BasicAuthMiddleware fails CLOSED by design when
+# app/auth.py's SessionAuthMiddleware fails CLOSED by design when
 # PARSECAT_AUTH_USERNAME / PARSECAT_AUTH_PASSWORD are unset -- correct for a
 # real deploy (this branch exists specifically so a misconfigured one does
 # NOT silently serve the app wide open), but it would 401/503 every
@@ -52,7 +52,8 @@ def _no_real_llm_keys_in_tests():
 # whole session, same shape as the fixture above (deterministic test
 # environment), just setting rather than stripping. test_auth.py itself
 # overrides/clears these locally (monkeypatch) to exercise the gate's own
-# unconfigured/wrong-credential/missing-header branches.
+# unconfigured/wrong-credential/expired-token branches, and exercises the
+# real POST /api/auth/login flow rather than this shortcut.
 TEST_AUTH_USERNAME = "test-user"
 TEST_AUTH_PASSWORD = "test-pass"
 
@@ -66,15 +67,18 @@ def _fixed_basic_auth_credentials():
     yield
 
 
-def basic_auth_headers() -> dict[str, str]:
-    """Authorization header matching the fixed test credentials above --
-    pass to TestClient(app, headers=basic_auth_headers()) wherever a test
-    constructs a client directly, so it isn't 401'd by BasicAuthMiddleware.
+def auth_headers() -> dict[str, str]:
+    """Authorization header carrying a freshly-minted, valid session token --
+    pass to TestClient(app, headers=auth_headers()) wherever a test
+    constructs a client directly, so it isn't 401'd by SessionAuthMiddleware.
+    Mints the token directly via issue_session_token() rather than going
+    through POST /api/auth/login, since these call sites only need a client
+    that's already past the gate, not to exercise the login flow itself.
 
     Named to avoid pytest collecting this as a test itself (anything
     literally named test_* in a test file/module is fair game for pytest's
     default collection, even a plain helper with no assertions in it).
     """
-    token = base64.b64encode(f"{TEST_AUTH_USERNAME}:{TEST_AUTH_PASSWORD}".encode()).decode()
-    return {"Authorization": f"Basic {token}"}
+    token, _ = issue_session_token()
+    return {"Authorization": f"Bearer {token}"}
 

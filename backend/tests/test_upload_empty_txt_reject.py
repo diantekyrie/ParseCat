@@ -11,7 +11,7 @@ from app.db import get_session
 from app.main import app
 from app.models.db_models import Capture
 from app.services.ingestion import empty_bugreport_rejection_message, parse_bugreport_txt
-from tests.conftest import basic_auth_headers
+from tests.conftest import auth_headers
 
 
 @pytest.fixture()
@@ -30,7 +30,7 @@ def client(tmp_path):
             yield session
 
     app.dependency_overrides[get_session] = _session
-    with TestClient(app, headers=basic_auth_headers()) as c:
+    with TestClient(app, headers=auth_headers()) as c:
         yield c, engine
     app.dependency_overrides.clear()
 

@@ -10,6 +10,7 @@ import {
   splitNarrationSections,
 } from "./answerBands";
 import DiagnosisStory, { IdentityStrip } from "./DiagnosisStory";
+import { getAuthHeader, notifyUnauthorized } from "./authSession.js";
 
 const SEVERITY_COLOR = { critical: "var(--red)", warning: "var(--amber)", info: "var(--blue)" };
 const CONFIDENCE_COLOR = { HIGH: "var(--green)", MEDIUM: "var(--amber)", LOW: "var(--orange)", UNCONFIRMED: "var(--muted)" };
@@ -21,7 +22,17 @@ const TABS = [
 ];
 
 async function api(path, opts) {
-  const res = await fetch(`/api${path}`, opts);
+  const res = await fetch(`/api${path}`, {
+    ...opts,
+    headers: { ...(opts?.headers || {}), ...getAuthHeader() },
+  });
+  if (res.status === 401) {
+    // Session expired or was never valid (shouldn't normally happen -- this
+    // component only mounts after LoginGate already has a token -- but a
+    // timeout mid-session lands here). Flips the app back to the login
+    // screen; see authSession.js and LoginGate.jsx.
+    notifyUnauthorized();
+  }
   if (!res.ok) {
     const text = await res.text();
     // FastAPI errors are usually {"detail": "..."}; show that plain string in

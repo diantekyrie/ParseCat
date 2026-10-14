@@ -58,6 +58,10 @@ _DEFAULT_SESSION_TIMEOUT_SECONDS = 15 * 60
 # that required being already logged in would be unusable.
 _EXEMPT_PATHS = frozenset({"/api/health", "/api/auth/login"})
 
+
+def _is_api_path(path: str) -> bool:
+    return path == "/api" or path.startswith("/api/")
+
 # Signs session tokens. Generated fresh every process start, never persisted
 # -- a restart invalidates every outstanding session, which fits the intent
 # here (periodic forced re-auth) rather than something to work around.
@@ -168,7 +172,23 @@ class SessionAuthMiddleware(BaseHTTPMiddleware):
         # Vercel-split conversation), blocking OPTIONS here would break
         # every cross-origin request even with a valid token on the real
         # one. Preflight itself exposes nothing but CORS negotiation.
-        if request.method == "OPTIONS" or request.url.path in _EXEMPT_PATHS:
+        #
+        # Non-/api paths are the static frontend (index.html, /assets/*, and
+        # the SPA catch-all -- see main.py's mount_frontend) and are exempt
+        # too: LoginGate.jsx IS that bundle, so gating it here created a
+        # deadlock where the login screen's own JS/CSS couldn't load without
+        # a token you can only get from... the login screen. The bundle is
+        # just the client-side app shell with no capture data or secrets
+        # baked in (a BYOK key, for instance, is typed in and sent per
+        # request, never embedded in the build) -- every actual read of
+        # device/capture data still goes through a gated /api/* call, so
+        # this doesn't hand out anything an unauthenticated visitor couldn't
+        # already infer from the public GitHub repo this is built from.
+        if (
+            request.method == "OPTIONS"
+            or request.url.path in _EXEMPT_PATHS
+            or not _is_api_path(request.url.path)
+        ):
             return await call_next(request)
 
         if _configured_credentials() is None:

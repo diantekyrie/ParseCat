@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import App from "./App.jsx";
 import { setToken, setUnauthorizedHandler } from "./authSession.js";
+import "./LoginGate.css";
 
 // Wraps the real App behind a login form backed by POST /api/auth/login
 // (see backend/app/auth.py). Deliberately plain component state for
@@ -60,14 +61,17 @@ export default function LoginGate() {
 
   if (!authed) {
     return (
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh" }}>
-        <form onSubmit={handleSubmit} style={{ width: "280px", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-          <h1 style={{ margin: 0 }}>ParseCat</h1>
-          <p style={{ margin: 0, color: "#888" }}>Sign in to continue.</p>
+      <div className="login-screen">
+        <form className="login-card" onSubmit={handleSubmit}>
+          <div className="login-brand">
+            <span className="login-brand-mark">PC</span>
+            <h1>ParseCat</h1>
+          </div>
+          <p className="login-subtitle">Sign in to diagnose device logs.</p>
           {expiredNotice && (
-            <p style={{ margin: 0, color: "#b35900" }}>Your session ended. Please sign in again.</p>
+            <p className="login-notice">Your session ended. Please sign in again.</p>
           )}
-          <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+          <label className="login-field">
             Username
             <input
               type="text"
@@ -77,7 +81,7 @@ export default function LoginGate() {
               autoComplete="username"
             />
           </label>
-          <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+          <label className="login-field">
             Password
             <input
               type="password"
@@ -86,10 +90,11 @@ export default function LoginGate() {
               autoComplete="current-password"
             />
           </label>
-          {error && <div style={{ color: "#c0392b" }}>{error}</div>}
-          <button type="submit" disabled={busy || !username || !password}>
+          {error && <div className="login-error">{error}</div>}
+          <button type="submit" className="login-submit" disabled={busy || !username || !password}>
             {busy ? "Signing in..." : "Sign in"}
           </button>
+          <p className="login-footnote">Access is limited to people with the shared credential.</p>
         </form>
       </div>
     );

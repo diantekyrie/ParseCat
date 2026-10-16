@@ -1738,7 +1738,9 @@ def _format_history(history: list[dict] | None) -> str:
 # any "sk-..." token (full OpenRouter/OpenAI/Anthropic-style keys, bare
 # prefixes like "sk-or-v1", masked forms like "sk-or-...abcd"); and any
 # opaque run of 32+ chars (which can also hide long model/request ids).
-# NOT covered, by decision (Founders Engineer + Arch on #86): masked non-"sk-"
+# The regex runs before the literal key/prefix swap so a truncated echo
+# ("sk-or-v1-0123456789a...") is consumed whole, not split at char 8.
+# NOT covered: masked non-"sk-"
 # keys such as "AIza...wxyz", and a bare masked last-4 ("...abcd",
 # "key ending abcd"). A last-4 alone is not usable as a key.
 _KEY_LIKE_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_.\-]*|(?<![A-Za-z0-9])[A-Za-z0-9_\-]{32,}")
@@ -1748,11 +1750,12 @@ def _redact_llm_error(message: str, key: str | None) -> str:
     """Strip key material from a provider exception's text before it is
     returned as `llm_error`. Keeps the rest (e.g. "Error code: 401") so the
     visitor still gets a useful status class. Never log the raw message."""
+    message = _KEY_LIKE_RE.sub("[redacted]", message)
     if key:
         for fragment in sorted({key, key[:8]}, key=len, reverse=True):
             if len(fragment) >= 4:
                 message = message.replace(fragment, "[redacted]")
-    return _KEY_LIKE_RE.sub("[redacted]", message)
+    return message
 
 
 def _run_llm(

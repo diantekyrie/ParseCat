@@ -134,3 +134,15 @@ def test_run_llm_redacts_key_and_key_like_tokens_directly(monkeypatch):
 def test_benign_error_text_survives_unchanged(key):
     benign = "Error code: 429 rate limited"
     assert reasoning._redact_llm_error(benign, key) == benign
+
+
+def test_truncated_key_echo_leaks_no_chars_past_prefix():
+    # Arch #86 review 5493738353: prefix swap ran first and left chars 9..30.
+    from app.services.reasoning import _redact_llm_error
+
+    truncated = DUMMY_KEY[:20] + "..."
+    out = _redact_llm_error(f"Error code: 401 - invalid key {truncated}", DUMMY_KEY)
+    assert "Error code: 401" in out
+    assert DUMMY_KEY[8:20] not in out
+    assert DUMMY_KEY[:8] not in out
+    assert "[redacted]-" not in out

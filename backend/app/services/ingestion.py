@@ -35,6 +35,7 @@ from app.parsers.section_extractor import PREAMBLE, extract_sections, extract_se
 from app.parsers.selinux import parse_selinux_denials
 from app.parsers.tombstone import parse_tombstone
 from app.parsers.wifi import parse_wifi_events
+from app.parsers.bt_framework import parse_bt_framework_events
 
 def _dedup_by_key(events: list, key_fn) -> list:
     """Keeps the first occurrence of each distinct key, dropping later
@@ -192,6 +193,11 @@ def _parse_sections_into_capture(capture: ParsedCapture, sections: dict) -> Pars
         capture.wifi_events = parse_wifi_events(sections["wifi"])
     else:
         capture.parse_warnings.append("No 'wifi' dumpsys section found")
+
+    if "bluetooth_manager" in sections:
+        capture.bt_framework_events = parse_bt_framework_events(sections["bluetooth_manager"])
+    else:
+        capture.parse_warnings.append("No 'bluetooth_manager' dumpsys section found")
 
     # AVC denials appear in both buffers -- overwhelmingly EVENT LOG (where
     # auditd writes) but occasionally SYSTEM LOG too, so both are scanned and

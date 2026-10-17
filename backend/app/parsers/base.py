@@ -813,6 +813,29 @@ class CompanionDeviceAssociation:
 
 
 @dataclass
+class BtFrameworkEvent:
+    """One decoded fact from `DUMP OF SERVICE bluetooth_manager` (framework
+    BT text — not HCI binary). Adapter enable / adapter SM, ACL connection
+    events, bond-state changes, and profile connection-state changes from
+    BluetoothActiveDeviceManager. Invent-nothing: unknown disconnect reason
+    codes and unknown bond/adapter tokens stay Unknown / raw as printed.
+    """
+
+    timestamp: str
+    kind: str                 # "adapter_enable" | "adapter_state" | "connection" |
+                              # "bond" | "profile_connection"
+    action: Optional[str]     # CONNECTED/DISCONNECTED, Enable, BLE_TURN_ON, ...
+    profile: Optional[str]    # HEADSET / LE_AUDIO / ... for profile_connection
+    address: Optional[str]    # BD_ADDR as printed (synthetic in fixtures)
+    from_state: Optional[str]
+    to_state: Optional[str]
+    reason_code: Optional[int]
+    reason_name: Optional[str]
+    detail: str
+    source_ref: SourceRef
+
+
+@dataclass
 class ParsedCapture:
     """Everything a capture's ingestion pipeline produced, ground-truth facts only."""
 
@@ -833,6 +856,7 @@ class ParsedCapture:
     packet_capture_summary: Optional[PacketCaptureSummary] = None
     packet_analysis: Optional[PacketAnalysis] = None
     wifi_events: list[WifiEvent] = field(default_factory=list)
+    bt_framework_events: list[BtFrameworkEvent] = field(default_factory=list)
     battery_uid_stats: list[BatteryUidStats] = field(default_factory=list)
     cdm_pairing_events: list[CdmPairingEvent] = field(default_factory=list)
     companion_device_associations: list[CompanionDeviceAssociation] = field(default_factory=list)

@@ -23,7 +23,7 @@ export const HOW_TO_CAPTURE_STEPS = [
     id: "full-bugreport",
     title: "Take a full bugreport ZIP",
     body:
-      "Prefer `adb bugreport bugreport.zip`, or Developer options → Take bug report. Upload the whole .zip. Plain logcat / .txt-only uploads lack ZIP companions (tombstones, ANRs, HCI files).",
+      "Prefer adb bugreport bugreport.zip, or Developer options → Take bug report. Upload the whole .zip. Plain logcat / .txt-only uploads lack ZIP companions (tombstones, ANRs, HCI files).",
   },
   {
     id: "accepts",
@@ -40,7 +40,7 @@ export const HOW_TO_CAPTURE_STEPS = [
 ];
 
 export const HOW_TO_CAPTURE_DOCS_HINT =
-  "Full steps and AOSP link: docs/how-to-capture.md in the repo.";
+  "Full steps: the AOSP Bluetooth verifying & debugging guide.";
 
 export const HOW_TO_CAPTURE_AOSP_URL =
   "https://source.android.com/docs/core/connect/bluetooth/verifying_debugging";

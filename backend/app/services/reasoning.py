@@ -17,7 +17,7 @@ from sqlmodel import Session
 
 from sqlmodel import select
 
-from app.llm import get_byok_client, get_llm_client
+from app.llm import BYOK_PROVIDER_ID, get_byok_client, get_llm_client, resolve_provider_id
 from app.models.db_models import (
     AnrBlockingThreadRow,
     AnrMainThreadSnapshotRow,
@@ -1260,8 +1260,22 @@ def build_diagnosis_bundle(
                     "notable_events": [
                         {"timestamp": e.timestamp, "kind": e.kind, "status_name": e.status_name,
                          "reason_name": e.reason_name, "handle": e.handle,
-                         "confidence": pairing_confidence}
-                        for e in bt_events if e.kind == "disconnection_complete" or (e.status_code or 0) != 0
+                         "encryption_enabled": e.encryption_enabled, "key_type": e.key_type,
+                         "severity": e.severity,
+                         "confidence": e.confidence or pairing_confidence,
+                         "source": (
+                             {"section": e.source_section,
+                              "line_start": e.source_line_start,
+                              "line_end": e.source_line_end}
+                             if e.source_section is not None else None
+                         )}
+                        for e in bt_events
+                        if e.kind in (
+                            "disconnection_complete", "authentication_complete",
+                            "encryption_change", "simple_pairing_complete",
+                            "change_connection_link_key_complete",
+                            "link_key_request", "link_key_notification",
+                        ) or (e.status_code or 0) != 0
                     ],
                 })
         pcap_rows = session.exec(
@@ -1706,10 +1720,15 @@ def scan_capture(
     bundle["scan"] = True
     # Re-attach after ranked_findings so scan findings feed verified_facts.
     attach_verified_facts(bundle)
-    report_text, llm_error = _run_llm(
+    report_text, llm_error, narrated_by = _run_llm(
         bundle, SCAN_SYSTEM_PROMPT, provider, byok_api_key=byok_api_key, byok_model=byok_model,
     )
-    return {"bundle": bundle, "report": report_text, "llm_error": llm_error, "provider": provider}
+    return {
+        "bundle": bundle, "report": report_text, "llm_error": llm_error,
+        # `provider` echoes the request (contract: test_api_user_flows);
+        # `narrated_by` is what actually ran (#84).
+        "provider": provider, "narrated_by": narrated_by,
+    }
 
 
 def _format_history(history: list[dict] | None) -> str:
@@ -1733,15 +1752,51 @@ def _format_history(history: list[dict] | None) -> str:
     )
 
 
+# Best-effort redaction for `llm_error` (which goes straight to the UI).
+# `_redact_llm_error` strips: the supplied BYOK key and its first 8 chars;
+# any "sk-..." token (full OpenRouter/OpenAI/Anthropic-style keys, bare
+# prefixes like "sk-or-v1", masked forms like "sk-or-...abcd"); and any
+# opaque run of 32+ chars (which can also hide long model/request ids).
+# The regex runs before the literal key/prefix swap so a truncated echo
+# ("sk-or-v1-0123456789a...") is consumed whole, not split at char 8.
+# NOT covered: masked non-"sk-"
+# keys such as "AIza...wxyz", and a bare masked last-4 ("...abcd",
+# "key ending abcd"). A last-4 alone is not usable as a key.
+_KEY_LIKE_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_.\-]*|(?<![A-Za-z0-9])[A-Za-z0-9_\-]{32,}")
+
+
+def _redact_llm_error(message: str, key: str | None) -> str:
+    """Strip key material from a provider exception's text before it is
+    returned as `llm_error`. Keeps the rest (e.g. "Error code: 401") so the
+    visitor still gets a useful status class. Never log the raw message."""
+    message = _KEY_LIKE_RE.sub("[redacted]", message)
+    if key:
+        for fragment in sorted({key, key[:8]}, key=len, reverse=True):
+            if len(fragment) >= 4:
+                message = message.replace(fragment, "[redacted]")
+    return message
+
+
 def _run_llm(
     bundle: dict, system_prompt: str, provider: str | None, history: list[dict] | None = None,
     byok_api_key: str | None = None, byok_model: str | None = None,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None]:
+    """Returns (report_text, llm_error, narrated_by).
+
+    `narrated_by` is the provider id that actually produced report_text
+    (#84) -- BYOK_PROVIDER_ID when a visitor key ran, else the id
+    get_llm_client resolved (including auto-detect for provider=None). It
+    is always a fixed id from app.llm, never the key, a key prefix, the
+    visitor's model string, or the echoed request `provider`. None when
+    narration failed (nothing was narrated) or the id can't be resolved,
+    so the UI shows no source label rather than a wrong one.
+    """
     user_prompt = (
         _format_history(history) +
         "Verified fact bundle (JSON):\n\n" + json.dumps(bundle, indent=2, default=str) +
         "\n\nWrite a diagnosis report answering the question above using only these facts."
     )
+    byok_key = ""
     try:
         # .strip() before the truthiness check: the frontend trims before
         # sending, but a raw Form POST (or a future non-browser client)
@@ -1755,14 +1810,21 @@ def _run_llm(
         # _resolve_byok) only ever hands byok_api_key through when
         # `provider` is itself BYOK-capable, so `provider` here is already
         # the right one to use for the BYOK client too.
-        llm = get_byok_client(provider, byok_key, byok_model) if byok_key else get_llm_client(provider)
-        return llm.narrate(system_prompt, user_prompt), None
+        if byok_key:
+            llm = get_byok_client(provider, byok_key, byok_model)
+            narrated_by = BYOK_PROVIDER_ID
+        else:
+            llm = get_llm_client(provider)
+            narrated_by = resolve_provider_id(provider)
+        return llm.narrate(system_prompt, user_prompt), None, narrated_by
     except Exception as exc:  # noqa: BLE001 -- LLM narration is a convenience
         # layer on top of already-computed, independently verified facts.
         # A provider outage, quota error, or bad key should degrade to
         # "here are the facts, narration failed" -- never a 500 that hides
-        # the verification work that already succeeded.
-        return None, str(exc)
+        # the verification work that already succeeded. The message is
+        # redacted (a provider 401 can echo the key) and deliberately not
+        # logged server-side. narrated_by is None -- nothing was narrated.
+        return None, _redact_llm_error(str(exc), byok_key or None), None
 
 
 def diagnose(
@@ -1771,10 +1833,15 @@ def diagnose(
     byok_api_key: str | None = None, byok_model: str | None = None,
 ) -> dict:
     bundle = build_diagnosis_bundle(session, capture_id, device_label, question)
-    report_text, llm_error = _run_llm(
+    report_text, llm_error, narrated_by = _run_llm(
         bundle, SYSTEM_PROMPT, provider, history, byok_api_key=byok_api_key, byok_model=byok_model,
     )
-    return {"bundle": bundle, "report": report_text, "llm_error": llm_error, "provider": provider}
+    return {
+        "bundle": bundle, "report": report_text, "llm_error": llm_error,
+        # `provider` echoes the request (contract: test_api_user_flows);
+        # `narrated_by` is what actually ran (#84).
+        "provider": provider, "narrated_by": narrated_by,
+    }
 
 
 INVESTIGATION_SYSTEM_PROMPT = SYSTEM_PROMPT + """
@@ -1838,8 +1905,13 @@ def diagnose_investigation(
 
     bundle = {"question": question, "captures": captures_bundle}
     attach_verified_facts(bundle)
-    report_text, llm_error = _run_llm(
+    report_text, llm_error, narrated_by = _run_llm(
         bundle, INVESTIGATION_SYSTEM_PROMPT, provider, history,
         byok_api_key=byok_api_key, byok_model=byok_model,
     )
-    return {"bundle": bundle, "report": report_text, "llm_error": llm_error, "provider": provider}
+    return {
+        "bundle": bundle, "report": report_text, "llm_error": llm_error,
+        # `provider` echoes the request (contract: test_api_user_flows);
+        # `narrated_by` is what actually ran (#84).
+        "provider": provider, "narrated_by": narrated_by,
+    }

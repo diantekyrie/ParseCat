@@ -18,6 +18,14 @@ _COLUMN_MIGRATIONS = [
     ("investigation", "archived", "BOOLEAN NOT NULL DEFAULT 0"),
     ("device", "owner_user_id", "INTEGER"),
     ("investigation", "owner_user_id", "INTEGER"),
+    # Msg5: BT HCI auth/encrypt/link-key events + SourceRef + severity/confidence
+    ("bthcieventrow", "encryption_enabled", "INTEGER"),
+    ("bthcieventrow", "key_type", "INTEGER"),
+    ("bthcieventrow", "source_section", "VARCHAR"),
+    ("bthcieventrow", "source_line_start", "INTEGER"),
+    ("bthcieventrow", "source_line_end", "INTEGER"),
+    ("bthcieventrow", "severity", "VARCHAR"),
+    ("bthcieventrow", "confidence", "VARCHAR"),
 ]
 
 

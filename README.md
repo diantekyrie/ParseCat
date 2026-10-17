@@ -96,9 +96,37 @@ backend/
                               parsers above on log history that predates the
                               live SYSTEM LOG window, deduplicated where the
                               two genuinely overlap
+      battery_stats.py         DUMP OF SERVICE batterystats -> Estimated
+                              power use (mAh) per UID (fg/bg/fgs/cached +
+                              component breakdown). Present / wired.
+      memory.py                DUMP OF SERVICE meminfo (point-in-time RAM /
+                              ZRAM / per-process) + EVENT LOG `am_pss`
+                              samples over time. Present / wired. Does not
+                              label growth as a "leak."
+      location.py              DUMP OF SERVICE location (providers, usage,
+                              GNSS KPIs) + batterystats gps_signal_quality
+                              intervals and +gps/-gps uid history. Present /
+                              wired. Reception quality is not position error;
+                              coordinates are treated as sensitive.
+      kernel.py                KERNEL LOG ring buffer -- warning-or-worse
+                              plus panic-family signatures; boot-relative
+                              timestamps kept native (no invented wall-clock
+                              conversion). Present / wired.
+      thermal.py               dumpsys thermalservice -> overall throttling
+                              status + Current temperatures from HAL
+                              (cached block skipped to avoid double-count).
+                              Present / wired.
+      cpu.py                   dumpsys cpuinfo / top-style snapshot at
+                              capture time (point-in-time only, not a load
+                              timeseries). Present / wired.
+      pcap.py                  container-level .pcap/.pcapng summary
+                              (packet/byte counts, time range, link type,
+                              malformed/truncated counts) for direct packet
+                              uploads. Present / wired.
       packet_analysis.py       real protocol-level dissection of .pcap/
-                              .pcapng uploads -- see "Packet capture
-                              analysis" below
+                              .pcapng uploads on top of pcap.py -- see
+                              "Packet capture analysis" below. Present /
+                              wired.
     services/
       ingestion.py       wires zip -> sections -> parsers -> ParsedCapture;
                           also reads and parses tombstone/ANR files and the
@@ -150,6 +178,24 @@ frontend/               React + Vite dashboard: device info panel, stat
                          merged event timeline, and an Ask panel with a
                          per-question LLM provider dropdown
 ```
+
+### Parser inventory status (Msg8)
+
+The architecture tree above lists parsers that are **present and wired**
+into ingestion on `main` (including `battery_stats`, `cpu`, `memory`,
+`thermal`, `location`, `kernel`, `pcap`, and `packet_analysis`). It does
+**not** invent parsers that do not exist. Gaps that are still out of scope
+(for example full L2CAP/profile BT decode, or Apple `sysdiagnose`) stay
+under "Explicitly out of scope" below — those are **not yet** / never for
+this MVP, not silently omitted from the tree.
+
+## How to capture (HCI snoop + bugreport)
+
+For Bluetooth diagnosis, enable **Bluetooth HCI snoop** in Developer options
+**before** reproducing the issue, restart Bluetooth, then take a full
+**bugreport ZIP** (`adb bugreport` or Developer options → Take bug report).
+Plain logcat is usually not enough. Condensed checklist: dashboard sidebar
+**How to capture**. Full steps: [`docs/how-to-capture.md`](docs/how-to-capture.md).
 
 ## Upload formats
 
@@ -279,7 +325,7 @@ instead"), confirmed live against the real API rather than assumed.
 
 If narration fails for any reason (bad/missing key, quota, wrong
 model/endpoint), the request still returns `200` with the full verified
-fact bundle intact and `report: null` / `llm_error: "<the actual error>"` --
+fact bundle intact and `report: null` / `llm_error: "<provider error, key-like tokens redacted>"` --
 narration is a convenience layer on top of the independently-verified
 facts, never a single point of failure for them.
 

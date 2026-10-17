@@ -49,6 +49,7 @@ from app.models.db_models import (
     SelinuxDenialRow,
     TombstoneRow,
     WifiEventRow,
+    BtFrameworkEventRow,
 )
 from app.parsers.base import DeviceInfo, ParsedCapture
 
@@ -424,11 +425,17 @@ def persist_capture(
             event_code_counts_json=json.dumps(s.event_code_counts),
         ))
         for e in s.events:
+            ref = e.source_ref
             session.add(BtHciEventRow(
                 capture_id=capture.id, timestamp=e.timestamp, kind=e.kind,
                 status_code=e.status_code, status_name=e.status_name,
                 handle=e.handle, reason_code=e.reason_code, reason_name=e.reason_name,
                 opcode=e.opcode,
+                encryption_enabled=e.encryption_enabled, key_type=e.key_type,
+                source_section=ref.section if ref else None,
+                source_line_start=ref.line_start if ref else None,
+                source_line_end=ref.line_end if ref else None,
+                severity=e.severity, confidence=e.confidence,
             ))
 
     if parsed.packet_capture_summary is not None:
@@ -464,6 +471,17 @@ def persist_capture(
             source_section=w.source_ref.section,
             source_line_start=w.source_ref.line_start,
             source_line_end=w.source_ref.line_end,
+        ))
+
+    for e in parsed.bt_framework_events:
+        session.add(BtFrameworkEventRow(
+            capture_id=capture.id, timestamp=e.timestamp, kind=e.kind,
+            action=e.action, profile=e.profile, address=e.address,
+            from_state=e.from_state, to_state=e.to_state,
+            reason_code=e.reason_code, reason_name=e.reason_name, detail=e.detail,
+            source_section=e.source_ref.section,
+            source_line_start=e.source_ref.line_start,
+            source_line_end=e.source_ref.line_end,
         ))
 
     for b in parsed.battery_uid_stats:

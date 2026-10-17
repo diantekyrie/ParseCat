@@ -7,10 +7,13 @@ import {
   answerConfidence,
   flattenVerifiedFacts,
   hasVerifiedFacts,
+  narratedByExportLine,
+  narratedByLabel,
   splitNarrationSections,
 } from "./answerBands";
 import DiagnosisStory, { IdentityStrip } from "./DiagnosisStory";
 import { getAuthHeader, logoutSession, notifyUnauthorized, refreshAccessToken } from "./authSession.js";
+import HowToCapturePanel from "./HowToCapturePanel";
 
 const SEVERITY_COLOR = { critical: "var(--red)", warning: "var(--amber)", info: "var(--blue)" };
 const CONFIDENCE_COLOR = { HIGH: "var(--green)", MEDIUM: "var(--amber)", LOW: "var(--orange)", UNCONFIRMED: "var(--muted)" };
@@ -1066,7 +1069,9 @@ export default function App() {
       if (provider) form.append("provider", provider);
       appendByokFields(form);
       const data = await api(`/captures/${captureId}/scan`, { method: "POST", body: form });
-      setScanByCapture((prev) => ({ ...prev, [captureId]: data }));
+      // byok_sent is a boolean only (never the key) -- lets the narrated-by
+      // label refuse to claim Stub for a BYOK request (#84).
+      setScanByCapture((prev) => ({ ...prev, [captureId]: { ...data, byok_sent: Boolean(byokApiKey.trim()) } }));
     } catch (err) {
       setError(String(err));
     } finally {
@@ -1087,7 +1092,7 @@ export default function App() {
       if (provider) form.append("provider", provider);
       appendByokFields(form);
       const data = await api(`/captures/${captureId}/diagnose`, { method: "POST", body: form });
-      setDiagnosisByCapture((prev) => ({ ...prev, [captureId]: data }));
+      setDiagnosisByCapture((prev) => ({ ...prev, [captureId]: { ...data, byok_sent: Boolean(byokApiKey.trim()) } }));
       setFollowUpQuestion("");
     } catch (err) {
       setError(String(err));
@@ -1131,7 +1136,8 @@ export default function App() {
             followUps: [
               ...(existing.followUps || []),
               { question: askedQuestion, report: data.report, llm_error: data.llm_error,
-                provider: data.provider, bundle: data.bundle },
+                provider: data.provider, narrated_by: data.narrated_by,
+                byok_sent: Boolean(byokApiKey.trim()), bundle: data.bundle },
             ],
           },
         };
@@ -1159,7 +1165,7 @@ export default function App() {
         `/investigations/${encodeURIComponent(investigationLabel.trim())}/diagnose`,
         { method: "POST", body: form },
       );
-      setInvDiagnosis(data);
+      setInvDiagnosis({ ...data, byok_sent: Boolean(byokApiKey.trim()) });
       setInvFollowUpQuestion("");
     } catch (err) {
       setError(String(err));
@@ -1191,7 +1197,8 @@ export default function App() {
         followUps: [
           ...(existing.followUps || []),
           { question: askedQuestion, report: data.report, llm_error: data.llm_error,
-            provider: data.provider, bundle: data.bundle },
+            provider: data.provider, narrated_by: data.narrated_by,
+            byok_sent: Boolean(byokApiKey.trim()), bundle: data.bundle },
         ],
       } : existing));
       setInvFollowUpQuestion("");
@@ -1207,13 +1214,14 @@ export default function App() {
     const followUpText = (invDiagnosis.followUps || []).map((turn, i) => [
       "",
       `follow-up ${i + 1}: ${turn.question}`,
+      narratedByExportLine(turn, providers),
       turn.report || `LLM narration failed: ${turn.llm_error}`,
     ].join("\n")).join("\n");
     const report = [
       "ParseCat investigation diagnosis export",
       `investigation: ${investigationLabel}`,
       `captures: ${invDiagnosis.bundle.captures.map((c) => `#${c.capture_id} (${c.device_label})`).join(", ")}`,
-      `provider: ${invDiagnosis.provider || "auto"}`,
+      narratedByExportLine(invDiagnosis, providers),
       "",
       "question:",
       invDiagnosis.bundle.question,
@@ -1269,12 +1277,13 @@ export default function App() {
     const followUpText = (diagnosis.followUps || []).map((turn, i) => [
       "",
       `follow-up ${i + 1}: ${turn.question}`,
+      narratedByExportLine(turn, providers),
       turn.report || `LLM narration failed: ${turn.llm_error}`,
     ].join("\n")).join("\n");
     const report = [
       "ParseCat diagnosis export",
       `capture: #${selectedCaptureId}${targetCapture ? ` ${targetCapture.original_filename}` : ""}`,
-      `provider: ${diagnosis.provider || "auto"}`,
+      narratedByExportLine(diagnosis, providers),
       "",
       "question:",
       diagnosis.bundle.question,
@@ -1383,6 +1392,8 @@ export default function App() {
               {busy ? "Parsing..." : selectedFiles.length > 1 ? "Upload & parse all" : "Upload & parse"}
             </button>
           </section>
+
+          <HowToCapturePanel />
 
           <section className="panel">
             <h2>Captures for this device</h2>
@@ -1494,7 +1505,7 @@ export default function App() {
                     <NarrationBand
                       report={scan.report}
                       llmError={scan.llm_error}
-                      providerLabel={scan.provider ? (providers.find((p) => p.id === scan.provider)?.label || scan.provider) : null}
+                      providerLabel={narratedByLabel(scan, providers)}
                     />
                   </div>
                 )}
@@ -1548,7 +1559,7 @@ export default function App() {
                     <NarrationBand
                       report={diagnosis.report}
                       llmError={diagnosis.llm_error}
-                      providerLabel={diagnosis.provider ? (providers.find((p) => p.id === diagnosis.provider)?.label || diagnosis.provider) : null}
+                      providerLabel={narratedByLabel(diagnosis, providers)}
                     />
 
                     {(diagnosis.followUps || []).map((turn, i) => (
@@ -1562,7 +1573,7 @@ export default function App() {
                           deviceLabel={deviceLabel}
                         />
                         <VerifiedFromLogBand bundle={turn.bundle} />
-                        <NarrationBand report={turn.report} llmError={turn.llm_error} />
+                        <NarrationBand report={turn.report} llmError={turn.llm_error} providerLabel={narratedByLabel(turn, providers)} />
                       </div>
                     ))}
 
@@ -1646,7 +1657,7 @@ export default function App() {
                     <NarrationBand
                       report={invDiagnosis.report}
                       llmError={invDiagnosis.llm_error}
-                      providerLabel={invDiagnosis.provider ? (providers.find((p) => p.id === invDiagnosis.provider)?.label || invDiagnosis.provider) : null}
+                      providerLabel={narratedByLabel(invDiagnosis, providers)}
                     />
 
                     {(invDiagnosis.followUps || []).map((turn, i) => (
@@ -1664,7 +1675,7 @@ export default function App() {
                           }
                         />
                         <VerifiedFromLogBand bundle={turn.bundle} />
-                        <NarrationBand report={turn.report} llmError={turn.llm_error} />
+                        <NarrationBand report={turn.report} llmError={turn.llm_error} providerLabel={narratedByLabel(turn, providers)} />
                       </div>
                     ))}
 
@@ -2490,6 +2501,21 @@ export default function App() {
         .coverage-notice.coverage-gap { border-color: var(--amber); }
         .coverage-notice.coverage-ok { border-color: var(--green); }
         .coverage-notice.coverage-info { border-color: var(--blue); }
+        .how-to-capture-panel { padding-top: 10px; padding-bottom: 10px; }
+        .how-to-capture-toggle {
+          display: flex; width: 100%; align-items: center; justify-content: space-between;
+          background: transparent; border: 0; color: var(--text); font: inherit; font-weight: 600;
+          cursor: pointer; padding: 0; text-align: left;
+        }
+        .how-to-capture-toggle:hover { color: var(--blue); }
+        .how-to-capture-chevron { color: var(--muted); font-weight: 400; }
+        .how-to-capture-body { margin-top: 10px; }
+        .how-to-capture-list { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 8px; }
+        .how-to-capture-list li strong { display: block; font-size: 13px; }
+        .how-to-capture-list li p { margin: 4px 0 0; }
+        .how-to-capture-docs { margin-top: 10px; }
+        .how-to-capture-body a { color: var(--blue); }
+
         .claim-card { border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px; margin-bottom: 12px; background: #0e1420; }
         .claim-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
         .badge { color: #10131a; font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 10px; }

@@ -79,6 +79,7 @@ from app.models.db_models import (
     SelinuxDenialRow,
     TombstoneRow,
     WifiEventRow,
+    BtFrameworkEventRow,
 )
 
 
@@ -208,6 +209,9 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
     wifi_event_rows = session.exec(
         select(WifiEventRow).where(WifiEventRow.capture_id == capture_id)
     ).all()
+    bt_framework_rows = session.exec(
+        select(BtFrameworkEventRow).where(BtFrameworkEventRow.capture_id == capture_id)
+    ).all()
     process_kill_rows = session.exec(
         select(ProcessKillEventRow).where(ProcessKillEventRow.capture_id == capture_id)
     ).all()
@@ -272,18 +276,35 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
                      + (f" ({t.signal_code})" if t.signal_code else ""),
             "source": None,
         })
+    _BT_NOTABLE_KINDS = {
+        "disconnection_complete", "authentication_complete", "encryption_change",
+        "simple_pairing_complete", "change_connection_link_key_complete",
+        "link_key_request", "link_key_notification",
+    }
     for e in bt_event_rows:
-        if e.kind == "disconnection_complete" or (e.status_code and e.status_code != 0):
-            label = f"BT {e.kind.replace('_', ' ')}"
-            if e.status_name:
-                label += f": {e.status_name}"
-            if e.reason_name:
-                label += f" (reason: {e.reason_name})"
-            timeline.append({
-                "timestamp": e.timestamp, "kind": "bt_hci",
-                "severity": "warning" if (e.status_code or 0) != 0 else "info",
-                "label": label, "source": None,
-            })
+        notable = (
+            e.kind in _BT_NOTABLE_KINDS
+            or (e.status_code is not None and e.status_code != 0)
+        )
+        if not notable:
+            continue
+        label = f"BT {e.kind.replace('_', ' ')}"
+        if e.status_name:
+            label += f": {e.status_name}"
+        if e.reason_name:
+            label += f" (reason: {e.reason_name})"
+        # Prefer parser-assigned severity; fall back for rows from older captures.
+        sev = e.severity or (
+            "warning" if (e.status_code or 0) != 0 or (e.reason_code or 0) != 0 else "info"
+        )
+        timeline.append({
+            "timestamp": e.timestamp, "kind": "bt_hci",
+            "severity": sev,
+            "label": label,
+            "source": _source(e.source_section, e.source_line_start, e.source_line_end)
+            if e.source_section is not None else None,
+            "confidence": e.confidence,
+        })
     for w in wifi_event_rows:
         if w.kind == "disconnection":
             timeline.append({
@@ -358,9 +379,18 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
                     {
                         "timestamp": e.timestamp, "kind": e.kind, "status_name": e.status_name,
                         "reason_name": e.reason_name, "handle": e.handle,
+                        "encryption_enabled": e.encryption_enabled, "key_type": e.key_type,
+                        "severity": e.severity, "confidence": e.confidence,
+                        "source": _source(e.source_section, e.source_line_start, e.source_line_end)
+                        if e.source_section is not None else None,
                     }
                     for e in bt_event_rows
-                    if e.kind == "disconnection_complete" or (e.status_code or 0) != 0
+                    if e.kind in (
+                        "disconnection_complete", "authentication_complete",
+                        "encryption_change", "simple_pairing_complete",
+                        "change_connection_link_key_complete",
+                        "link_key_request", "link_key_notification",
+                    ) or (e.status_code or 0) != 0
                 ],
             } if bt_summary_row else None
         ),
@@ -485,6 +515,16 @@ def build_capture_summary(session: Session, capture_id: int) -> dict:
                 "source": _source(w.source_section, w.source_line_start, w.source_line_end),
             } for w in wifi_event_rows
         ],
+        "bt_framework_events": [
+            {
+                "timestamp": e.timestamp, "kind": e.kind, "action": e.action,
+                "profile": e.profile, "address": e.address,
+                "from_state": e.from_state, "to_state": e.to_state,
+                "reason_code": e.reason_code, "reason_name": e.reason_name,
+                "detail": e.detail,
+                "source": _source(e.source_section, e.source_line_start, e.source_line_end),
+            } for e in bt_framework_rows
+        ],
         "top_battery_consumers": [
             {
                 "package": b.package, "uid_token": b.uid_token, "total_mah": b.total_mah,
@@ -536,7 +576,7 @@ def build_merged_summary(session: Session, capture_ids: list[int]) -> dict:
     merged_counts: dict[str, int] = {}
     parse_warnings: list[str] = []
     device_infos = []
-    crash_events, tombstones, anrs, wifi_events = [], [], [], []
+    crash_events, tombstones, anrs, wifi_events, bt_framework_events = [], [], [], [], []
     selinux_denials: list[dict] = []
     process_kills: list[dict] = []
     top_battery_consumers, timeline, media_sessions, focus_stack = [], [], [], []
@@ -571,6 +611,7 @@ def build_merged_summary(session: Session, capture_ids: list[int]) -> dict:
         tombstones.extend(_tag_rows(cap["tombstones"], cid, fname))
         anrs.extend(_tag_rows(cap["anrs"], cid, fname))
         wifi_events.extend(_tag_rows(cap["wifi_events"], cid, fname))
+        bt_framework_events.extend(_tag_rows(cap.get("bt_framework_events") or [], cid, fname))
         selinux_denials.extend(_tag_rows(cap["selinux_denials"], cid, fname))
         process_kills.extend(_tag_rows(cap["process_kills"], cid, fname))
         top_battery_consumers.extend(_tag_rows(cap["top_battery_consumers"], cid, fname))
@@ -626,6 +667,7 @@ def build_merged_summary(session: Session, capture_ids: list[int]) -> dict:
         "packet_capture_summary": packet_capture_summaries,
         "packet_analysis": packet_analyses,
         "wifi_events": wifi_events,
+        "bt_framework_events": bt_framework_events,
         "selinux_denials": selinux_denials,
         "process_kills": process_kills,
         "top_battery_consumers": top_battery_consumers[:15],

@@ -151,13 +151,14 @@ def test_run_llm_prefers_byok_over_the_provider_dropdown(monkeypatch):
     monkeypatch.setattr(reasoning, "get_byok_client", get_byok_mock)
     monkeypatch.setattr(reasoning, "get_llm_client", get_llm_mock)
 
-    report, llm_error = reasoning._run_llm(
+    report, llm_error, narrated_by = reasoning._run_llm(
         {"question": "test"}, "system prompt", provider="anthropic",
         byok_api_key="visitor-key", byok_model="some/model",
     )
 
     assert report == "byok report"
     assert llm_error is None
+    assert narrated_by == "openrouter-byok"
     get_byok_mock.assert_called_once_with("anthropic", "visitor-key", "some/model")
     get_llm_mock.assert_not_called()
 
@@ -170,10 +171,11 @@ def test_run_llm_falls_back_to_provider_dispatch_without_a_byok_key(monkeypatch)
     monkeypatch.setattr(reasoning, "get_byok_client", get_byok_mock)
     monkeypatch.setattr(reasoning, "get_llm_client", get_llm_mock)
 
-    report, llm_error = reasoning._run_llm({"question": "test"}, "system prompt", provider=None)
+    report, llm_error, narrated_by = reasoning._run_llm({"question": "test"}, "system prompt", provider=None)
 
     assert report == "stub report"
     assert llm_error is None
+    assert narrated_by == "stub"  # no egress/keys -> auto-detect resolves to stub
     get_llm_mock.assert_called_once_with(None)
     get_byok_mock.assert_not_called()
 
@@ -189,7 +191,7 @@ def test_run_llm_treats_whitespace_only_byok_key_as_absent(monkeypatch):
     monkeypatch.setattr(reasoning, "get_byok_client", get_byok_mock)
     monkeypatch.setattr(reasoning, "get_llm_client", get_llm_mock)
 
-    report, llm_error = reasoning._run_llm(
+    report, llm_error, narrated_by = reasoning._run_llm(
         {"question": "test"}, "system prompt", provider=None, byok_api_key="   ",
     )
 
@@ -204,10 +206,11 @@ def test_run_llm_degrades_gracefully_when_byok_gate_is_closed():
     # "narration failed" (bundle/facts still returned by the caller), never
     # an unhandled exception -- same degrade-on-provider-error contract
     # _run_llm already has for a bad key or a provider outage.
-    report, llm_error = reasoning._run_llm(
+    report, llm_error, narrated_by = reasoning._run_llm(
         {"question": "test"}, "system prompt", provider=None,
         byok_api_key="visitor-key-123",
     )
     assert report is None
     assert llm_error is not None
     assert "BYOK is disabled" in llm_error
+    assert narrated_by is None  # nothing narrated -> no source label

@@ -121,10 +121,11 @@ def test_run_llm_redacts_key_and_key_like_tokens_directly(monkeypatch):
             )
 
     monkeypatch.setattr(reasoning, "get_byok_client", lambda key, model=None: _Raiser())
-    report, llm_error = reasoning._run_llm(
+    report, llm_error, narrated_by = reasoning._run_llm(
         {"question": "t"}, "sys", provider=None, byok_api_key=DUMMY_KEY,
     )
     assert report is None
+    assert narrated_by is None  # nothing was narrated -- the call raised
     for needle in (*FORBIDDEN, "sk-ant-api03-XYZxyz123456"):
         assert needle not in llm_error
     assert "401" in llm_error

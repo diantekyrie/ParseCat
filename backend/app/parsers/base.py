@@ -363,21 +363,43 @@ class BtHciEvent:
     verified against real bytes to be the classic btsnoop binary format,
     not the compressed bugreport-inline "btsnooz" variant). Only the
     diagnostically load-bearing event types are decoded per-record
-    (connection/disconnection complete, command complete/status, LE
-    connection complete); everything else is counted in
-    BtHciSummary.event_code_counts without per-record decoding.
+    (connection/disconnection/auth/encryption/link-key/pairing complete,
+    command complete/status, LE connection complete); everything else is
+    counted in BtHciSummary.event_code_counts without per-record decoding.
+
+    SourceRef uses section "bt_hci" and 1-indexed btsnoop record index as
+    line_start/line_end (binary log -- there is no text line number).
+    severity and confidence are assigned in the parser (code-owned), never
+    by an LLM. Link-key bytes and BD_ADDR are never stored on this fact.
     """
 
     timestamp: str          # ISO-ish UTC, converted from the btsnoop 64-bit epoch
-    kind: str                # "disconnection_complete" | "connection_complete" |
-                              # "command_complete" | "command_status" |
-                              # "le_connection_complete"
+    kind: str                # see bt_hci.py EVT_* decoders for the allowed set
     status_code: Optional[int]
-    status_name: Optional[str]     # human label from the HCI status code table, or None if unmapped
+    status_name: Optional[str]     # HCI status table label, or Unknown (0xNN)
     handle: Optional[int]
     reason_code: Optional[int]      # disconnection reason, same code table as status
     reason_name: Optional[str]
     opcode: Optional[int]           # command opcode, for command_complete/command_status
+    encryption_enabled: Optional[int] = None  # Encryption Change only; None otherwise
+    key_type: Optional[int] = None            # Link Key Notification only; None otherwise
+    source_ref: Optional[SourceRef] = None
+    severity: Optional[str] = None            # "info" | "warning" | "critical"
+    confidence: Optional[str] = None          # "HIGH" | "MEDIUM" | "LOW" | "UNCONFIRMED"
+
+
+@dataclass
+class BtHciHandleFailureSequence:
+    """Decoded events sharing one connection handle that include at least one
+    non-success status (or auth/pairing/encrypt failure) and end in
+    disconnection_complete. Derived from BtHciEvent list; not a separate
+    wire decode.
+    """
+
+    handle: int
+    disconnect_reason_code: Optional[int]
+    disconnect_reason_name: Optional[str]
+    events: list[BtHciEvent] = field(default_factory=list)
 
 
 @dataclass
@@ -392,6 +414,7 @@ class BtHciSummary:
     last_timestamp: Optional[str]
     event_code_counts: dict          # {hex event code string: count}
     events: list[BtHciEvent] = field(default_factory=list)  # only the decoded high-value ones
+    handle_failure_sequences: list[BtHciHandleFailureSequence] = field(default_factory=list)
 
 
 @dataclass

@@ -516,15 +516,18 @@ class PacketAnalysis:
 class WifiEvent:
     """One decoded event from `DUMP OF SERVICE wifi` -> WifiController's
     state-machine transition log (`rec[N]: time=... what=EVENT_NAME ...`).
-    Only the diagnostically load-bearing event types are decoded
-    (disconnection with 802.11 reason code, BSSID association/roam);
-    the state machine log has many other "what=" event types not parsed
-    here (e.g. CMD_UPDATE_AP_CAPABILITY, screen state) since they carry no
-    connectivity-failure signal.
+    Load-bearing types: disconnection (802.11 reason), association/roam,
+    supplicant_state, network_connection, and dhcp / ip_provisioning /
+    ip_configuration. Other what= types are skipped.
+    For kind=supplicant_state, reason_name holds the SupplicantState token
+    (or Unknown (TOKEN)). For dhcp/ip_* kinds, reason_name holds the outcome
+    label (e.g. success / pre_dhcp_action).
     """
 
     timestamp: str
-    kind: str                 # "disconnection" | "association"
+    kind: str                 # "disconnection" | "association" | "supplicant_state" |
+                              # "network_connection" | "dhcp" | "ip_provisioning" |
+                              # "ip_configuration"
     ssid: Optional[str]
     bssid: Optional[str]
     reason_code: Optional[int]        # 802.11 reason code, disconnection only
@@ -836,6 +839,29 @@ class CompanionDeviceAssociation:
 
 
 @dataclass
+class BtFrameworkEvent:
+    """One decoded fact from `DUMP OF SERVICE bluetooth_manager` (framework
+    BT text — not HCI binary). Adapter enable / adapter SM, ACL connection
+    events, bond-state changes, and profile connection-state changes from
+    BluetoothActiveDeviceManager. Invent-nothing: unknown disconnect reason
+    codes and unknown bond/adapter tokens stay Unknown / raw as printed.
+    """
+
+    timestamp: str
+    kind: str                 # "adapter_enable" | "adapter_state" | "connection" |
+                              # "bond" | "profile_connection"
+    action: Optional[str]     # CONNECTED/DISCONNECTED, Enable, BLE_TURN_ON, ...
+    profile: Optional[str]    # HEADSET / LE_AUDIO / ... for profile_connection
+    address: Optional[str]    # BD_ADDR as printed (synthetic in fixtures)
+    from_state: Optional[str]
+    to_state: Optional[str]
+    reason_code: Optional[int]
+    reason_name: Optional[str]
+    detail: str
+    source_ref: SourceRef
+
+
+@dataclass
 class ParsedCapture:
     """Everything a capture's ingestion pipeline produced, ground-truth facts only."""
 
@@ -856,6 +882,7 @@ class ParsedCapture:
     packet_capture_summary: Optional[PacketCaptureSummary] = None
     packet_analysis: Optional[PacketAnalysis] = None
     wifi_events: list[WifiEvent] = field(default_factory=list)
+    bt_framework_events: list[BtFrameworkEvent] = field(default_factory=list)
     battery_uid_stats: list[BatteryUidStats] = field(default_factory=list)
     cdm_pairing_events: list[CdmPairingEvent] = field(default_factory=list)
     companion_device_associations: list[CompanionDeviceAssociation] = field(default_factory=list)

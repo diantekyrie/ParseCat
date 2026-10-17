@@ -63,3 +63,48 @@ export function splitNarrationSections(reportText) {
     nextSteps: reportText.slice(match.index + match[0].length).trim(),
   };
 }
+
+/** "Narrated by" source label (#84).
+ *
+ * The backend echoes the REQUESTED `provider` (e.g. "stub" from the
+ * dropdown) but a BYOK key overrides it, so that echo must never be used as
+ * the source label when `narrated_by` (the provider that actually ran) is
+ * available. Rules:
+ *   - `narrated_by` present and non-empty -> label for that id
+ *     ("openrouter-byok" -> "OpenRouter (your key)").
+ *   - `narrated_by` present but null -> no label (narration failed or the
+ *     backend could not resolve what ran) rather than a guessed one.
+ *   - `narrated_by` absent (older backend) -> fall back to `provider`, but
+ *     only when this request did not carry a BYOK key (`byok_sent`), since
+ *     then `provider` is not what ran.
+ *   - A BYOK request never gets the Stub label.
+ */
+export const BYOK_PROVIDER_ID = "openrouter-byok";
+export const BYOK_PROVIDER_LABEL = "OpenRouter (your key)";
+export const UNKNOWN_NARRATOR_EXPORT = "unknown (no narration, or source not reported)";
+
+function labelForId(id, providers) {
+  if (id === BYOK_PROVIDER_ID) return BYOK_PROVIDER_LABEL;
+  const match = (providers || []).find((p) => p && p.id === id);
+  return (match && match.label) || id;
+}
+
+export function narratedByLabel(result, providers = []) {
+  if (!result || typeof result !== "object") return null;
+  const byokSent = result.byok_sent === true;
+  let id;
+  if (Object.prototype.hasOwnProperty.call(result, "narrated_by")) {
+    id = result.narrated_by;
+  } else {
+    id = byokSent ? null : result.provider;
+  }
+  if (typeof id !== "string" || !id) return null;
+  if (byokSent && id === "stub") return null;
+  return labelForId(id, providers);
+}
+
+/** Export header line; uses the same rules so an export can't claim Stub
+ * over live text. */
+export function narratedByExportLine(result, providers = []) {
+  return `narrated by: ${narratedByLabel(result, providers) || UNKNOWN_NARRATOR_EXPORT}`;
+}

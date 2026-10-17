@@ -17,7 +17,7 @@ from sqlmodel import Session
 
 from sqlmodel import select
 
-from app.llm import get_byok_client, get_llm_client
+from app.llm import BYOK_PROVIDER_ID, get_byok_client, get_llm_client, resolve_provider_id
 from app.models.db_models import (
     AnrBlockingThreadRow,
     AnrMainThreadSnapshotRow,
@@ -1706,10 +1706,15 @@ def scan_capture(
     bundle["scan"] = True
     # Re-attach after ranked_findings so scan findings feed verified_facts.
     attach_verified_facts(bundle)
-    report_text, llm_error = _run_llm(
+    report_text, llm_error, narrated_by = _run_llm(
         bundle, SCAN_SYSTEM_PROMPT, provider, byok_api_key=byok_api_key, byok_model=byok_model,
     )
-    return {"bundle": bundle, "report": report_text, "llm_error": llm_error, "provider": provider}
+    return {
+        "bundle": bundle, "report": report_text, "llm_error": llm_error,
+        # `provider` echoes the request (contract: test_api_user_flows);
+        # `narrated_by` is what actually ran (#84).
+        "provider": provider, "narrated_by": narrated_by,
+    }
 
 
 def _format_history(history: list[dict] | None) -> str:
@@ -1736,7 +1741,17 @@ def _format_history(history: list[dict] | None) -> str:
 def _run_llm(
     bundle: dict, system_prompt: str, provider: str | None, history: list[dict] | None = None,
     byok_api_key: str | None = None, byok_model: str | None = None,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None]:
+    """Returns (report_text, llm_error, narrated_by).
+
+    `narrated_by` is the provider id that actually produced report_text
+    (#84) -- BYOK_PROVIDER_ID when a visitor key ran, else the id
+    get_llm_client resolved (including auto-detect for provider=None). It
+    is always a fixed id from app.llm, never the key, a key prefix, the
+    visitor's model string, or the echoed request `provider`. None when
+    narration failed (nothing was narrated) or the id can't be resolved,
+    so the UI shows no source label rather than a wrong one.
+    """
     user_prompt = (
         _format_history(history) +
         "Verified fact bundle (JSON):\n\n" + json.dumps(bundle, indent=2, default=str) +
@@ -1752,14 +1767,19 @@ def _run_llm(
         # see get_byok_client for why this is a distinct consent path, not
         # a bypass of the operator's own egress gate (and why it's gated
         # off by default via BYOK_ENV).
-        llm = get_byok_client(byok_key, byok_model) if byok_key else get_llm_client(provider)
-        return llm.narrate(system_prompt, user_prompt), None
+        if byok_key:
+            llm = get_byok_client(byok_key, byok_model)
+            narrated_by = BYOK_PROVIDER_ID
+        else:
+            llm = get_llm_client(provider)
+            narrated_by = resolve_provider_id(provider)
+        return llm.narrate(system_prompt, user_prompt), None, narrated_by
     except Exception as exc:  # noqa: BLE001 -- LLM narration is a convenience
         # layer on top of already-computed, independently verified facts.
         # A provider outage, quota error, or bad key should degrade to
         # "here are the facts, narration failed" -- never a 500 that hides
         # the verification work that already succeeded.
-        return None, str(exc)
+        return None, str(exc), None
 
 
 def diagnose(
@@ -1768,10 +1788,15 @@ def diagnose(
     byok_api_key: str | None = None, byok_model: str | None = None,
 ) -> dict:
     bundle = build_diagnosis_bundle(session, capture_id, device_label, question)
-    report_text, llm_error = _run_llm(
+    report_text, llm_error, narrated_by = _run_llm(
         bundle, SYSTEM_PROMPT, provider, history, byok_api_key=byok_api_key, byok_model=byok_model,
     )
-    return {"bundle": bundle, "report": report_text, "llm_error": llm_error, "provider": provider}
+    return {
+        "bundle": bundle, "report": report_text, "llm_error": llm_error,
+        # `provider` echoes the request (contract: test_api_user_flows);
+        # `narrated_by` is what actually ran (#84).
+        "provider": provider, "narrated_by": narrated_by,
+    }
 
 
 INVESTIGATION_SYSTEM_PROMPT = SYSTEM_PROMPT + """
@@ -1835,8 +1860,13 @@ def diagnose_investigation(
 
     bundle = {"question": question, "captures": captures_bundle}
     attach_verified_facts(bundle)
-    report_text, llm_error = _run_llm(
+    report_text, llm_error, narrated_by = _run_llm(
         bundle, INVESTIGATION_SYSTEM_PROMPT, provider, history,
         byok_api_key=byok_api_key, byok_model=byok_model,
     )
-    return {"bundle": bundle, "report": report_text, "llm_error": llm_error, "provider": provider}
+    return {
+        "bundle": bundle, "report": report_text, "llm_error": llm_error,
+        # `provider` echoes the request (contract: test_api_user_flows);
+        # `narrated_by` is what actually ran (#84).
+        "provider": provider, "narrated_by": narrated_by,
+    }

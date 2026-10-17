@@ -1738,6 +1738,31 @@ def _format_history(history: list[dict] | None) -> str:
     )
 
 
+# Best-effort redaction for `llm_error` (which goes straight to the UI).
+# `_redact_llm_error` strips: the supplied BYOK key and its first 8 chars;
+# any "sk-..." token (full OpenRouter/OpenAI/Anthropic-style keys, bare
+# prefixes like "sk-or-v1", masked forms like "sk-or-...abcd"); and any
+# opaque run of 32+ chars (which can also hide long model/request ids).
+# The regex runs before the literal key/prefix swap so a truncated echo
+# ("sk-or-v1-0123456789a...") is consumed whole, not split at char 8.
+# NOT covered: masked non-"sk-"
+# keys such as "AIza...wxyz", and a bare masked last-4 ("...abcd",
+# "key ending abcd"). A last-4 alone is not usable as a key.
+_KEY_LIKE_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_.\-]*|(?<![A-Za-z0-9])[A-Za-z0-9_\-]{32,}")
+
+
+def _redact_llm_error(message: str, key: str | None) -> str:
+    """Strip key material from a provider exception's text before it is
+    returned as `llm_error`. Keeps the rest (e.g. "Error code: 401") so the
+    visitor still gets a useful status class. Never log the raw message."""
+    message = _KEY_LIKE_RE.sub("[redacted]", message)
+    if key:
+        for fragment in sorted({key, key[:8]}, key=len, reverse=True):
+            if len(fragment) >= 4:
+                message = message.replace(fragment, "[redacted]")
+    return message
+
+
 def _run_llm(
     bundle: dict, system_prompt: str, provider: str | None, history: list[dict] | None = None,
     byok_api_key: str | None = None, byok_model: str | None = None,
@@ -1757,6 +1782,7 @@ def _run_llm(
         "Verified fact bundle (JSON):\n\n" + json.dumps(bundle, indent=2, default=str) +
         "\n\nWrite a diagnosis report answering the question above using only these facts."
     )
+    byok_key = ""
     try:
         # .strip() before the truthiness check: the frontend trims before
         # sending, but a raw Form POST (or a future non-browser client)
@@ -1778,8 +1804,10 @@ def _run_llm(
         # layer on top of already-computed, independently verified facts.
         # A provider outage, quota error, or bad key should degrade to
         # "here are the facts, narration failed" -- never a 500 that hides
-        # the verification work that already succeeded.
-        return None, str(exc), None
+        # the verification work that already succeeded. The message is
+        # redacted (a provider 401 can echo the key) and deliberately not
+        # logged server-side. narrated_by is None -- nothing was narrated.
+        return None, _redact_llm_error(str(exc), byok_key or None), None
 
 
 def diagnose(

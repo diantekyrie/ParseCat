@@ -28,23 +28,25 @@ HCI_EGGBOT_FILLED = {
     0x24: "LMP PDU Not Allowed",
 }
 
-# IEEE 802.11 reason codes (Eggbot gap fill). 12 and 25-31 are reserved.
+# IEEE 802.11 reason codes (Eggbot gap fill). 12 and 25-31 are assigned
+# (hostapd WLAN_REASON_BSS_TRANSITION_DISASSOC, TDLS_*, SSP_*, BAD_CIPHER_OR_AKM,
+# NOT_AUTHORIZED_THIS_LOCATION, SERVICE_CHANGE_PRECLUDES_TS), not reserved.
 WIFI_EGGBOT_FILLED = {
     10: "Disassociated: unacceptable Power Capability element",
     11: "Disassociated: unacceptable Supported Channels element",
-    12: "Reserved",
+    12: "Disassociated due to BSS transition management",
     13: "Invalid information element",
     14: "Message integrity code (MIC) failure",
     21: "Unsupported RSN information element version",
     22: "Invalid RSN information element capabilities",
     24: "Cipher suite rejected because of security policy",
-    25: "Reserved",
-    26: "Reserved",
-    27: "Reserved",
-    28: "Reserved",
-    29: "Reserved",
-    30: "Reserved",
-    31: "Reserved",
+    25: "TDLS teardown: peer unreachable via the TDLS direct link",
+    26: "TDLS teardown: unspecified reason",
+    27: "Disassociated: session terminated by SSP request",
+    28: "Disassociated: lack of SSP roaming agreement",
+    29: "Service rejected: SSP cipher suite or AKM requirement",
+    30: "Service not authorized in this location",
+    31: "TS deleted: QoS AP lacks bandwidth after BSS service change",
     32: "Disassociated for unspecified QoS-related reason",
     33: "Disassociated: QoS AP lacks sufficient bandwidth",
 }
@@ -75,6 +77,14 @@ def test_wifi_reason_unknown_stays_unknown():
     # 99 is outside the commonly assigned reason-code range; leave Unknown.
     assert 99 not in REASON_CODE_NAMES
     assert _reason_name(99) == "Unknown (802.11 reason 99)"
+
+
+def test_wifi_assigned_reasons_never_labeled_reserved():
+    # Regression (Arch review on #72): 1-34 are all assigned in 802.11-2012+.
+    # Only code 0 may carry the "Reserved/unspecified" label.
+    for code in range(1, 35):
+        name = _reason_name(code)
+        assert "reserved" not in name.lower(), (code, name)
 
 
 def test_hci_preexisting_fixture_codes_unchanged():

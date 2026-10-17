@@ -63,6 +63,12 @@ backend/
                               disconnection/command complete/status events
                               with HCI status-code names from the Bluetooth
                               Core Spec
+      bt_framework.py          Android framework Bluetooth dumpsys text
+                              (DUMP OF SERVICE bluetooth_manager) —
+                              adapter enable / adapter state machine,
+                              ACL Connection Events, Bond Events, and
+                              profile connection-state changes from
+                              BluetoothActiveDeviceManager
       wifi.py                 DUMP OF SERVICE wifi -> WifiController/
                               ClientModeImpl state machine log: Wi-Fi
                               disconnection events with IEEE 802.11 reason
@@ -98,35 +104,33 @@ backend/
                               two genuinely overlap
       battery_stats.py         DUMP OF SERVICE batterystats -> Estimated
                               power use (mAh) per UID (fg/bg/fgs/cached +
-                              component breakdown). Present / wired.
+                              component breakdown).
       memory.py                DUMP OF SERVICE meminfo (point-in-time RAM /
                               ZRAM / per-process) + EVENT LOG `am_pss`
-                              samples over time. Present / wired. Does not
+                              samples over time. Does not
                               label growth as a "leak."
       location.py              DUMP OF SERVICE location (providers, usage,
                               GNSS KPIs) + batterystats gps_signal_quality
-                              intervals and +gps/-gps uid history. Present /
-                              wired. Reception quality is not position error;
+                              intervals and +gps/-gps uid history. Reception
+                              quality is not position error;
                               coordinates are treated as sensitive.
       kernel.py                KERNEL LOG ring buffer -- warning-or-worse
                               plus panic-family signatures; boot-relative
                               timestamps kept native (no invented wall-clock
-                              conversion). Present / wired.
+                              conversion).
       thermal.py               dumpsys thermalservice -> overall throttling
                               status + Current temperatures from HAL
                               (cached block skipped to avoid double-count).
-                              Present / wired.
       cpu.py                   dumpsys cpuinfo / top-style snapshot at
                               capture time (point-in-time only, not a load
-                              timeseries). Present / wired.
+                              timeseries).
       pcap.py                  container-level .pcap/.pcapng summary
                               (packet/byte counts, time range, link type,
                               malformed/truncated counts) for direct packet
-                              uploads. Present / wired.
+                              uploads.
       packet_analysis.py       real protocol-level dissection of .pcap/
                               .pcapng uploads on top of pcap.py -- see
-                              "Packet capture analysis" below. Present /
-                              wired.
+                              "Packet capture analysis" below.
     services/
       ingestion.py       wires zip -> sections -> parsers -> ParsedCapture;
                           also reads and parses tombstone/ANR files and the
@@ -179,15 +183,15 @@ frontend/               React + Vite dashboard: device info panel, stat
                          per-question LLM provider dropdown
 ```
 
-### Parser inventory status (Msg8)
+### Parser inventory status
 
 The architecture tree above lists parsers that are **present and wired**
-into ingestion on `main` (including `battery_stats`, `cpu`, `memory`,
-`thermal`, `location`, `kernel`, `pcap`, and `packet_analysis`). It does
-**not** invent parsers that do not exist. Gaps that are still out of scope
-(for example full L2CAP/profile BT decode, or Apple `sysdiagnose`) stay
-under "Explicitly out of scope" below — those are **not yet** / never for
-this MVP, not silently omitted from the tree.
+into ingestion on `main` (including `battery_stats`, `bt_framework`, `cpu`,
+`memory`, `thermal`, `location`, `kernel`, `pcap`, and `packet_analysis`).
+It does **not** invent parsers that do not exist. Gaps that are still out
+of scope (for example full L2CAP/profile BT decode, or Apple `sysdiagnose`)
+stay under "Explicitly out of scope" below. They're out of scope for this
+MVP, not silently left out of the tree.
 
 ## How to capture (HCI snoop + bugreport)
 

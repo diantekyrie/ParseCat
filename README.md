@@ -189,6 +189,14 @@ into ingestion on `main` (including `battery_stats`, `cpu`, `memory`,
 under "Explicitly out of scope" below — those are **not yet** / never for
 this MVP, not silently omitted from the tree.
 
+## How to capture (HCI snoop + bugreport)
+
+For Bluetooth diagnosis, enable **Bluetooth HCI snoop** in Developer options
+**before** reproducing the issue, restart Bluetooth, then take a full
+**bugreport ZIP** (`adb bugreport` or Developer options → Take bug report).
+Plain logcat is usually not enough. Condensed checklist: dashboard sidebar
+**How to capture**. Full steps: [`docs/how-to-capture.md`](docs/how-to-capture.md).
+
 ## Upload formats
 
 The local dashboard accepts three upload types:

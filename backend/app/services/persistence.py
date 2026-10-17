@@ -49,6 +49,7 @@ from app.models.db_models import (
     SelinuxDenialRow,
     TombstoneRow,
     WifiEventRow,
+    BtFrameworkEventRow,
 )
 from app.parsers.base import DeviceInfo, ParsedCapture
 
@@ -448,6 +449,17 @@ def persist_capture(
             source_section=w.source_ref.section,
             source_line_start=w.source_ref.line_start,
             source_line_end=w.source_ref.line_end,
+        ))
+
+    for e in parsed.bt_framework_events:
+        session.add(BtFrameworkEventRow(
+            capture_id=capture.id, timestamp=e.timestamp, kind=e.kind,
+            action=e.action, profile=e.profile, address=e.address,
+            from_state=e.from_state, to_state=e.to_state,
+            reason_code=e.reason_code, reason_name=e.reason_name, detail=e.detail,
+            source_section=e.source_ref.section,
+            source_line_start=e.source_ref.line_start,
+            source_line_end=e.source_ref.line_end,
         ))
 
     for b in parsed.battery_uid_stats:

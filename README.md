@@ -441,7 +441,9 @@ pytest -q
 ## Bluetooth / Wi-Fi: what's decoded vs. not
 
 `bt_hci.py` decodes the diagnostically load-bearing HCI event types per-record
-(Connection Complete, Disconnection Complete, Command Complete, Command
+(Connection Complete, Disconnection Complete, Authentication Complete,
+Encryption Change, Change Connection Link Key Complete, Link Key Request,
+Link Key Notification, Simple Pairing Complete, Command Complete, Command
 Status, LE Connection Complete), with HCI status/reason codes named from the
 Bluetooth Core Spec. Everything else is counted by event code
 (`event_code_counts`) without per-record decoding -- this is HCI-framing-level

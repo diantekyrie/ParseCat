@@ -378,6 +378,24 @@ const BYOK_PROVIDERS = [
 ];
 const BYOK_PROVIDER_ID_SET = new Set(BYOK_PROVIDERS.map((p) => p.id));
 
+// Issue #87: the "Narrated by" dropdown used to read ONLY p.available/
+// p.disabled_reason from GET /api/llm/providers, which reflects the
+// OPERATOR's own server-env key -- it had no idea a user had saved their
+// own BYOK key for that provider, so it kept showing "(no key set)" and
+// disabling the option even though Settings correctly said "Saved to your
+// account" and the backend (_resolve_byok) would actually use it. A saved
+// BYOK key always wins over the operator's key when both exist (see
+// _resolve_byok), so these two helpers check byokStatus FIRST.
+function providerOptionLabel(p, byokStatus) {
+  if (byokStatus?.[p.id]?.configured) return `${p.label} (your key)`;
+  if (p.available) return p.label;
+  return `${p.label}${p.disabled_reason === "egress_gated" ? " (third-party send disabled)" : " (no key set)"}`;
+}
+
+function providerOptionDisabled(p, byokStatus) {
+  return !p.available && !byokStatus?.[p.id]?.configured;
+}
+
 function ByokProviderCard({
   providerId, label, keyHint, modelPlaceholder,
   status, draft, setDraftApiKey, setDraftModel,
@@ -1498,8 +1516,8 @@ export default function App() {
                       Narrated by
                       <select value={provider} onChange={(e) => setProvider(e.target.value)}>
                         {providers.map((p) => (
-                          <option key={p.id} value={p.id} disabled={!p.available}>
-                            {p.label}{!p.available ? (p.disabled_reason === "egress_gated" ? " (third-party send disabled)" : " (no key set)") : ""}
+                          <option key={p.id} value={p.id} disabled={providerOptionDisabled(p, byokStatus)}>
+                            {providerOptionLabel(p, byokStatus)}
                           </option>
                         ))}
                       </select>
@@ -1587,8 +1605,8 @@ export default function App() {
                       Narrated by
                       <select value={provider} onChange={(e) => setProvider(e.target.value)}>
                         {providers.map((p) => (
-                          <option key={p.id} value={p.id} disabled={!p.available}>
-                            {p.label}{!p.available ? (p.disabled_reason === "egress_gated" ? " (third-party send disabled)" : " (no key set)") : ""}
+                          <option key={p.id} value={p.id} disabled={providerOptionDisabled(p, byokStatus)}>
+                            {providerOptionLabel(p, byokStatus)}
                           </option>
                         ))}
                       </select>

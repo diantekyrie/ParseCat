@@ -12,7 +12,8 @@ Scope, deliberately narrow:
 Patterns are conservative by design: a missed bare number is preferable to
 mangling a timestamp, PID, hex address, MAC, version string or build
 fingerprint that diagnosis depends on. Known false negatives are listed in
-the PR security note (bare 10-digit phone numbers, unformatted bare
+the PR security note (bare 10-digit phone numbers, space-grouped phone
+numbers without a phone keyword or tel: anchor, unformatted bare
 15-digit IMEIs and IMSI / ICCID / MEID without a keyword, non-email account names outside the Account{} form, lower-case
 multi-word unquoted account_name= values).
 
@@ -94,14 +95,31 @@ _IMEI_DEVICE_ID_RE = re.compile(
 )
 
 
-# Phones. E.164 needs a leading '+'; NANP needs separators (so bare 10-digit
-# runs -- epoch seconds, byte counts -- are left alone) and valid area /
-# exchange first digits [2-9].
+# Phones. Plain spaces are NOT a separator on their own: kernel / dumpsys
+# free text is full of space-separated numeric columns (meminfo, LMK
+# thresholds, dimensions, latencies) such as `800 600 1080 1920` or
+# `+100 200 300 4000`, and mangling those destroys diagnostic numbers.
+#   * E.164 without a keyword: '+' then digits, optionally '-'-grouped.
+#   * NANP without a keyword: valid [2-9] area / exchange digits and either
+#     a parenthesized area code or one consistent '-' / '.' separator, so
+#     bare 10-digit runs (epoch seconds, byte counts) stay put.
+#   * Space-grouped forms only when a phone keyword or `tel:` anchors them.
 _E164_RE = re.compile(
-    _NB + r"\+[1-9]\d{0,2}(?:[ -]?\(?\d{1,4}\)?){2,5}" + _NA
+    _NB + r"\+[1-9]\d{0,2}(?:-?\(?\d{1,4}\)?){2,5}" + _NA
 )
 _NANP_RE = re.compile(
-    _NB + r"(?:\+?1[ .-])?(?:\([2-9]\d{2}\)\s?|[2-9]\d{2}[ .-])[2-9]\d{2}[ .-]\d{4}" + _NA
+    _NB + r"(?:\+?1[ .-])?"
+    r"(?:\([2-9]\d{2}\)\s?[2-9]\d{2}[ .-]\d{4}|[2-9]\d{2}([.-])[2-9]\d{2}\1\d{4})"
+    + _NA
+)
+# Keyword-anchored phone: the keyword makes the space-grouped forms safe.
+# `number` alone is too generic, so it only counts with an `=` / `:`.
+_PHONE_KV_RE = re.compile(
+    r"\b((?:phone_?(?:number)?|phoneNumber|telephone|tel|msisdn|mobile|cell(?:phone)?"
+    r"|caller(?:_?id)?|callerId|callee|line1_?number|line1Number)\s*[=:]?\s*"
+    r"|number\s*[=:]\s*)"
+    r"(\+?\(?\d[\d ().-]{6,}\d)" + _NA,
+    re.IGNORECASE,
 )
 _TEL_URI_RE = re.compile(r"\btel:\+?[\d().-]{7,}", re.IGNORECASE)
 
@@ -125,6 +143,13 @@ def _e164_sub(m: re.Match) -> str:
     # plans, an accepted false negative.
     if 10 <= len(digits) <= 15:
         return PHONE_TOKEN
+    return m.group(0)
+
+
+def _phone_kv_sub(m: re.Match) -> str:
+    digits = re.sub(r"\D", "", m.group(2))
+    if 10 <= len(digits) <= 15:
+        return m.group(1) + PHONE_TOKEN
     return m.group(0)
 
 
@@ -154,6 +179,7 @@ def redact_pii(text: Optional[str]) -> Optional[str]:
     out = _IMEI_DEVICE_ID_RE.sub(_device_id_sub, out)
     out = _EMAIL_RE.sub(_email_sub, out)
     out = _IMEI_SEP_RE.sub(_imei_sep_sub, out)
+    out = _PHONE_KV_RE.sub(_phone_kv_sub, out)
     out = _TEL_URI_RE.sub("tel:" + PHONE_TOKEN, out)
     out = _NANP_RE.sub(PHONE_TOKEN, out)
     out = _E164_RE.sub(_e164_sub, out)

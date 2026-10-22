@@ -36,7 +36,13 @@ from app.services.pii_redaction import (
     ("callback 415.555.0142.", "415.555.0142", PHONE_TOKEN),
     ("number=+1 202-555-0147 state=RINGING", "+1 202-555-0147", PHONE_TOKEN),
     ("msisdn +14155550123 ok", "+14155550123", PHONE_TOKEN),
-    ("uk +44 20 7946 0958 ok", "+44 20 7946 0958", PHONE_TOKEN),
+    # space-grouped forms need a phone keyword or tel: anchor (see negatives)
+    ("phone +44 20 7946 0958 ok", "+44 20 7946 0958", PHONE_TOKEN),
+    ("phoneNumber=415 555 0123", "415 555 0123", PHONE_TOKEN),
+    ("caller (415) 555 0188 ringing", "555 0188", PHONE_TOKEN),
+    ("uri tel:+1 415 555 0166", "415 555 0166", PHONE_TOKEN),
+    ("intl +4420-7946-0958 ok", "+4420-7946-0958", PHONE_TOKEN),
+    ("home +1 (415) 555-0155", "555-0155", PHONE_TOKEN),
     ("uri tel:+1-415-555-0177", "415-555-0177", PHONE_TOKEN),
     ("device 49-015420-323751-8 registered", "49-015420-323751-8", IMEI_TOKEN),
     ("deviceId=490154203237518 ok", "490154203237518", IMEI_TOKEN),
@@ -106,6 +112,14 @@ def test_idempotent_and_none_passthrough():
     # IPs and sizes
     "dhcp lease 192.168.1.23 gw 192.168.1.1",
     "allocated 1048576 bytes, rss 2147483648",
+    # space-separated numeric columns (meminfo, LMK, dimensions, latencies)
+    # must not be read as NANP / E.164 phones without a keyword (Arch, PR #96)
+    "dims 800 600 1080 1920",
+    "sizes 212 555 1234 bytes",
+    "latency +100 200 300 4000",
+    "offset +1 234 567 8901",
+    "lmk minfree 18432 23040 27648 32256 55296 80640",
+    "phone state 0 1 2",
     # bare 15-digit runs are never IMEI-redacted without a keyword/format,
     # even when Luhn-valid (real capture: kernel ns timestamp passed Luhn)
     "counter 123456789012345 ticks",

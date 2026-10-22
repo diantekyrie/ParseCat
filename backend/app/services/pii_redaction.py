@@ -13,7 +13,8 @@ Patterns are conservative by design: a missed bare number is preferable to
 mangling a timestamp, PID, hex address, MAC, version string or build
 fingerprint that diagnosis depends on. Known false negatives are listed in
 the PR security note (bare 10-digit phone numbers, unformatted bare
-15-digit IMEIs and IMSI / ICCID / MEID without a keyword, non-email account names outside the Account{} form).
+15-digit IMEIs and IMSI / ICCID / MEID without a keyword, non-email account names outside the Account{} form, lower-case
+multi-word unquoted account_name= values).
 
 Every replacement is a typed token so a reader can still see *that* a value
 was there and what kind it was, e.g. ``[redacted-email]``.
@@ -41,10 +42,14 @@ _NA = r"(?![\w:/@-]|\.\d)"  # not-after (a trailing sentence period is fine)
 # Android account objects: `Account {name=..., type=...}`. The name may be
 # an email or a free-form display name, so the whole name value goes.
 _ACCOUNT_OBJ_RE = re.compile(r"(Account\s*\{\s*name=)([^,}]+)", re.IGNORECASE)
-# key=value spellings seen in AccountManager / sync logs.
+# key=value spellings seen in AccountManager / sync logs. The value is a
+# quoted string (any content), or an unquoted first word plus up to three
+# following Capitalised words so a display name like `Jane Doe` goes whole
+# while trailing log prose (`... failed to sync`) survives. Lower-case
+# multi-word unquoted names keep their tail: a listed false negative.
 _ACCOUNT_KV_RE = re.compile(
-    r"\b((?:account_?name|accountName|authAccount)\s*[=:]\s*)([^\s,;}\]]+)",
-    re.IGNORECASE,
+    r"\b((?i:account_?name|authAccount)\s*[=:]\s*)"
+    r"(?!\[redacted-)(\"[^\"]*\"|'[^']*'|[^\s,;}\]]+(?:[ ]+[A-Z][\w'.-]*(?![\w=:])){0,3})",
 )
 
 # Keyword-anchored identifiers. Without the keyword a 14-20 digit run is

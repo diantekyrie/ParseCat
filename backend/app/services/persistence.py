@@ -319,7 +319,7 @@ def persist_capture(
             exception_class=c.exception_class, message=redact_pii(c.message),
             root_cause_class=c.root_cause_class,
             root_cause_message=redact_pii(c.root_cause_message),
-            root_cause_frame=c.root_cause_frame,
+            root_cause_frame=redact_pii(c.root_cause_frame),
             source_section=c.source_ref.section,
             source_line_start=c.source_ref.line_start,
             source_line_end=c.source_ref.line_end,
@@ -333,7 +333,7 @@ def persist_capture(
             pid=t.pid, tid=t.tid, thread_name=t.thread_name, uid=t.uid,
             signal_number=t.signal_number, signal_name=t.signal_name,
             signal_code=t.signal_code, fault_addr=t.fault_addr, abi=t.abi,
-            top_frame=t.top_frame,
+            top_frame=redact_pii(t.top_frame),
         ))
 
     for a in parsed.anrs:
@@ -356,8 +356,8 @@ def persist_capture(
     for snap in parsed.anr_main_thread_snapshots:
         session.add(AnrMainThreadSnapshotRow(
             capture_id=capture.id, pid=snap.pid, process=snap.process,
-            state=snap.state, held_mutexes=snap.held_mutexes,
-            top_frames_json=json.dumps(snap.top_frames),
+            state=snap.state, held_mutexes=redact_pii(snap.held_mutexes),
+            top_frames_json=json.dumps([redact_pii(f) for f in snap.top_frames]),
             source_section=snap.source_ref.section,
             source_line_start=snap.source_ref.line_start,
             source_line_end=snap.source_ref.line_end,
@@ -449,6 +449,10 @@ def persist_capture(
             frame_type_breakdown_json=json.dumps([{"label": f.label, "count": f.count} for f in pa.frame_type_breakdown]),
             identity_signals_json=json.dumps([{"kind": s.kind, "value": s.value, "count": s.count} for s in pa.identity_signals]),
             anomalies_json=json.dumps([
+                # Deliberately not redact_pii()'d: packet-capture anomaly `detail` is a
+                # parser-built template (frame label, reason code, ip_src -> ip_dst),
+                # never copied log text. The IPs are structured identifiers, same
+                # FE / owner policy bucket as MAC / SSID.
                 {"timestamp": a.timestamp, "kind": a.kind, "detail": a.detail, "mac_or_ip": a.mac_or_ip}
                 for a in pa.anomalies
             ]),

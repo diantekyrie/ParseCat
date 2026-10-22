@@ -7,15 +7,17 @@ capture content.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.models.db_models import (
-    AnrRow, BtFrameworkEventRow, CdmPairingEventRow, CrashEventRow,
+    AnrMainThreadSnapshotRow, AnrRow, BtFrameworkEventRow, CdmPairingEventRow, CrashEventRow,
     FocusEventRow, KernelLogEventRow, ProcessKillEventRow, TombstoneRow,
 )
 from app.parsers.base import (
-    AnrFacts, BtFrameworkEvent, CdmPairingEvent, CrashEvent, FocusEvent,
+    AnrFacts, AnrMainThreadSnapshot, BtFrameworkEvent, CdmPairingEvent, CrashEvent, FocusEvent,
     KernelLogEvent, ParsedCapture, ProcessKillEvent, SourceRef, TombstoneFacts,
 )
 from app.services.persistence import persist_capture
@@ -210,3 +212,59 @@ def test_every_redacted_free_text_column_is_scrubbed_at_persist():
         assert tomb.fault_addr == "0x0000007b2c4d1e80"
         assert tomb.build_fingerprint.endswith("10754064:user/release-keys")
         assert anr.package == kill.package == "com.example.app"
+
+
+# --------------------------------------- Arch review on 9f694d2 (PR #96)
+
+@pytest.mark.parametrize("text, expected", [
+    # space-containing display name in the key=value form goes whole
+    ("SyncManager: accountName=Jane Doe failed to sync",
+     "SyncManager: accountName=[redacted-account] failed to sync"),
+    ("authAccount: Jane Mary Doe-Smith}", "authAccount: [redacted-account]}"),
+    ('account_name="jane q doe", type=com.example', "account_name=[redacted-account], type=com.example"),
+    ("ACCOUNT_NAME=Jane Doe Rest=1", "ACCOUNT_NAME=[redacted-account] Rest=1"),
+    # listed false negative: unquoted lower-case multi-word name keeps its tail
+    ("accountName=jane doe", "accountName=[redacted-account] doe"),
+])
+def test_account_kv_display_name_with_spaces(text, expected):
+    out = redact_pii(text)
+    assert out == expected
+    assert redact_pii(out) == out  # idempotent, no "[redacted-account]]"
+
+
+def test_stack_frame_columns_are_scrubbed_at_persist():
+    """top_frames_json, tombstone top_frame, crash root_cause_frame and ANR
+    held_mutexes are log-derived text too; ordinary frames must survive."""
+    pii = "jdoe@example.com"
+    plain = "at com.example.app.Main.run(Main.java:42)"
+    p = ParsedCapture()
+    p.crash_events.append(CrashEvent(
+        timestamp="10-22 12:31:00.123", thread="main", package="com.example.app",
+        pid=12345, exception_class="java.lang.RuntimeException", message="boom",
+        root_cause_class="java.lang.IllegalStateException", root_cause_message="boom",
+        root_cause_frame=f"com.example.app.Login.as({pii})", source_ref=_ref()))
+    p.tombstones.append(TombstoneFacts(
+        filename="tombstone_00", modified_at="2026-10-22 12:31", timestamp=None,
+        build_fingerprint=None, executable="/system/bin/app_process64", cmdline=None,
+        package="com.example.app", pid=12345, tid=12345, thread_name="main", uid=10234,
+        signal_number=11, signal_name="SIGSEGV", signal_code="SEGV_MAPERR",
+        fault_addr="0x0000007b2c4d1e80", abi="arm64",
+        top_frame=f"#00 pc 0x1e80 /data/user/0/{pii}/lib.so"))
+    p.anr_main_thread_snapshots.append(AnrMainThreadSnapshot(
+        pid=12345, process="com.example.app", state="Blocked",
+        held_mutexes=f"mutator lock owner {pii}",
+        top_frames=[f"at com.example.app.Sync.run(account {pii})", plain],
+        source_ref=_ref()))
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        cap = persist_capture(s, "synthetic-device", "synthetic.txt", p)
+        def one(model):
+            return s.exec(select(model).where(model.capture_id == cap.id)).one()
+        crash, tomb, snap = one(CrashEventRow), one(TombstoneRow), one(AnrMainThreadSnapshotRow)
+        frames = json.loads(snap.top_frames_json)
+        for text in (crash.root_cause_frame, tomb.top_frame, snap.held_mutexes, frames[0]):
+            assert pii not in text and EMAIL_TOKEN in text, text
+        assert frames[1] == plain
+        assert snap.state == "Blocked" and tomb.fault_addr == "0x0000007b2c4d1e80"

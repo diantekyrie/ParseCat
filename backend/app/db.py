@@ -16,6 +16,14 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 _COLUMN_MIGRATIONS = [
     ("device", "archived", "BOOLEAN NOT NULL DEFAULT 0"),
     ("investigation", "archived", "BOOLEAN NOT NULL DEFAULT 0"),
+    # Msg5: BT HCI auth/encrypt/link-key events + SourceRef + severity/confidence
+    ("bthcieventrow", "encryption_enabled", "INTEGER"),
+    ("bthcieventrow", "key_type", "INTEGER"),
+    ("bthcieventrow", "source_section", "VARCHAR"),
+    ("bthcieventrow", "source_line_start", "INTEGER"),
+    ("bthcieventrow", "source_line_end", "INTEGER"),
+    ("bthcieventrow", "severity", "VARCHAR"),
+    ("bthcieventrow", "confidence", "VARCHAR"),
 ]
 
 

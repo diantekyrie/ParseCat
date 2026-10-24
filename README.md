@@ -59,8 +59,10 @@ backend/
                               BT_HCI_LOG_CANDIDATES in ingestion.py) -- real
                               binary `btsnoop` framing (verified byte-for-
                               byte against real files, not assumed from any
-                              one filename), decoding connection/
-                              disconnection/command complete/status events
+                              one filename), decoding connection, auth,
+                              encryption, link-key, pairing and command
+                              events (full list under "Bluetooth / Wi-Fi:
+                              what's decoded vs. not")
                               with HCI status-code names from the Bluetooth
                               Core Spec
       bt_framework.py          Android framework Bluetooth dumpsys text

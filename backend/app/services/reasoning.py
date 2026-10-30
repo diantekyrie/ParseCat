@@ -1761,15 +1761,19 @@ def _format_history(history: list[dict] | None) -> str:
 # ("sk-or-v1-0123456789a...") is consumed whole, not split at char 8.
 # Also covered: non-"sk-" provider prefixes (Google "AIza", Groq "gsk_",
 # xAI "xai-", Perplexity "pplx-", Hugging Face "hf_"), full, truncated, or
-# masked with an ellipsis ("AIzaSyAbc...wxyz"). Prefix-anchored on purpose so
-# ordinary text (provider names, request/model ids) isn't over-redacted.
+# masked with an ellipsis ("AIzaSyAbc...wxyz"). Prefix-anchored, and a bare
+# prefix word is NOT enough: "AIza" needs 4+ more chars; the others need an
+# ellipsis or a 16+ char tail, so model ids ("xai-grok-2") and library names
+# ("hf_hub") survive.
 # NOT covered: a non-"sk-" key with an unlisted prefix that is masked/short
 # enough to dodge the 32+ rule, and a bare masked last-4 ("...abcd",
 # "key ending abcd"). A last-4 alone is not usable as a key.
+_KEY_TAIL = r"[A-Za-z0-9_\-]"
 _KEY_LIKE_RE = re.compile(
     r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_.\-]*"
-    r"|(?<![A-Za-z0-9])(?:AIza|gsk_|xai-|pplx-|hf_)[A-Za-z0-9_\-]*(?:(?:\.{2,}|\u2026)[A-Za-z0-9_\-]*)?"
-    r"|(?<![A-Za-z0-9])[A-Za-z0-9_\-]{32,}"
+    rf"|(?<![A-Za-z0-9])(?:AIza|gsk_|xai-|pplx-|hf_)(?:{_KEY_TAIL}*(?:\.{{2,}}|\u2026){_KEY_TAIL}*|{_KEY_TAIL}{{16,}})"
+    rf"|(?<![A-Za-z0-9])AIza{_KEY_TAIL}{{4,}}"
+    rf"|(?<![A-Za-z0-9]){_KEY_TAIL}{{32,}}"
 )
 
 

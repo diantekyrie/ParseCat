@@ -156,6 +156,10 @@ def test_truncated_key_echo_leaks_no_chars_past_prefix():
     "AIzaSyFAKE",
     "gsk_FAKE1234...wxyz",
     "xai-FAKE1234...wxyz",
+    "pplx-FAKE1234...wxyz",
+    "pplx-FAKE1234567890abcdef",
+    "hf_FAKE1234...wxyz",
+    "hf_FAKE1234567890abcdefgh",
 ])
 def test_masked_and_truncated_non_sk_keys_are_redacted(echo):
     out = reasoning._redact_llm_error(f"Error code: 401 - invalid key {echo} rejected", None)
@@ -171,6 +175,9 @@ def test_masked_and_truncated_non_sk_keys_are_redacted(echo):
     "Google API returned 403 for model gemini-pro",
     "trace 3fa85f6457174562b3fc2c963f66afa6"[:25],
     "see xai docs and hf hub; gsk is a prefix",
+    "model xai-grok-2 not found",
+    "hf_hub download failed",
+    "unknown prefix AIza and pplx- and gsk_",
 ])
 def test_non_key_error_text_not_over_redacted(benign):
     assert reasoning._redact_llm_error(benign, None) == benign

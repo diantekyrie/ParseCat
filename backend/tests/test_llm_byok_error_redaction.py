@@ -173,7 +173,7 @@ def test_masked_and_truncated_non_sk_keys_are_redacted(echo):
     "Error code: 401 from openai (request id req_7f3a9c)",
     "model gemini-1.5-flash not found",
     "Google API returned 403 for model gemini-pro",
-    "trace 3fa85f6457174562b3fc2c963f66afa6"[:25],
+    "trace id 3fa85f6457174562 not found",
     "see xai docs and hf hub; gsk is a prefix",
     "model xai-grok-2 not found",
     "hf_hub download failed",
@@ -181,3 +181,11 @@ def test_masked_and_truncated_non_sk_keys_are_redacted(echo):
 ])
 def test_non_key_error_text_not_over_redacted(benign):
     assert reasoning._redact_llm_error(benign, None) == benign
+
+
+def test_single_dot_mask_leaves_only_last_four():
+    # Known, accepted gap (see comment above _KEY_LIKE_RE): the prefix part
+    # is redacted, only the last-4 tail survives.
+    out = reasoning._redact_llm_error("bad key AIzaSyFAKE.wxyz", None)
+    assert "FAKE" not in out
+    assert out == "bad key [redacted].wxyz"

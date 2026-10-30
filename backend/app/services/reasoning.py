@@ -1766,7 +1766,8 @@ def _format_history(history: list[dict] | None) -> str:
 # ellipsis or a 16+ char tail, so model ids ("xai-grok-2") and library names
 # ("hf_hub") survive.
 # NOT covered: a non-"sk-" key with an unlisted prefix that is masked/short
-# enough to dodge the 32+ rule, and a bare masked last-4 ("...abcd",
+# enough to dodge the 32+ rule, the tail after a single-dot mask
+# ("AIzaSy.wxyz" -> "[redacted].wxyz"; a last-4), and a bare masked last-4 ("...abcd",
 # "key ending abcd"). A last-4 alone is not usable as a key.
 _KEY_TAIL = r"[A-Za-z0-9_\-]"
 _KEY_LIKE_RE = re.compile(

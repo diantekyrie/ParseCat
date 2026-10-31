@@ -61,6 +61,16 @@ from app.services.pii_redaction import (
     # #99: "number=" only counts when the value itself is phone-shaped
     ("number=+14155550123", "+14155550123", PHONE_TOKEN),
     ("number=800-555-0199", "800-555-0199", PHONE_TOKEN),
+    # #103 review: real phone shapes after number= / cell stay redacted
+    ("number=4155550123", "4155550123", PHONE_TOKEN),
+    ("number=14155550123", "14155550123", PHONE_TOKEN),
+    ("number=415 555 0123", "415 555 0123", PHONE_TOKEN),
+    ("number=415-555.0123", "415-555.0123", PHONE_TOKEN),
+    ("number=(415) 555-0123", "(415) 555-0123", PHONE_TOKEN),
+    ("cell 415 555 0123", "415 555 0123", PHONE_TOKEN),
+    ("cell=4155550123", "4155550123", PHONE_TOKEN),
+    ("cell: 415-555-0123", "415-555-0123", PHONE_TOKEN),
+    ("number: 415 555 0123", "415 555 0123", PHONE_TOKEN),
 ])
 def test_each_pii_type_is_redacted(text, secret, token):
     out = redact_pii(text)
@@ -140,8 +150,37 @@ def test_idempotent_and_none_passthrough():
     "cell=310260123456789",
     # #99: "number" alone must not treat an epoch-ms timestamp as a phone
     "number: 1792698392012",
+    # #103 review boundaries: epoch seconds, trailing numeric columns
+    "number: 1792698392",
+    "cell 310 260 1234 567",
+    "number=415 555 0123 4567",
+    # bare prose "cell" with no phone value stays untouched
+    "Serving cell changed after handover",
+    "cell info refreshed at 1792698392012",
 ])
 def test_non_pii_left_unchanged(text):
+    assert redact_pii(text) == text
+
+
+# ------------------------------------------------- pinned known residuals
+# These pin documented tradeoffs so a later regex change can't flip them
+# silently (Arch review on PR #110). Changing either is an FE call.
+
+def test_residual_bare_cell_triple_is_over_redacted():
+    # Over-redaction: MCC/MNC/LAC-shaped `cell 310 260 1234` with nothing
+    # after it has a complete NANP space-grouped shape. Pending FE decision.
+    assert redact_pii("cell 310 260 1234") == "cell " + PHONE_TOKEN
+
+
+@pytest.mark.parametrize("text", [
+    "cell 415 555 0123 4",
+    "cell=415-555-0123-",
+    "number=415 555 0123 4",
+])
+def test_residual_phone_with_trailing_column_is_not_redacted(text):
+    # Leak-direction false negative, listed in the module docstring: a
+    # phone followed by another numeric column / glued digit or dash after
+    # `number` / bare `cell` is skipped so cell-identity tuples survive.
     assert redact_pii(text) == text
 
 
@@ -331,3 +370,73 @@ def test_parse_warnings_and_display_name_are_scrubbed_at_persist():
         # the nickname text itself (not matched by any regex) survives
         assert "Jane's Watch" in cdm.display_name and "Jane's Watch" in cda.display_name
         assert cdm.mac_address == mac and cda.mac_address == mac
+
+
+def test_upload_response_parse_warnings_are_scrubbed(monkeypatch):
+    """#97 / Arch on #105: the upload route echoed raw parsed.parse_warnings in
+    its JSON response even though the persisted copy was scrubbed. Drive the
+    real POST /api/captures path with a synthetic bugreport and inject a
+    warning carrying an email (as `Packet-level protocol analysis failed:
+    {exc}` could), then assert the response JSON is scrubbed."""
+    from fastapi.testclient import TestClient
+    from sqlalchemy.pool import StaticPool
+
+    import app.api.routes as routes
+    from app.db import get_session
+    from app.main import app
+    from app.services.ingestion import parse_capture_file as real_parse
+
+    pii = "jdoe@example.com"
+
+    def _parse_with_pii_warning(path, filename):
+        parsed = real_parse(path, filename)
+        parsed.parse_warnings.append(f"Packet-level protocol analysis failed: bad owner {pii}")
+        return parsed
+
+    monkeypatch.setattr(routes, "parse_capture_file", _parse_with_pii_warning)
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+
+    def _override_session():
+        with Session(engine) as session:
+            yield session
+
+    body = (
+        "------ SYSTEM LOG (logcat -v threadtime -v printable -v uid -d *:v) ------\n"
+        "09-02 01:31:53.866  1145  1145 D keystore2: debug line 0\n"
+        "------ 0.326s was the duration of 'SYSTEM LOG' ------\n"
+    )
+    app.dependency_overrides[get_session] = _override_session
+    try:
+        with TestClient(app) as c:
+            r = c.post(
+                "/api/captures",
+                data={"device_label": "synthetic-device-97-api"},
+                files={"file": ("logcat.txt", body.encode(), "text/plain")},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    assert pii not in r.text
+    assert any(EMAIL_TOKEN in w for w in payload["parse_warnings"])
+    # identity_warning equality check still works on the scrubbed list
+    from app.services.persistence import UNVERIFIED_DEVICE_IDENTITY_WARNING
+    assert payload["identity_warning"] in (None, UNVERIFIED_DEVICE_IDENTITY_WARNING)
+    assert (payload["identity_warning"] is not None) == (
+        UNVERIFIED_DEVICE_IDENTITY_WARNING in payload["parse_warnings"]
+    )
+
+
+def test_identity_warning_survives_redact_pii_unchanged():
+    """Review on #106: the upload route matches identity_warning by equality
+    against the *scrubbed* parse_warnings list, so the fixed template must be a
+    fixed point of redact_pii(). Pins that invariant directly."""
+    from app.services.persistence import UNVERIFIED_DEVICE_IDENTITY_WARNING
+    from app.services.pii_redaction import redact_pii
+
+    assert redact_pii(UNVERIFIED_DEVICE_IDENTITY_WARNING) == UNVERIFIED_DEVICE_IDENTITY_WARNING

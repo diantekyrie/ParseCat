@@ -54,6 +54,12 @@ from app.services.pii_redaction import (
     ("Account {name=Jane Doe, type=com.example.chat}", "Jane Doe", ACCOUNT_TOKEN),
     ("Account {name=jdoe@example.com, type=com.google}", "jdoe@example.com", ACCOUNT_TOKEN),
     ("sync accountName=jdoe_42 authority=x", "jdoe_42", ACCOUNT_TOKEN),
+    # #99: bare "cell" dropped, but "cellphone" / "cell phone" still count
+    ("cellphone 415-555-0123", "415-555-0123", PHONE_TOKEN),
+    ("cell phone 415-555-0123", "415-555-0123", PHONE_TOKEN),
+    # #99: "number=" only counts when the value itself is phone-shaped
+    ("number=+14155550123", "+14155550123", PHONE_TOKEN),
+    ("number=800-555-0199", "800-555-0199", PHONE_TOKEN),
 ])
 def test_each_pii_type_is_redacted(text, secret, token):
     out = redact_pii(text)
@@ -128,6 +134,11 @@ def test_idempotent_and_none_passthrough():
     # Java Class@hash toString glued to a package path (real audio-focus clientId shape)
     "clientId=android.media.AudioManager$1@1a2b3c4com.example.media.player.LocalMediaPlayerController@e5e02de",
     "listener=com.example.Foo$Bar@9f8e7d6com.example.app.Player",
+    # #99: bare "cell" is cell-identity data (MCC/MNC/LAC/CID), not a phone
+    "cell 310 260 12345 678",
+    "cell=310260123456789",
+    # #99: "number" alone must not treat an epoch-ms timestamp as a phone
+    "number: 1792698392012",
 ])
 def test_non_pii_left_unchanged(text):
     assert redact_pii(text) == text

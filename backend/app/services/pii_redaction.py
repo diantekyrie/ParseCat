@@ -113,12 +113,25 @@ _NANP_RE = re.compile(
     + _NA
 )
 # Keyword-anchored phone: the keyword makes the space-grouped forms safe.
-# `number` alone is too generic, so it only counts with an `=` / `:`.
+# Bare "cell" is dropped (telephony dumps pair it with MCC/MNC/LAC/CID,
+# e.g. "cell 310 260 12345 678", which is cell-identity data, not a phone
+# number) -- only "cellphone" / "cell phone" count.
 _PHONE_KV_RE = re.compile(
-    r"\b((?:phone_?(?:number)?|phoneNumber|telephone|tel|msisdn|mobile|cell(?:phone)?"
-    r"|caller(?:_?id)?|callerId|callee|line1_?number|line1Number)\s*[=:]?\s*"
-    r"|number\s*[=:]\s*)"
+    r"\b((?:phone_?(?:number)?|phoneNumber|telephone|tel|msisdn|mobile|cell ?phone"
+    r"|caller(?:_?id)?|callerId|callee|line1_?number|line1Number)\s*[=:]?\s*)"
     r"(\+?\(?\d[\d ().-]{6,}\d)" + _NA,
+    re.IGNORECASE,
+)
+# `number` alone is too generic (epoch-ms timestamps, counters) to anchor
+# the loose digit-run value pattern above, so it only redacts when the
+# value itself is phone-shaped: a leading '+' (E.164) or NANP grouping via
+# parens or one consistent '-'/'.' separator. A bare digit run like
+# "number: 1792698392012" (an epoch-ms timestamp) is left alone.
+_NUMBER_KV_RE = re.compile(
+    r"\b(number\s*[=:]\s*)"
+    r"(\+\d[\d().\- ]{6,}\d"
+    r"|\(\d{3}\)\s?\d{3}[ .-]\d{4}"
+    r"|\d{3}([.-])\d{3}\3\d{4})" + _NA,
     re.IGNORECASE,
 )
 _TEL_URI_RE = re.compile(r"\btel:\+?[\d().-]{7,}", re.IGNORECASE)
@@ -180,6 +193,7 @@ def redact_pii(text: Optional[str]) -> Optional[str]:
     out = _EMAIL_RE.sub(_email_sub, out)
     out = _IMEI_SEP_RE.sub(_imei_sep_sub, out)
     out = _PHONE_KV_RE.sub(_phone_kv_sub, out)
+    out = _NUMBER_KV_RE.sub(_phone_kv_sub, out)
     out = _TEL_URI_RE.sub("tel:" + PHONE_TOKEN, out)
     out = _NANP_RE.sub(PHONE_TOKEN, out)
     out = _E164_RE.sub(_e164_sub, out)

@@ -2266,7 +2266,8 @@ export default function App() {
           background: transparent; border: 0; color: var(--text); font: inherit; font-weight: 600;
           cursor: pointer; padding: 0; text-align: left;
         }
-        .how-to-capture-toggle:hover { color: var(--blue); }
+        /* Scoped override (like .scope-toggle): the global button:hover rule (0,2,1) otherwise paints --accent-dark behind blue text (#91). */
+        .how-to-capture-toggle:hover:not(:disabled) { background: transparent; color: var(--blue); }
         .how-to-capture-chevron { color: var(--muted); font-weight: 400; }
         .how-to-capture-body { margin-top: 10px; }
         .how-to-capture-list { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 8px; }

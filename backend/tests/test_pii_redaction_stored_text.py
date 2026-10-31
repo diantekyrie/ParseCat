@@ -385,6 +385,7 @@ def test_upload_response_parse_warnings_are_scrubbed(monkeypatch):
     from app.db import get_session
     from app.main import app
     from app.services.ingestion import parse_capture_file as real_parse
+    from tests.conftest import auth_headers
 
     pii = "jdoe@example.com"
 
@@ -411,7 +412,7 @@ def test_upload_response_parse_warnings_are_scrubbed(monkeypatch):
     )
     app.dependency_overrides[get_session] = _override_session
     try:
-        with TestClient(app) as c:
+        with TestClient(app, headers=auth_headers()) as c:
             r = c.post(
                 "/api/captures",
                 data={"device_label": "synthetic-device-97-api"},

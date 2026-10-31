@@ -62,6 +62,7 @@ Gap-matrix decisions (issue #70, PC-pcap-004):
 """
 from __future__ import annotations
 
+import enum
 import shutil
 import struct
 import subprocess
@@ -336,7 +337,19 @@ def _dot11_addr2(pkt: bytes, dot11_start: int, ftype: int) -> str | None:
     return ":".join(f"{b:02x}" for b in mac)
 
 
-def _dot11_reason_code(pkt: bytes, dot11_start: int) -> int | None:
+class ReasonCodeUnavailable(enum.Enum):
+    """Why a deauth/disassoc reason code couldn't be read (Arch review on #116).
+
+    ABSENT: the frame is too short to hold the 2-byte field.
+    ENCRYPTED: the field is there but encrypted (802.11w/PMF Protected bit),
+    so it can't be decoded. Saying "not present" for this case would be false.
+    """
+
+    ABSENT = "absent"
+    ENCRYPTED = "encrypted"
+
+
+def _dot11_reason_code(pkt: bytes, dot11_start: int) -> int | ReasonCodeUnavailable:
     # #70 / Arch review on #115: for Deauthentication and Disassociation
     # frames, the frame body is the Reason Code field ALONE (2 bytes,
     # little-endian) -- no other fixed fields, no IEs -- immediately after
@@ -349,22 +362,27 @@ def _dot11_reason_code(pkt: bytes, dot11_start: int) -> int | None:
     #     with a CCMP/GCMP header, not the reason code. Reading these 2
     #     bytes would decode ciphertext as a confident-looking (wrong)
     #     reason -- exactly the fabricated fact this parser must not
-    #     produce, so return None rather than guess.
+    #     produce. The reason code IS present, just encrypted, so return
+    #     ENCRYPTED (not ABSENT) and let the caller say so truthfully.
     #   * Order bit (FC byte 1, 0x80) -- adds a 4-byte +HT Control field
     #     between SeqCtrl and the frame body, shifting the reason code.
+    # Scope: non-QoS management frames only. The +HTC shift is the only
+    # variable offset handled; deauth/disassoc are never 4-address frames.
+    # Protected wins over Order: if both are set, the body is still
+    # ciphertext, so ENCRYPTED. Deterministic for a given byte string.
     # addr2's offset is unaffected by either bit -- it's part of the fixed
     # MAC header, before SeqCtrl/+HTC/body -- so _dot11_addr2 needs no
     # equivalent guard.
     if dot11_start + 2 > len(pkt):
-        return None
+        return ReasonCodeUnavailable.ABSENT
     fc_byte1 = pkt[dot11_start + 1]
     if fc_byte1 & 0x40:  # Protected Frame
-        return None
+        return ReasonCodeUnavailable.ENCRYPTED
     off = dot11_start + 2 + 2 + 6 + 6 + 6 + 2
     if fc_byte1 & 0x80:  # Order (+HT Control present)
         off += 4
     if off + 2 > len(pkt):
-        return None
+        return ReasonCodeUnavailable.ABSENT
     return struct.unpack("<H", pkt[off:off + 2])[0]
 
 
@@ -430,7 +448,12 @@ def _analyze_dot11_fallback(path: Path) -> PacketAnalysis:
             elif ftype == 0 and subtype in (10, 12):  # Disassoc, Deauth
                 bssid = _dot11_addr2(pkt, rt_len, ftype)
                 reason_code = _dot11_reason_code(pkt, rt_len)
-                if reason_code is None:
+                if reason_code is ReasonCodeUnavailable.ENCRYPTED:
+                    detail = (
+                        f"{dot11_frame_label(ftype, subtype)} frame (reason code encrypted "
+                        "(802.11w protected frame), not decodable)"
+                    )
+                elif reason_code is ReasonCodeUnavailable.ABSENT:
                     detail = f"{dot11_frame_label(ftype, subtype)} frame (reason code not present in this packet)"
                 else:
                     detail = (

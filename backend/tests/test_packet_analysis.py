@@ -31,6 +31,7 @@ from app.parsers.packet_analysis import (
     _analyze_dot11_fallback,
     _decode_tshark_ssid,
     _dot11_frame_control,
+    ReasonCodeUnavailable,
     _dot11_reason_code,
     _radiotap_rssi_and_header_len,
     _tshark_bool,
@@ -156,18 +157,44 @@ def test_dot11_reason_code_reads_the_two_byte_field_after_the_mgmt_header():
     assert _dot11_reason_code(pkt, rt_len) == 3
 
 
-def test_dot11_reason_code_is_none_when_protected_bit_set():
+def test_dot11_reason_code_is_encrypted_when_protected_bit_set():
     # Arch review on #115: under 802.11w/PMF, a protected deauth/disassoc's
     # body starts with a CCMP/GCMP header, not a plaintext reason code --
     # these 2 bytes would be ciphertext, not frame 3's actual reason. Must
-    # return None rather than decode (and present as fact) a wrong value.
+    # return ENCRYPTED (present but unreadable), never a decoded value and
+    # never ABSENT (Arch review on #116: "not present" would be false).
     pkt = (
         _radiotap_with_rssi(-60)
         + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff", protected=True)
         + struct.pack("<H", 3)  # would read as reason 3 if the guard were missing
     )
     _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
-    assert _dot11_reason_code(pkt, rt_len) is None
+    assert _dot11_reason_code(pkt, rt_len) is ReasonCodeUnavailable.ENCRYPTED
+
+
+def test_dot11_reason_code_is_absent_when_order_bit_set_but_body_truncated():
+    # Arch review on #116: +HTC present but no reason bytes after it. The
+    # un-shifted offset would read the HTC bytes as a reason; must be ABSENT.
+    pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff", order=True)
+        + b"\x07\x00\x00\x00"  # +HT Control only; first 2 bytes look like reason 7
+    )
+    _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
+    assert _dot11_reason_code(pkt, rt_len) is ReasonCodeUnavailable.ABSENT
+
+
+def test_dot11_reason_code_is_encrypted_when_protected_and_order_both_set():
+    # Arch review on #116: Protected wins over Order -- even with a
+    # correctly shifted offset, the body is ciphertext.
+    pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff", protected=True, order=True)
+        + b"\x00\x00\x00\x00"
+        + struct.pack("<H", 7)
+    )
+    _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
+    assert _dot11_reason_code(pkt, rt_len) is ReasonCodeUnavailable.ENCRYPTED
 
 
 def test_dot11_reason_code_shifts_past_ht_control_when_order_bit_set():
@@ -184,12 +211,12 @@ def test_dot11_reason_code_shifts_past_ht_control_when_order_bit_set():
     assert _dot11_reason_code(pkt, rt_len) == 7
 
 
-def test_dot11_reason_code_is_none_when_bytes_are_absent():
+def test_dot11_reason_code_is_absent_when_bytes_are_absent():
     # The pre-existing deauth fixture above has no reason-code bytes --
     # must degrade to None, not a wrong guess or an IndexError.
     pkt = _radiotap_with_rssi(-60) + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff")
     _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
-    assert _dot11_reason_code(pkt, rt_len) is None
+    assert _dot11_reason_code(pkt, rt_len) is ReasonCodeUnavailable.ABSENT
 
 
 def test_fallback_backend_decodes_deauth_and_disassoc_reason_codes(tmp_path):
@@ -241,11 +268,11 @@ def test_fallback_backend_reason_code_absent_says_so_not_unknown(tmp_path):
     assert "reason code 0" not in result.anomalies[0].detail
 
 
-def test_fallback_backend_protected_deauth_reports_not_present_not_a_wrong_reason(tmp_path):
-    # Arch review on #115, end-to-end through _analyze_dot11_fallback: a
-    # PMF-protected deauth must never surface a decoded-looking reason code
-    # (its body is ciphertext) -- same "not present" wording as truncated
-    # frames, not a fabricated number.
+def test_fallback_backend_protected_deauth_reports_encrypted_not_a_wrong_reason(tmp_path):
+    # Arch review on #115/#116, end-to-end through _analyze_dot11_fallback:
+    # a PMF-protected deauth must never surface a decoded-looking reason
+    # code (its body is ciphertext), and must not claim the code is absent
+    # either -- it's present but encrypted.
     deauth_pkt = (
         _radiotap_with_rssi(-60)
         + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff", protected=True)
@@ -256,7 +283,8 @@ def test_fallback_backend_protected_deauth_reports_not_present_not_a_wrong_reaso
 
     result = _analyze_dot11_fallback(pcap_path)
     assert len(result.anomalies) == 1
-    assert "not present in this packet" in result.anomalies[0].detail
+    assert "reason code encrypted (802.11w protected frame), not decodable" in result.anomalies[0].detail
+    assert "not present" not in result.anomalies[0].detail
     assert "reason code 3" not in result.anomalies[0].detail
 
 
@@ -267,7 +295,8 @@ def test_llm_bound_anomaly_rows_keep_reason_code_text_drop_mac(tmp_path):
     # filters them before they reach the prompt. Confirms SYSTEM_PROMPT rule
     # 10a's claim holds end to end: a decoded reason code's detail text
     # survives into the LLM-bound row untouched, a not-decodable one still
-    # says so (never a fabricated number), and mac_or_ip never reaches it.
+    # says it's encrypted (never a fabricated number, never "not present"),
+    # and mac_or_ip never reaches it.
     from app.services.reasoning import _llm_safe_evidence_row
 
     decoded_pkt = (
@@ -301,7 +330,8 @@ def test_llm_bound_anomaly_rows_keep_reason_code_text_drop_mac(tmp_path):
     protected_row = next(r for r in llm_rows if r is not decoded_row)
 
     assert "Deauthenticated: station leaving" in decoded_row["detail"]
-    assert "not present in this packet" in protected_row["detail"]
+    assert "reason code encrypted" in protected_row["detail"]
+    assert "not present" not in protected_row["detail"]
     assert "reason code 7" not in protected_row["detail"]
     assert "mac_or_ip" not in decoded_row and "mac_or_ip" not in protected_row
 

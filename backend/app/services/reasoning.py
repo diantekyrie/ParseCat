@@ -200,7 +200,10 @@ numbers). Rules, no exceptions:
     both fallback paths -- never state a retransmission fact unless a
     packet_analysis entry actually contains one). Frame counts, RSSI
     range, retry rate, reason codes, and any listed anomalies
-    in packet_analysis are real per-packet facts, not inferred. SSID/BSSID
+    in packet_analysis are real per-packet facts, not inferred. An anomaly
+    whose detail says the reason code is "encrypted" means the frame did
+    carry one but it was protected (802.11w), so its value is unknown --
+    never state, guess, or say there was no reason code. SSID/BSSID
     identity signals and anomaly MAC/BSSID fields are intentionally absent
     from this LLM-bound packet_analysis (kept in local SQLite for UI only). If "device_wide_pairing_evidence" includes a
     "current_associations" list, that's the CDM service's OWN

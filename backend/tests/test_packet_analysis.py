@@ -213,7 +213,7 @@ def test_dot11_reason_code_shifts_past_ht_control_when_order_bit_set():
 
 def test_dot11_reason_code_is_absent_when_bytes_are_absent():
     # The pre-existing deauth fixture above has no reason-code bytes --
-    # must degrade to None, not a wrong guess or an IndexError.
+    # must return ReasonCodeUnavailable.ABSENT, not a wrong guess or an IndexError.
     pkt = _radiotap_with_rssi(-60) + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff")
     _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
     assert _dot11_reason_code(pkt, rt_len) is ReasonCodeUnavailable.ABSENT
@@ -250,6 +250,7 @@ def test_fallback_backend_decodes_deauth_and_disassoc_reason_codes(tmp_path):
     # actual wording -- this checks the two concrete claims instead).
     assert "NOT decoded" not in result.note
     assert "reason codes are exact per-packet facts" in result.note
+    assert "PMF-protected (802.11w) reason codes are reported as encrypted" in result.note
 
 
 def test_fallback_backend_reason_code_absent_says_so_not_unknown(tmp_path):

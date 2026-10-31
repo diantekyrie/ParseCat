@@ -488,7 +488,9 @@ def _analyze_dot11_fallback(path: Path) -> PacketAnalysis:
         note=(
             "Hand-rolled radiotap/802.11 header parser (tshark not available). Frame "
             "type/subtype, retry flag, RSSI, and deauthentication/disassociation "
-            "reason codes are exact per-packet facts. No TCP/retransmission analysis "
+            "reason codes are exact per-packet facts when plaintext; PMF-protected "
+            "(802.11w) reason codes are reported as encrypted, not decoded. No "
+            "TCP/retransmission analysis "
             "is attempted on this 802.11 monitor-mode path -- that stays tshark-only "
             "by design, not a gap to be closed here."
         ),

@@ -70,6 +70,7 @@ from app.services.pii_redaction import (
     ("cell 415 555 0123", "415 555 0123", PHONE_TOKEN),
     ("cell=4155550123", "4155550123", PHONE_TOKEN),
     ("cell: 415-555-0123", "415-555-0123", PHONE_TOKEN),
+    ("number: 415 555 0123", "415 555 0123", PHONE_TOKEN),
 ])
 def test_each_pii_type_is_redacted(text, secret, token):
     out = redact_pii(text)
@@ -153,6 +154,9 @@ def test_idempotent_and_none_passthrough():
     "number: 1792698392",
     "cell 310 260 1234 567",
     "number=415 555 0123 4567",
+    # bare prose "cell" with no phone value stays untouched
+    "Serving cell changed after handover",
+    "cell info refreshed at 1792698392012",
 ])
 def test_non_pii_left_unchanged(text):
     assert redact_pii(text) == text

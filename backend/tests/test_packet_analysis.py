@@ -31,6 +31,7 @@ from app.parsers.packet_analysis import (
     _analyze_dot11_fallback,
     _decode_tshark_ssid,
     _dot11_frame_control,
+    _dot11_reason_code,
     _radiotap_rssi_and_header_len,
     _tshark_bool,
     analyze_packet_capture,
@@ -133,6 +134,76 @@ def test_fallback_backend_finds_deauth_beacon_ssid_and_rssi_range(tmp_path):
     assert result.anomalies[0].mac_or_ip == "aa:bb:cc:dd:ee:ff"
 
 
+# ---------------------------------------------------------------------------
+# #70 (PC-pcap-004): reason codes now decoded on the fallback path too.
+# ---------------------------------------------------------------------------
+
+def test_dot11_reason_code_reads_the_two_byte_field_after_the_mgmt_header():
+    # PC-pcap-005: Deauth/Disassoc frame body is the Reason Code ALONE,
+    # little-endian, right after the 24-byte non-QoS/non-4-address header.
+    pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff")
+        + struct.pack("<H", 3)  # reason 3: Deauthenticated due to inactivity
+    )
+    _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
+    assert _dot11_reason_code(pkt, rt_len) == 3
+
+
+def test_dot11_reason_code_is_none_when_bytes_are_absent():
+    # The pre-existing deauth fixture above has no reason-code bytes --
+    # must degrade to None, not a wrong guess or an IndexError.
+    pkt = _radiotap_with_rssi(-60) + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff")
+    _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
+    assert _dot11_reason_code(pkt, rt_len) is None
+
+
+def test_fallback_backend_decodes_deauth_and_disassoc_reason_codes(tmp_path):
+    # PC-pcap-005: both subtypes, two different reason codes, named via the
+    # same wifi.py REASON_CODE_NAMES table the dumpsys-based parser uses --
+    # one source of truth, not a second copy that could drift from it.
+    deauth_pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff")
+        + struct.pack("<H", 3)  # "Deauthenticated: station leaving"
+    )
+    disassoc_pkt = (
+        _radiotap_with_rssi(-55)
+        + _dot11_mgmt_header(0, 10, addr2=b"\x11\x22\x33\x44\x55\x66")
+        + struct.pack("<H", 4)  # "Disassociated due to inactivity"
+    )
+    pcap_path = tmp_path / "synthetic.pcap"
+    pcap_path.write_bytes(
+        _pcap_global_header(127)
+        + _pcap_record(deauth_pkt)
+        + _pcap_record(disassoc_pkt)
+    )
+
+    result = _analyze_dot11_fallback(pcap_path)
+    by_kind = {a.kind: a for a in result.anomalies}
+    assert "reason code 3 (Deauthenticated: station leaving)" in by_kind["deauthentication"].detail
+    assert "reason code 4 (Disassociated due to inactivity)" in by_kind["disassociation"].detail
+    # Still real per-packet facts, not guesses -- note no longer claims
+    # reason codes are undecoded on this backend.
+    assert "reason code" not in result.note.lower() or "NOT decoded" not in result.note
+
+
+def test_fallback_backend_reason_code_absent_says_so_not_unknown(tmp_path):
+    # PC-pcap-006: a truncated/malformed deauth frame (no reason-code bytes)
+    # must say the bytes aren't present, never invent reason 0 or omit the
+    # anomaly -- distinct wording from an actually-decoded-but-unmapped code.
+    deauth_pkt = _radiotap_with_rssi(-60) + _dot11_mgmt_header(
+        0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff"
+    )
+    pcap_path = tmp_path / "synthetic.pcap"
+    pcap_path.write_bytes(_pcap_global_header(127) + _pcap_record(deauth_pkt))
+
+    result = _analyze_dot11_fallback(pcap_path)
+    assert len(result.anomalies) == 1
+    assert "not present in this packet" in result.anomalies[0].detail
+    assert "reason code 0" not in result.anomalies[0].detail
+
+
 def test_analyze_packet_capture_uses_fallback_when_tshark_unavailable(tmp_path, monkeypatch):
     import app.parsers.packet_analysis as pa_module
 
@@ -225,6 +296,43 @@ def test_analyze_with_tshark_still_detects_tcp_reset_as_1_text(monkeypatch, tmp_
 
     result = analyze_with_tshark(tmp_path / "unused.pcap", "ethernet")
     assert any(a.kind == "tcp_reset" for a in result.anomalies)
+
+
+def test_analyze_with_tshark_detects_retransmission_as_true_text(monkeypatch, tmp_path):
+    # #70: tcp.analysis.retransmission is tshark's own stream/ACK-tracking
+    # verdict, same boolean-text trap as tcp.flags.reset and wlan.fc.retry.
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "ip.src": "203.0.113.10", "ip.dst": "198.51.100.20",
+        "tcp.analysis.retransmission": "True",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "ethernet")
+    retrans = [a for a in result.anomalies if a.kind == "tcp_retransmission"]
+    assert len(retrans) == 1
+    assert retrans[0].detail == "TCP retransmission 203.0.113.10 -> 198.51.100.20"
+
+
+def test_analyze_with_tshark_still_detects_retransmission_as_1_text(monkeypatch, tmp_path):
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{"tcp.analysis.retransmission": "1"})
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "ethernet")
+    assert any(a.kind == "tcp_retransmission" for a in result.anomalies)
+
+
+def test_analyze_with_tshark_no_retransmission_when_false(monkeypatch, tmp_path):
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{"tcp.analysis.retransmission": "False"})
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "ethernet")
+    assert not any(a.kind == "tcp_retransmission" for a in result.anomalies)
 
 
 def test_decode_tshark_ssid_converts_hex_bytes_to_network_name():

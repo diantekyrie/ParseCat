@@ -481,9 +481,16 @@ via a `backend` field so it can be honest about relative completeness:
   The hand-rolled RSSI extraction was checked byte-for-byte against
   scapy's own `RadioTap.dBm_AntSignal` decoding (0 mismatches across 3000
   real packets) before being trusted for a full-file run. Deauth/disassoc
-  reason codes and TCP retransmission analysis are tshark-only -- the
-  fallback's `note` field says so explicitly on every result rather than
-  silently omitting them. Ethernet/IP-linktype captures (not 802.11
+  reason codes are now decoded on both backends (#70): the fallback's
+  24-byte management header is followed by the Reason Code as the frame
+  body's only fixed field for these two subtypes, read directly the same
+  way as every other fallback field. TCP retransmission analysis stays
+  tshark-only, permanently -- it's tshark's own stream/ACK-tracking
+  verdict, and hand-rolling an equivalent on either fallback would mean
+  inventing a heuristic this project has no way to verify against
+  tshark's own analysis. Each fallback's `note` field says so explicitly
+  on every result rather than silently omitting it. Ethernet/IP-linktype
+  captures (not 802.11
   monitor mode, which is unusually large because it captures every nearby
   device's traffic) use real scapy dissection instead, since those
   captures are typically small enough for scapy's per-packet overhead to

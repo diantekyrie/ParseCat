@@ -391,3 +391,13 @@ def test_upload_response_parse_warnings_are_scrubbed(monkeypatch):
     assert (payload["identity_warning"] is not None) == (
         UNVERIFIED_DEVICE_IDENTITY_WARNING in payload["parse_warnings"]
     )
+
+
+def test_identity_warning_survives_redact_pii_unchanged():
+    """Review on #106: the upload route matches identity_warning by equality
+    against the *scrubbed* parse_warnings list, so the fixed template must be a
+    fixed point of redact_pii(). Pins that invariant directly."""
+    from app.services.persistence import UNVERIFIED_DEVICE_IDENTITY_WARNING
+    from app.services.pii_redaction import redact_pii
+
+    assert redact_pii(UNVERIFIED_DEVICE_IDENTITY_WARNING) == UNVERIFIED_DEVICE_IDENTITY_WARNING

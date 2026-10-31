@@ -210,6 +210,11 @@ def _as_utc(dt: datetime | None) -> datetime | None:
 # redact_pii() (emails, phones, IMEI/MEID/IMSI/ICCID, account names).
 # Structured identifiers (serial, fingerprint, MAC, SSID/BSSID, lat/long)
 # are intentionally untouched pending a separate FE/owner policy decision.
+# CDM/companion display_name (a user-chosen nickname, e.g. "Jane's Watch")
+# also goes through redact_pii() to catch an email/phone typed into the
+# field, but whether the nickname itself should be redacted outright is
+# the same kind of FE/owner policy call as the structured identifiers
+# above, not resolved here (#97).
 def persist_capture(
     session: Session,
     device_label: str,
@@ -225,7 +230,7 @@ def persist_capture(
         device_id=device.id,
         original_filename=original_filename,
         captured_at=_as_utc(captured_at),
-        parse_warnings="\n".join(parsed.parse_warnings),
+        parse_warnings="\n".join(redact_pii(w) for w in parsed.parse_warnings),
     )
     session.add(capture)
     session.commit()
@@ -493,7 +498,7 @@ def persist_capture(
     for e in parsed.cdm_pairing_events:
         session.add(CdmPairingEventRow(
             capture_id=capture.id, timestamp=e.timestamp, level=e.level, tag=e.tag,
-            kind=e.kind, mac_address=e.mac_address, display_name=e.display_name,
+            kind=e.kind, mac_address=e.mac_address, display_name=redact_pii(e.display_name),
             package_name=e.package_name, association_id=e.association_id,
             detail=redact_pii(e.detail),
             source_section=e.source_ref.section,
@@ -618,7 +623,7 @@ def persist_capture(
     for a in parsed.companion_device_associations:
         session.add(CompanionDeviceAssociationRow(
             capture_id=capture.id, association_id=a.association_id, mac_address=a.mac_address,
-            display_name=a.display_name, package_name=a.package_name, device_profile=a.device_profile,
+            display_name=redact_pii(a.display_name), package_name=a.package_name, device_profile=a.device_profile,
             self_managed=a.self_managed, revoked=a.revoked, pending=a.pending, trusted=a.trusted,
             time_approved=a.time_approved, last_time_connected=a.last_time_connected,
             currently_connected=a.currently_connected,

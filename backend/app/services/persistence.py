@@ -52,6 +52,7 @@ from app.models.db_models import (
     BtFrameworkEventRow,
 )
 from app.parsers.base import DeviceInfo, ParsedCapture
+from app.services.pii_redaction import redact_pii
 
 
 # Hardware identity compared at persist time so two physical devices cannot
@@ -205,6 +206,15 @@ def _as_utc(dt: datetime | None) -> datetime | None:
     return dt
 
 
+# Free-text columns copied verbatim from device logs go through
+# redact_pii() (emails, phones, IMEI/MEID/IMSI/ICCID, account names).
+# Structured identifiers (serial, fingerprint, MAC, SSID/BSSID, lat/long)
+# are intentionally untouched pending a separate FE/owner policy decision.
+# CDM/companion display_name (a user-chosen nickname, e.g. "Jane's Watch")
+# also goes through redact_pii() to catch an email/phone typed into the
+# field, but whether the nickname itself should be redacted outright is
+# the same kind of FE/owner policy call as the structured identifiers
+# above, not resolved here (#97).
 def persist_capture(
     session: Session,
     device_label: str,
@@ -220,7 +230,7 @@ def persist_capture(
         device_id=device.id,
         original_filename=original_filename,
         captured_at=_as_utc(captured_at),
-        parse_warnings="\n".join(parsed.parse_warnings),
+        parse_warnings="\n".join(redact_pii(w) for w in parsed.parse_warnings),
     )
     session.add(capture)
     session.commit()
@@ -250,7 +260,7 @@ def persist_capture(
             capture_id=capture.id,
             timestamp=e.timestamp, event_type=e.event_type, package=e.package,
             uid=e.uid, pid=e.pid, usage=e.usage,
-            request_result=e.request_result, loss_code=e.loss_code, detail=e.detail,
+            request_result=e.request_result, loss_code=e.loss_code, detail=redact_pii(e.detail),
             source_section=e.source_ref.section,
             source_line_start=e.source_ref.line_start,
             source_line_end=e.source_ref.line_end,
@@ -311,9 +321,10 @@ def persist_capture(
         session.add(CrashEventRow(
             capture_id=capture.id,
             timestamp=c.timestamp, thread=c.thread, package=c.package, pid=c.pid,
-            exception_class=c.exception_class, message=c.message,
-            root_cause_class=c.root_cause_class, root_cause_message=c.root_cause_message,
-            root_cause_frame=c.root_cause_frame,
+            exception_class=c.exception_class, message=redact_pii(c.message),
+            root_cause_class=c.root_cause_class,
+            root_cause_message=redact_pii(c.root_cause_message),
+            root_cause_frame=redact_pii(c.root_cause_frame),
             source_section=c.source_ref.section,
             source_line_start=c.source_ref.line_start,
             source_line_end=c.source_ref.line_end,
@@ -323,17 +334,18 @@ def persist_capture(
         session.add(TombstoneRow(
             capture_id=capture.id, filename=t.filename, modified_at=t.modified_at,
             timestamp=t.timestamp, build_fingerprint=t.build_fingerprint,
-            executable=t.executable, cmdline=t.cmdline, package=t.package,
+            executable=t.executable, cmdline=redact_pii(t.cmdline), package=t.package,
             pid=t.pid, tid=t.tid, thread_name=t.thread_name, uid=t.uid,
             signal_number=t.signal_number, signal_name=t.signal_name,
             signal_code=t.signal_code, fault_addr=t.fault_addr, abi=t.abi,
-            top_frame=t.top_frame,
+            top_frame=redact_pii(t.top_frame),
         ))
 
     for a in parsed.anrs:
         session.add(AnrRow(
             capture_id=capture.id, filename=a.filename, timestamp=a.timestamp,
-            subject=a.subject, pid=a.pid, package=a.package, reason=a.reason,
+            subject=redact_pii(a.subject), pid=a.pid, package=a.package,
+            reason=redact_pii(a.reason),
             timeout_ms=a.timeout_ms, rss_kb=a.rss_kb,
         ))
         for bt in a.blocking_threads:
@@ -349,8 +361,8 @@ def persist_capture(
     for snap in parsed.anr_main_thread_snapshots:
         session.add(AnrMainThreadSnapshotRow(
             capture_id=capture.id, pid=snap.pid, process=snap.process,
-            state=snap.state, held_mutexes=snap.held_mutexes,
-            top_frames_json=json.dumps(snap.top_frames),
+            state=snap.state, held_mutexes=redact_pii(snap.held_mutexes),
+            top_frames_json=json.dumps([redact_pii(f) for f in snap.top_frames]),
             source_section=snap.source_ref.section,
             source_line_start=snap.source_ref.line_start,
             source_line_end=snap.source_ref.line_end,
@@ -360,7 +372,7 @@ def persist_capture(
         session.add(KernelLogEventRow(
             capture_id=capture.id, boot_relative_sec=ev.boot_relative_sec,
             priority=ev.priority, priority_name=ev.priority_name, thread=ev.thread,
-            message=ev.message, is_panic_family=ev.is_panic_family,
+            message=redact_pii(ev.message), is_panic_family=ev.is_panic_family,
             source_section=ev.source_ref.section,
             source_line_start=ev.source_ref.line_start,
             source_line_end=ev.source_ref.line_end,
@@ -442,6 +454,10 @@ def persist_capture(
             frame_type_breakdown_json=json.dumps([{"label": f.label, "count": f.count} for f in pa.frame_type_breakdown]),
             identity_signals_json=json.dumps([{"kind": s.kind, "value": s.value, "count": s.count} for s in pa.identity_signals]),
             anomalies_json=json.dumps([
+                # Deliberately not redact_pii()'d: packet-capture anomaly `detail` is a
+                # parser-built template (frame label, reason code, ip_src -> ip_dst),
+                # never copied log text. The IPs are structured identifiers, same
+                # FE / owner policy bucket as MAC / SSID.
                 {"timestamp": a.timestamp, "kind": a.kind, "detail": a.detail, "mac_or_ip": a.mac_or_ip}
                 for a in pa.anomalies
             ]),
@@ -462,7 +478,7 @@ def persist_capture(
             capture_id=capture.id, timestamp=e.timestamp, kind=e.kind,
             action=e.action, profile=e.profile, address=e.address,
             from_state=e.from_state, to_state=e.to_state,
-            reason_code=e.reason_code, reason_name=e.reason_name, detail=e.detail,
+            reason_code=e.reason_code, reason_name=e.reason_name, detail=redact_pii(e.detail),
             source_section=e.source_ref.section,
             source_line_start=e.source_ref.line_start,
             source_line_end=e.source_ref.line_end,
@@ -482,8 +498,9 @@ def persist_capture(
     for e in parsed.cdm_pairing_events:
         session.add(CdmPairingEventRow(
             capture_id=capture.id, timestamp=e.timestamp, level=e.level, tag=e.tag,
-            kind=e.kind, mac_address=e.mac_address, display_name=e.display_name,
-            package_name=e.package_name, association_id=e.association_id, detail=e.detail,
+            kind=e.kind, mac_address=e.mac_address, display_name=redact_pii(e.display_name),
+            package_name=e.package_name, association_id=e.association_id,
+            detail=redact_pii(e.detail),
             source_section=e.source_ref.section,
             source_line_start=e.source_ref.line_start,
             source_line_end=e.source_ref.line_end,
@@ -493,7 +510,7 @@ def persist_capture(
         session.add(ProcessKillEventRow(
             capture_id=capture.id, timestamp=k.timestamp, kind=k.kind,
             user_id=k.user_id, pid=k.pid, process=k.process, package=k.package,
-            oom_adj=k.oom_adj, reason=k.reason, rss_kb=k.rss_kb, proc_state=k.proc_state,
+            oom_adj=k.oom_adj, reason=redact_pii(k.reason), rss_kb=k.rss_kb, proc_state=k.proc_state,
             source_section=k.source_ref.section,
             source_line_start=k.source_ref.line_start,
             source_line_end=k.source_ref.line_end,
@@ -606,7 +623,7 @@ def persist_capture(
     for a in parsed.companion_device_associations:
         session.add(CompanionDeviceAssociationRow(
             capture_id=capture.id, association_id=a.association_id, mac_address=a.mac_address,
-            display_name=a.display_name, package_name=a.package_name, device_profile=a.device_profile,
+            display_name=redact_pii(a.display_name), package_name=a.package_name, device_profile=a.device_profile,
             self_managed=a.self_managed, revoked=a.revoked, pending=a.pending, trusted=a.trusted,
             time_approved=a.time_approved, last_time_connected=a.last_time_connected,
             currently_connected=a.currently_connected,

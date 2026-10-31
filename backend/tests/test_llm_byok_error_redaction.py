@@ -147,3 +147,45 @@ def test_truncated_key_echo_leaks_no_chars_past_prefix():
     assert DUMMY_KEY[8:20] not in out
     assert DUMMY_KEY[:8] not in out
     assert "[redacted]-" not in out
+
+
+@pytest.mark.parametrize("echo", [
+    "AIzaSyFAKE...wxyz",
+    "AIzaSyFAKE\u2026wxyz",
+    "AIzaSyFAKEtrunc...",
+    "AIzaSyFAKE",
+    "gsk_FAKE1234...wxyz",
+    "xai-FAKE1234...wxyz",
+    "pplx-FAKE1234...wxyz",
+    "pplx-FAKE1234567890abcdef",
+    "hf_FAKE1234...wxyz",
+    "hf_FAKE1234567890abcdefgh",
+])
+def test_masked_and_truncated_non_sk_keys_are_redacted(echo):
+    out = reasoning._redact_llm_error(f"Error code: 401 - invalid key {echo} rejected", None)
+    assert "Error code: 401" in out
+    assert "FAKE" not in out
+    assert "wxyz" not in out
+    assert out.endswith("rejected")
+
+
+@pytest.mark.parametrize("benign", [
+    "Error code: 401 from openai (request id req_7f3a9c)",
+    "model gemini-1.5-flash not found",
+    "Google API returned 403 for model gemini-pro",
+    "trace id 3fa85f6457174562 not found",
+    "see xai docs and hf hub; gsk is a prefix",
+    "model xai-grok-2 not found",
+    "hf_hub download failed",
+    "unknown prefix AIza and pplx- and gsk_",
+])
+def test_non_key_error_text_not_over_redacted(benign):
+    assert reasoning._redact_llm_error(benign, None) == benign
+
+
+def test_single_dot_mask_leaves_only_last_four():
+    # Known, accepted gap (see comment above _KEY_LIKE_RE): the prefix part
+    # is redacted, only the last-4 tail survives.
+    out = reasoning._redact_llm_error("bad key AIzaSyFAKE.wxyz", None)
+    assert "FAKE" not in out
+    assert out == "bad key [redacted].wxyz"

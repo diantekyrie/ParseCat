@@ -1,0 +1,442 @@
+"""PII scrubbing of free-text log fields before persistence.
+
+All values are synthetic: example.com / example.org mailboxes, NANP 555-01xx
+fictional numbers, Ofcom drama-range UK numbers, the textbook Luhn-valid
+example IMEI 490154203237518, and made-up IMSI/ICCID/MEID digit runs. No real
+capture content.
+"""
+from __future__ import annotations
+
+import json
+
+import pytest
+from sqlmodel import Session, SQLModel, create_engine, select
+
+from app.models.db_models import (
+    AnrMainThreadSnapshotRow, AnrRow, BtFrameworkEventRow, CdmPairingEventRow,
+    CompanionDeviceAssociationRow, CrashEventRow, FocusEventRow, KernelLogEventRow,
+    ProcessKillEventRow, TombstoneRow,
+)
+from app.parsers.base import (
+    AnrFacts, AnrMainThreadSnapshot, BtFrameworkEvent, CdmPairingEvent, CompanionDeviceAssociation,
+    CrashEvent, FocusEvent, KernelLogEvent, ParsedCapture, ProcessKillEvent, SourceRef, TombstoneFacts,
+)
+from app.services.persistence import persist_capture
+from app.services.pii_redaction import (
+    ACCOUNT_TOKEN, EMAIL_TOKEN, ICCID_TOKEN, IMEI_TOKEN, IMSI_TOKEN,
+    MEID_TOKEN, PHONE_TOKEN, redact_pii,
+)
+
+# ---------------------------------------------------------------- positives
+
+@pytest.mark.parametrize("text, secret, token", [
+    ("Login failed for jane.doe+test@example.com: 401", "jane.doe+test@example.com", EMAIL_TOKEN),
+    ("to=<ops@mail.example.org>", "ops@mail.example.org", EMAIL_TOKEN),
+    ("dialing (415) 555-0123 now", "(415) 555-0123", PHONE_TOKEN),
+    ("callback 415-555-0199", "415-555-0199", PHONE_TOKEN),
+    ("callback 415.555.0142.", "415.555.0142", PHONE_TOKEN),
+    ("number=+1 202-555-0147 state=RINGING", "+1 202-555-0147", PHONE_TOKEN),
+    ("msisdn +14155550123 ok", "+14155550123", PHONE_TOKEN),
+    # space-grouped forms need a phone keyword or tel: anchor (see negatives)
+    ("phone +44 20 7946 0958 ok", "+44 20 7946 0958", PHONE_TOKEN),
+    ("phoneNumber=415 555 0123", "415 555 0123", PHONE_TOKEN),
+    ("caller (415) 555 0188 ringing", "555 0188", PHONE_TOKEN),
+    ("uri tel:+1 415 555 0166", "415 555 0166", PHONE_TOKEN),
+    ("intl +4420-7946-0958 ok", "+4420-7946-0958", PHONE_TOKEN),
+    ("home +1 (415) 555-0155", "555-0155", PHONE_TOKEN),
+    ("uri tel:+1-415-555-0177", "415-555-0177", PHONE_TOKEN),
+    ("device 49-015420-323751-8 registered", "49-015420-323751-8", IMEI_TOKEN),
+    ("deviceId=490154203237518 ok", "490154203237518", IMEI_TOKEN),
+    ("IMEI: 490154203237518", "490154203237518", IMEI_TOKEN),
+    ("imei=35123456789012 (no luhn, keyword)", "35123456789012", IMEI_TOKEN),
+    ("IMSI: 310260123456789", "310260123456789", IMSI_TOKEN),
+    ("iccid=8901260123456789012F", "8901260123456789012", ICCID_TOKEN),
+    ("meid=A1000012345678", "A1000012345678", MEID_TOKEN),
+    ("Account {name=Jane Doe, type=com.example.chat}", "Jane Doe", ACCOUNT_TOKEN),
+    ("Account {name=jdoe@example.com, type=com.google}", "jdoe@example.com", ACCOUNT_TOKEN),
+    ("sync accountName=jdoe_42 authority=x", "jdoe_42", ACCOUNT_TOKEN),
+    # #99: bare "cell" dropped, but "cellphone" / "cell phone" still count
+    ("cellphone 415-555-0123", "415-555-0123", PHONE_TOKEN),
+    ("cell phone 415-555-0123", "415-555-0123", PHONE_TOKEN),
+    # #99: "number=" only counts when the value itself is phone-shaped
+    ("number=+14155550123", "+14155550123", PHONE_TOKEN),
+    ("number=800-555-0199", "800-555-0199", PHONE_TOKEN),
+    # #103 review: real phone shapes after number= / cell stay redacted
+    ("number=4155550123", "4155550123", PHONE_TOKEN),
+    ("number=14155550123", "14155550123", PHONE_TOKEN),
+    ("number=415 555 0123", "415 555 0123", PHONE_TOKEN),
+    ("number=415-555.0123", "415-555.0123", PHONE_TOKEN),
+    ("number=(415) 555-0123", "(415) 555-0123", PHONE_TOKEN),
+    ("cell 415 555 0123", "415 555 0123", PHONE_TOKEN),
+    ("cell=4155550123", "4155550123", PHONE_TOKEN),
+    ("cell: 415-555-0123", "415-555-0123", PHONE_TOKEN),
+    ("number: 415 555 0123", "415 555 0123", PHONE_TOKEN),
+])
+def test_each_pii_type_is_redacted(text, secret, token):
+    out = redact_pii(text)
+    assert secret not in out
+    assert token in out
+
+
+def test_multiple_pii_in_one_crash_message():
+    msg = ("java.lang.IllegalStateException: user jdoe@example.com phone "
+           "(415) 555-0123 imei 490154203237518")
+    out = redact_pii(msg)
+    assert out == ("java.lang.IllegalStateException: user [redacted-email] phone "
+                   "[redacted-phone] imei [redacted-imei]")
+
+
+def test_idempotent_and_none_passthrough():
+    once = redact_pii("a@example.com +14155550123")
+    assert redact_pii(once) == once
+    assert redact_pii(None) is None
+    assert redact_pii("") == ""
+
+
+# ---------------------------------------------------------------- negatives
+
+@pytest.mark.parametrize("text", [
+    # timestamps
+    "10-22 12:31:00.123  1234  5678 E AndroidRuntime: FATAL EXCEPTION: main",
+    "2026-10-22T12:31:00.123456789Z",
+    "2026-10-22 12:31:00+0800",
+    "[ 1234.567890] init: Service 'vold' (pid 345) exited",
+    "[  +0.000123] usb 1-1: new high-speed USB device",
+    "epoch_ms=1761161460123 epoch_s=1761161460 elapsed=+1234ms",
+    # pids / tids / uids
+    "Process: com.example.app, PID: 12345",
+    "pid=12345 tid=12399 uid=10234",
+    # MACs
+    "Connected to aa:bb:cc:dd:ee:ff reason=3",
+    "BluetoothDevice 00:11:22:33:44:55 bond state 11 -> 12",
+    # hex pointers / fault addrs
+    "fault addr 0x0000007b2c4d1e80",
+    "pc 000000000004f3a8  /apex/com.android.runtime/lib64/bionic/libc.so (abort+164)",
+    "x0  0000007123456789012345  x1 0000000000000000",
+    # build fingerprints / ids / versions
+    "google/oriole/oriole:14/UP1A.231005.007/10754064:user/release-keys",
+    "versionName=23.42.18 (190400-574239231) versionCode=234218035",
+    "Linux version 5.10.198-android13-4-00050-g12f3388fd5ea",
+    "android.hardware.bluetooth@1.0::IBluetoothHci/default",
+    "vendor.qti.hardware.wifi@1.0-service",
+    "memcpy@GLIBC_2.14",
+    # package names
+    "com.google.android.gms.persistent",
+    "com.example.app:remote",
+    # 802.11 reason text
+    "CTRL-EVENT-DISCONNECTED bssid=aa:bb:cc:dd:ee:ff reason=3 locally_generated=1",
+    "reason 15: 4-way handshake timeout",
+    # IPs and sizes
+    "dhcp lease 192.168.1.23 gw 192.168.1.1",
+    "allocated 1048576 bytes, rss 2147483648",
+    # space-separated numeric columns (meminfo, LMK, dimensions, latencies)
+    # must not be read as NANP / E.164 phones without a keyword (Arch, PR #96)
+    "dims 800 600 1080 1920",
+    "sizes 212 555 1234 bytes",
+    "latency +100 200 300 4000",
+    "offset +1 234 567 8901",
+    "lmk minfree 18432 23040 27648 32256 55296 80640",
+    "phone state 0 1 2",
+    # bare 15-digit runs are never IMEI-redacted without a keyword/format,
+    # even when Luhn-valid (real capture: kernel ns timestamp passed Luhn)
+    "counter 123456789012345 ticks",
+    "gti.0: Drop obsolete input(IDX=1529267 IN_TS=490154203237518 TS=575859122191399 DELTA=4141506 ns)!",
+    "deviceId=123456789012345",
+    # Java Class@hash toString glued to a package path (real audio-focus clientId shape)
+    "clientId=android.media.AudioManager$1@1a2b3c4com.example.media.player.LocalMediaPlayerController@e5e02de",
+    "listener=com.example.Foo$Bar@9f8e7d6com.example.app.Player",
+    # #99: bare "cell" is cell-identity data (MCC/MNC/LAC/CID), not a phone
+    "cell 310 260 12345 678",
+    "cell=310260123456789",
+    # #99: "number" alone must not treat an epoch-ms timestamp as a phone
+    "number: 1792698392012",
+    # #103 review boundaries: epoch seconds, trailing numeric columns
+    "number: 1792698392",
+    "cell 310 260 1234 567",
+    "number=415 555 0123 4567",
+    # bare prose "cell" with no phone value stays untouched
+    "Serving cell changed after handover",
+    "cell info refreshed at 1792698392012",
+])
+def test_non_pii_left_unchanged(text):
+    assert redact_pii(text) == text
+
+
+# ------------------------------------------------- pinned known residuals
+# These pin documented tradeoffs so a later regex change can't flip them
+# silently (Arch review on PR #110). Changing either is an FE call.
+
+def test_residual_bare_cell_triple_is_over_redacted():
+    # Over-redaction: MCC/MNC/LAC-shaped `cell 310 260 1234` with nothing
+    # after it has a complete NANP space-grouped shape. Pending FE decision.
+    assert redact_pii("cell 310 260 1234") == "cell " + PHONE_TOKEN
+
+
+@pytest.mark.parametrize("text", [
+    "cell 415 555 0123 4",
+    "cell=415-555-0123-",
+    "number=415 555 0123 4",
+])
+def test_residual_phone_with_trailing_column_is_not_redacted(text):
+    # Leak-direction false negative, listed in the module docstring: a
+    # phone followed by another numeric column / glued digit or dash after
+    # `number` / bare `cell` is skipped so cell-identity tuples survive.
+    assert redact_pii(text) == text
+
+
+# ------------------------------------------------------------- persistence
+
+def _ref():
+    return SourceRef(section="system_log", line_start=1, line_end=1)
+
+
+def test_persisted_rows_have_no_email_or_phone():
+    pii = "user jdoe@example.com call (415) 555-0123 imei=490154203237518"
+    parsed = ParsedCapture()
+    parsed.crash_events.append(CrashEvent(
+        timestamp="10-22 12:31:00.123", thread="main", package="com.example.app",
+        pid=12345, exception_class="java.lang.RuntimeException", message=pii,
+        root_cause_class="java.lang.IllegalStateException", root_cause_message=pii,
+        root_cause_frame="com.example.app.Main.run(Main.java:42)", source_ref=_ref(),
+    ))
+    parsed.kernel_log_events.append(KernelLogEvent(
+        boot_relative_sec=12.5, priority=3, priority_name="err", thread="kworker/0:1",
+        message=pii, is_panic_family=False, source_ref=_ref(),
+    ))
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        cap = persist_capture(session, "synthetic-device", "synthetic.txt", parsed)
+        crash = session.exec(select(CrashEventRow).where(CrashEventRow.capture_id == cap.id)).one()
+        kern = session.exec(select(KernelLogEventRow).where(KernelLogEventRow.capture_id == cap.id)).one()
+
+        for stored in (crash.message, crash.root_cause_message, kern.message):
+            assert "jdoe@example.com" not in stored
+            assert "555-0123" not in stored
+            assert "490154203237518" not in stored
+            assert EMAIL_TOKEN in stored and PHONE_TOKEN in stored and IMEI_TOKEN in stored
+        # structured / non-free-text fields untouched
+        assert crash.pid == 12345
+        assert crash.package == "com.example.app"
+        assert crash.root_cause_frame == "com.example.app.Main.run(Main.java:42)"
+        assert kern.thread == "kworker/0:1"
+
+
+def test_every_redacted_free_text_column_is_scrubbed_at_persist():
+    """Covers the remaining free-text columns wired in persistence.py; MAC /
+    package / pid fields on the same rows must survive untouched."""
+    pii = "jdoe@example.com +14155550123"
+    mac = "aa:bb:cc:dd:ee:ff"
+    p = ParsedCapture()
+    p.focus_events.append(FocusEvent(
+        timestamp="10-22 12:31:00:123", event_type="owner_change", package="com.example.app",
+        uid=10234, pid=12345, usage=None, request_result=None, loss_code=None,
+        detail=pii, source_ref=_ref()))
+    p.tombstones.append(TombstoneFacts(
+        filename="tombstone_00", modified_at="2026-10-22 12:31", timestamp=None,
+        build_fingerprint="google/oriole/oriole:14/UP1A.231005.007/10754064:user/release-keys",
+        executable="/system/bin/app_process64", cmdline="com.example.app --user " + pii,
+        package="com.example.app", pid=12345, tid=12345, thread_name="main", uid=10234,
+        signal_number=11, signal_name="SIGSEGV", signal_code="SEGV_MAPERR",
+        fault_addr="0x0000007b2c4d1e80", abi="arm64", top_frame=None))
+    p.anrs.append(AnrFacts(
+        filename="anr_00", timestamp=None, subject="Input dispatching timed out " + pii,
+        pid=12345, package="com.example.app", reason="Input dispatching timed out " + pii,
+        timeout_ms=5000, rss_kb=None))
+    p.cdm_pairing_events.append(CdmPairingEvent(
+        timestamp="10-22 12:31:00.123", level="I", tag="CDM_AssociationStore",
+        kind="anomaly", mac_address=mac, display_name="Synthetic Watch",
+        package_name="com.example.companion", association_id=7,
+        detail=f"assoc {mac} owner {pii}", source_ref=_ref()))
+    p.process_kills.append(ProcessKillEvent(
+        timestamp="10-22 12:31:00.123", kind="kill", user_id=0, pid=12345,
+        process="com.example.app", package="com.example.app", oom_adj=900,
+        reason="empty " + pii, rss_kb=None, proc_state=None, source_ref=_ref()))
+    p.bt_framework_events.append(BtFrameworkEvent(
+        timestamp="10-22 12:31:00.123", kind="connection", action="CONNECTED",
+        profile="HEADSET", address=mac, from_state=None, to_state=None,
+        reason_code=None, reason_name=None, detail=f"{mac} name {pii}", source_ref=_ref()))
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        cap = persist_capture(s, "synthetic-device", "synthetic.txt", p)
+        def one(model):
+            return s.exec(select(model).where(model.capture_id == cap.id)).one()
+        focus, tomb, anr, cdm, kill, bt = (one(m) for m in (
+            FocusEventRow, TombstoneRow, AnrRow, CdmPairingEventRow,
+            ProcessKillEventRow, BtFrameworkEventRow))
+        stored = [focus.detail, tomb.cmdline, anr.subject, anr.reason,
+                  cdm.detail, kill.reason, bt.detail]
+        for text in stored:
+            assert "jdoe@example.com" not in text and "4155550123" not in text, text
+            assert EMAIL_TOKEN in text and PHONE_TOKEN in text, text
+        assert mac in cdm.detail and mac in bt.detail
+        assert cdm.mac_address == mac and bt.address == mac
+        assert tomb.fault_addr == "0x0000007b2c4d1e80"
+        assert tomb.build_fingerprint.endswith("10754064:user/release-keys")
+        assert anr.package == kill.package == "com.example.app"
+
+
+# --------------------------------------- Arch review on 9f694d2 (PR #96)
+
+@pytest.mark.parametrize("text, expected", [
+    # space-containing display name in the key=value form goes whole
+    ("SyncManager: accountName=Jane Doe failed to sync",
+     "SyncManager: accountName=[redacted-account] failed to sync"),
+    ("authAccount: Jane Mary Doe-Smith}", "authAccount: [redacted-account]}"),
+    ('account_name="jane q doe", type=com.example', "account_name=[redacted-account], type=com.example"),
+    ("ACCOUNT_NAME=Jane Doe Rest=1", "ACCOUNT_NAME=[redacted-account] Rest=1"),
+    # listed false negative: unquoted lower-case multi-word name keeps its tail
+    ("accountName=jane doe", "accountName=[redacted-account] doe"),
+])
+def test_account_kv_display_name_with_spaces(text, expected):
+    out = redact_pii(text)
+    assert out == expected
+    assert redact_pii(out) == out  # idempotent, no "[redacted-account]]"
+
+
+def test_stack_frame_columns_are_scrubbed_at_persist():
+    """top_frames_json, tombstone top_frame, crash root_cause_frame and ANR
+    held_mutexes are log-derived text too; ordinary frames must survive."""
+    pii = "jdoe@example.com"
+    plain = "at com.example.app.Main.run(Main.java:42)"
+    p = ParsedCapture()
+    p.crash_events.append(CrashEvent(
+        timestamp="10-22 12:31:00.123", thread="main", package="com.example.app",
+        pid=12345, exception_class="java.lang.RuntimeException", message="boom",
+        root_cause_class="java.lang.IllegalStateException", root_cause_message="boom",
+        root_cause_frame=f"com.example.app.Login.as({pii})", source_ref=_ref()))
+    p.tombstones.append(TombstoneFacts(
+        filename="tombstone_00", modified_at="2026-10-22 12:31", timestamp=None,
+        build_fingerprint=None, executable="/system/bin/app_process64", cmdline=None,
+        package="com.example.app", pid=12345, tid=12345, thread_name="main", uid=10234,
+        signal_number=11, signal_name="SIGSEGV", signal_code="SEGV_MAPERR",
+        fault_addr="0x0000007b2c4d1e80", abi="arm64",
+        top_frame=f"#00 pc 0x1e80 /data/user/0/{pii}/lib.so"))
+    p.anr_main_thread_snapshots.append(AnrMainThreadSnapshot(
+        pid=12345, process="com.example.app", state="Blocked",
+        held_mutexes=f"mutator lock owner {pii}",
+        top_frames=[f"at com.example.app.Sync.run(account {pii})", plain],
+        source_ref=_ref()))
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        cap = persist_capture(s, "synthetic-device", "synthetic.txt", p)
+        def one(model):
+            return s.exec(select(model).where(model.capture_id == cap.id)).one()
+        crash, tomb, snap = one(CrashEventRow), one(TombstoneRow), one(AnrMainThreadSnapshotRow)
+        frames = json.loads(snap.top_frames_json)
+        for text in (crash.root_cause_frame, tomb.top_frame, snap.held_mutexes, frames[0]):
+            assert pii not in text and EMAIL_TOKEN in text, text
+        assert frames[1] == plain
+        assert snap.state == "Blocked" and tomb.fault_addr == "0x0000007b2c4d1e80"
+
+
+# ------------------------------------------------------------- #97 follow-up
+
+def test_parse_warnings_and_display_name_are_scrubbed_at_persist():
+    """#97: parse_warnings (returned by the upload API) and CDM / companion
+    display_name weren't run through redact_pii(). Both now are."""
+    pii = "jdoe@example.com"
+    mac = "aa:bb:cc:dd:ee:ff"
+    p = ParsedCapture()
+    p.parse_warnings.append(f"No 'wifi' dumpsys section found for {pii}")
+    p.cdm_pairing_events.append(CdmPairingEvent(
+        timestamp="10-22 12:31:00.123", level="I", tag="CDM_AssociationStore",
+        kind="anomaly", mac_address=mac, display_name=f"Jane's Watch ({pii})",
+        package_name="com.example.companion", association_id=7,
+        detail="synthetic", source_ref=_ref()))
+    p.companion_device_associations.append(CompanionDeviceAssociation(
+        association_id=7, mac_address=mac, display_name=f"Jane's Watch ({pii})",
+        package_name="com.example.companion", device_profile="WATCH",
+        self_managed=False, revoked=False, pending=False, trusted=True,
+        time_approved="Thu Jun 25 10:08:12 PDT 2026", last_time_connected="None",
+        currently_connected=False, source_ref=_ref()))
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        cap = persist_capture(s, "synthetic-device-97", "synthetic.txt", p)
+        cdm = s.exec(select(CdmPairingEventRow).where(CdmPairingEventRow.capture_id == cap.id)).one()
+        cda = s.exec(
+            select(CompanionDeviceAssociationRow).where(CompanionDeviceAssociationRow.capture_id == cap.id)
+        ).one()
+        assert pii not in cap.parse_warnings and EMAIL_TOKEN in cap.parse_warnings
+        assert pii not in cdm.display_name and EMAIL_TOKEN in cdm.display_name
+        assert pii not in cda.display_name and EMAIL_TOKEN in cda.display_name
+        # the nickname text itself (not matched by any regex) survives
+        assert "Jane's Watch" in cdm.display_name and "Jane's Watch" in cda.display_name
+        assert cdm.mac_address == mac and cda.mac_address == mac
+
+
+def test_upload_response_parse_warnings_are_scrubbed(monkeypatch):
+    """#97 / Arch on #105: the upload route echoed raw parsed.parse_warnings in
+    its JSON response even though the persisted copy was scrubbed. Drive the
+    real POST /api/captures path with a synthetic bugreport and inject a
+    warning carrying an email (as `Packet-level protocol analysis failed:
+    {exc}` could), then assert the response JSON is scrubbed."""
+    from fastapi.testclient import TestClient
+    from sqlalchemy.pool import StaticPool
+
+    import app.api.routes as routes
+    from app.db import get_session
+    from app.main import app
+    from app.services.ingestion import parse_capture_file as real_parse
+
+    pii = "jdoe@example.com"
+
+    def _parse_with_pii_warning(path, filename):
+        parsed = real_parse(path, filename)
+        parsed.parse_warnings.append(f"Packet-level protocol analysis failed: bad owner {pii}")
+        return parsed
+
+    monkeypatch.setattr(routes, "parse_capture_file", _parse_with_pii_warning)
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+
+    def _override_session():
+        with Session(engine) as session:
+            yield session
+
+    body = (
+        "------ SYSTEM LOG (logcat -v threadtime -v printable -v uid -d *:v) ------\n"
+        "09-02 01:31:53.866  1145  1145 D keystore2: debug line 0\n"
+        "------ 0.326s was the duration of 'SYSTEM LOG' ------\n"
+    )
+    app.dependency_overrides[get_session] = _override_session
+    try:
+        with TestClient(app) as c:
+            r = c.post(
+                "/api/captures",
+                data={"device_label": "synthetic-device-97-api"},
+                files={"file": ("logcat.txt", body.encode(), "text/plain")},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    assert pii not in r.text
+    assert any(EMAIL_TOKEN in w for w in payload["parse_warnings"])
+    # identity_warning equality check still works on the scrubbed list
+    from app.services.persistence import UNVERIFIED_DEVICE_IDENTITY_WARNING
+    assert payload["identity_warning"] in (None, UNVERIFIED_DEVICE_IDENTITY_WARNING)
+    assert (payload["identity_warning"] is not None) == (
+        UNVERIFIED_DEVICE_IDENTITY_WARNING in payload["parse_warnings"]
+    )
+
+
+def test_identity_warning_survives_redact_pii_unchanged():
+    """Review on #106: the upload route matches identity_warning by equality
+    against the *scrubbed* parse_warnings list, so the fixed template must be a
+    fixed point of redact_pii(). Pins that invariant directly."""
+    from app.services.persistence import UNVERIFIED_DEVICE_IDENTITY_WARNING
+    from app.services.pii_redaction import redact_pii
+
+    assert redact_pii(UNVERIFIED_DEVICE_IDENTITY_WARNING) == UNVERIFIED_DEVICE_IDENTITY_WARNING

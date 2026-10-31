@@ -300,8 +300,8 @@ field was originally omitted and left to prompt instructions alone).
 
 ## Multi-capture correlation
 
-Captures are associated with a `Device` (by a label you choose, e.g. a
-serial number) rather than treated as disposable uploads. Any question
+Captures are associated with a `Device` (by a nickname you choose, e.g.
+"work phone") rather than treated as disposable uploads. Any question
 containing trigger words like "never", "across", "history", "week"
 triggers `correlation.package_history_across_device()`, which checks a
 claim (e.g. "has this app ever requested audio focus") against every

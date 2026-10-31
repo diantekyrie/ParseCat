@@ -13,12 +13,13 @@ import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.models.db_models import (
-    AnrMainThreadSnapshotRow, AnrRow, BtFrameworkEventRow, CdmPairingEventRow, CrashEventRow,
-    FocusEventRow, KernelLogEventRow, ProcessKillEventRow, TombstoneRow,
+    AnrMainThreadSnapshotRow, AnrRow, BtFrameworkEventRow, CdmPairingEventRow,
+    CompanionDeviceAssociationRow, CrashEventRow, FocusEventRow, KernelLogEventRow,
+    ProcessKillEventRow, TombstoneRow,
 )
 from app.parsers.base import (
-    AnrFacts, AnrMainThreadSnapshot, BtFrameworkEvent, CdmPairingEvent, CrashEvent, FocusEvent,
-    KernelLogEvent, ParsedCapture, ProcessKillEvent, SourceRef, TombstoneFacts,
+    AnrFacts, AnrMainThreadSnapshot, BtFrameworkEvent, CdmPairingEvent, CompanionDeviceAssociation,
+    CrashEvent, FocusEvent, KernelLogEvent, ParsedCapture, ProcessKillEvent, SourceRef, TombstoneFacts,
 )
 from app.services.persistence import persist_capture
 from app.services.pii_redaction import (
@@ -54,6 +55,12 @@ from app.services.pii_redaction import (
     ("Account {name=Jane Doe, type=com.example.chat}", "Jane Doe", ACCOUNT_TOKEN),
     ("Account {name=jdoe@example.com, type=com.google}", "jdoe@example.com", ACCOUNT_TOKEN),
     ("sync accountName=jdoe_42 authority=x", "jdoe_42", ACCOUNT_TOKEN),
+    # #99: bare "cell" dropped, but "cellphone" / "cell phone" still count
+    ("cellphone 415-555-0123", "415-555-0123", PHONE_TOKEN),
+    ("cell phone 415-555-0123", "415-555-0123", PHONE_TOKEN),
+    # #99: "number=" only counts when the value itself is phone-shaped
+    ("number=+14155550123", "+14155550123", PHONE_TOKEN),
+    ("number=800-555-0199", "800-555-0199", PHONE_TOKEN),
 ])
 def test_each_pii_type_is_redacted(text, secret, token):
     out = redact_pii(text)
@@ -128,6 +135,11 @@ def test_idempotent_and_none_passthrough():
     # Java Class@hash toString glued to a package path (real audio-focus clientId shape)
     "clientId=android.media.AudioManager$1@1a2b3c4com.example.media.player.LocalMediaPlayerController@e5e02de",
     "listener=com.example.Foo$Bar@9f8e7d6com.example.app.Player",
+    # #99: bare "cell" is cell-identity data (MCC/MNC/LAC/CID), not a phone
+    "cell 310 260 12345 678",
+    "cell=310260123456789",
+    # #99: "number" alone must not treat an epoch-ms timestamp as a phone
+    "number: 1792698392012",
 ])
 def test_non_pii_left_unchanged(text):
     assert redact_pii(text) == text
@@ -282,3 +294,40 @@ def test_stack_frame_columns_are_scrubbed_at_persist():
             assert pii not in text and EMAIL_TOKEN in text, text
         assert frames[1] == plain
         assert snap.state == "Blocked" and tomb.fault_addr == "0x0000007b2c4d1e80"
+
+
+# ------------------------------------------------------------- #97 follow-up
+
+def test_parse_warnings_and_display_name_are_scrubbed_at_persist():
+    """#97: parse_warnings (returned by the upload API) and CDM / companion
+    display_name weren't run through redact_pii(). Both now are."""
+    pii = "jdoe@example.com"
+    mac = "aa:bb:cc:dd:ee:ff"
+    p = ParsedCapture()
+    p.parse_warnings.append(f"No 'wifi' dumpsys section found for {pii}")
+    p.cdm_pairing_events.append(CdmPairingEvent(
+        timestamp="10-22 12:31:00.123", level="I", tag="CDM_AssociationStore",
+        kind="anomaly", mac_address=mac, display_name=f"Jane's Watch ({pii})",
+        package_name="com.example.companion", association_id=7,
+        detail="synthetic", source_ref=_ref()))
+    p.companion_device_associations.append(CompanionDeviceAssociation(
+        association_id=7, mac_address=mac, display_name=f"Jane's Watch ({pii})",
+        package_name="com.example.companion", device_profile="WATCH",
+        self_managed=False, revoked=False, pending=False, trusted=True,
+        time_approved="Thu Jun 25 10:08:12 PDT 2026", last_time_connected="None",
+        currently_connected=False, source_ref=_ref()))
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as s:
+        cap = persist_capture(s, "synthetic-device-97", "synthetic.txt", p)
+        cdm = s.exec(select(CdmPairingEventRow).where(CdmPairingEventRow.capture_id == cap.id)).one()
+        cda = s.exec(
+            select(CompanionDeviceAssociationRow).where(CompanionDeviceAssociationRow.capture_id == cap.id)
+        ).one()
+        assert pii not in cap.parse_warnings and EMAIL_TOKEN in cap.parse_warnings
+        assert pii not in cdm.display_name and EMAIL_TOKEN in cdm.display_name
+        assert pii not in cda.display_name and EMAIL_TOKEN in cda.display_name
+        # the nickname text itself (not matched by any regex) survives
+        assert "Jane's Watch" in cdm.display_name and "Jane's Watch" in cda.display_name
+        assert cdm.mac_address == mac and cda.mac_address == mac

@@ -117,7 +117,7 @@ class Device(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("owner_user_id", "label", name="uq_device_owner_label"),)
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    label: str = Field(index=True)  # user-chosen identifier, e.g. serial or nickname -- unique per owner, not globally
+    label: str = Field(index=True)  # user-chosen nickname, e.g. "work phone" -- unique per owner, not globally
     # Nullable so synthetic/unit tests that construct a Device without an
     # authenticated request still work (see persistence.py's default), but
     # every device created through the real upload API always has one --

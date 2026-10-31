@@ -332,6 +332,18 @@ numbers). Rules, no exceptions:
     understood) -- it is NEVER itself evidence. Every factual claim in
     your report must still trace back to the JSON fact bundle for THIS
     turn, per rule 1, even when answering a follow-up.
+15. Some fact text has been scrubbed of personal data before it ever
+    reached this bundle: a token like "[redacted-email]", "[redacted-
+    phone]", "[redacted-imei]", "[redacted-account]", etc. stands in for a
+    real value that was removed. Quote such a token verbatim exactly as
+    rule 2 requires for confidence labels -- never invent, guess, or
+    reconstruct the value it replaced. A token only means "a value of
+    that kind was present here" -- it is NOT an identifier, so it never
+    supports a same-entity or different-entity conclusion. Two facts that
+    both show "[redacted-account]" are NOT thereby the same account, and
+    two that show different redaction kinds are NOT thereby different
+    entities -- the token carries no identity information at all. Never
+    present a redaction token as if it were the real value.
 """
 
 

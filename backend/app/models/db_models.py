@@ -48,7 +48,7 @@ class AwareUTCDateTime(TypeDecorator):
 
 class Device(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    label: str = Field(index=True, unique=True)  # user-chosen identifier, e.g. serial or nickname
+    label: str = Field(index=True, unique=True)  # user-chosen nickname, e.g. "work phone" -- not a serial
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(AwareUTCDateTime(), nullable=False),

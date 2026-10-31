@@ -17,6 +17,7 @@ from app.services.persistence import (
     persist_capture,
     UNVERIFIED_DEVICE_IDENTITY_WARNING,
 )
+from app.services.pii_redaction import redact_pii
 from app.services.reasoning import diagnose, diagnose_investigation, scan_capture
 from app.services.summary import build_capture_summary, build_merged_summary, capture_severity
 
@@ -122,15 +123,20 @@ def upload_capture(
     except DeviceIdentityMismatchError as exc:
         raise HTTPException(status_code=409, detail=exc.as_api_detail()) from exc
 
+    # #97: the response echoes warnings too, so scrub them the same way the
+    # persisted Capture.parse_warnings copy is -- one warning embeds an
+    # arbitrary exception message. The identity warning is a fixed template
+    # with no PII, so it survives redact_pii() unchanged.
+    parse_warnings = [redact_pii(w) for w in parsed.parse_warnings]
     identity_warning = next(
-        (w for w in parsed.parse_warnings if w == UNVERIFIED_DEVICE_IDENTITY_WARNING),
+        (w for w in parse_warnings if w == UNVERIFIED_DEVICE_IDENTITY_WARNING),
         None,
     )
     return {
         "capture_id": capture.id,
         "device_label": device_label,
         "investigation_label": clean_investigation_label,
-        "parse_warnings": parsed.parse_warnings,
+        "parse_warnings": parse_warnings,
         "identity_warning": identity_warning,
         "facts_found": {
             "focus_stack_entries": len(parsed.focus_stack),

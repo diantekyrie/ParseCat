@@ -331,3 +331,63 @@ def test_parse_warnings_and_display_name_are_scrubbed_at_persist():
         # the nickname text itself (not matched by any regex) survives
         assert "Jane's Watch" in cdm.display_name and "Jane's Watch" in cda.display_name
         assert cdm.mac_address == mac and cda.mac_address == mac
+
+
+def test_upload_response_parse_warnings_are_scrubbed(monkeypatch):
+    """#97 / Arch on #105: the upload route echoed raw parsed.parse_warnings in
+    its JSON response even though the persisted copy was scrubbed. Drive the
+    real POST /api/captures path with a synthetic bugreport and inject a
+    warning carrying an email (as `Packet-level protocol analysis failed:
+    {exc}` could), then assert the response JSON is scrubbed."""
+    from fastapi.testclient import TestClient
+    from sqlalchemy.pool import StaticPool
+
+    import app.api.routes as routes
+    from app.db import get_session
+    from app.main import app
+    from app.services.ingestion import parse_capture_file as real_parse
+
+    pii = "jdoe@example.com"
+
+    def _parse_with_pii_warning(path, filename):
+        parsed = real_parse(path, filename)
+        parsed.parse_warnings.append(f"Packet-level protocol analysis failed: bad owner {pii}")
+        return parsed
+
+    monkeypatch.setattr(routes, "parse_capture_file", _parse_with_pii_warning)
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+
+    def _override_session():
+        with Session(engine) as session:
+            yield session
+
+    body = (
+        "------ SYSTEM LOG (logcat -v threadtime -v printable -v uid -d *:v) ------\n"
+        "09-02 01:31:53.866  1145  1145 D keystore2: debug line 0\n"
+        "------ 0.326s was the duration of 'SYSTEM LOG' ------\n"
+    )
+    app.dependency_overrides[get_session] = _override_session
+    try:
+        with TestClient(app) as c:
+            r = c.post(
+                "/api/captures",
+                data={"device_label": "synthetic-device-97-api"},
+                files={"file": ("logcat.txt", body.encode(), "text/plain")},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    assert pii not in r.text
+    assert any(EMAIL_TOKEN in w for w in payload["parse_warnings"])
+    # identity_warning equality check still works on the scrubbed list
+    from app.services.persistence import UNVERIFIED_DEVICE_IDENTITY_WARNING
+    assert payload["identity_warning"] in (None, UNVERIFIED_DEVICE_IDENTITY_WARNING)
+    assert (payload["identity_warning"] is not None) == (
+        UNVERIFIED_DEVICE_IDENTITY_WARNING in payload["parse_warnings"]
+    )

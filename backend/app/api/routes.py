@@ -133,7 +133,10 @@ def upload_capture(
         try:
             parsed = parse_capture_file(tmp_path, file.filename)
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(422, f"Failed to parse upload: {exc}") from exc
+            # #109: a parser exception can embed fragments of the uploaded
+            # log text (a malformed line quoted in the error, for instance),
+            # so this echo needs the same scrub as parse_warnings (#97/#107).
+            raise HTTPException(422, f"Failed to parse upload: {redact_pii(str(exc))}") from exc
     finally:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)

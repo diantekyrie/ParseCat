@@ -337,12 +337,32 @@ def _dot11_addr2(pkt: bytes, dot11_start: int, ftype: int) -> str | None:
 
 
 def _dot11_reason_code(pkt: bytes, dot11_start: int) -> int | None:
-    # #70: for Deauthentication and Disassociation frames, the frame body
-    # is the Reason Code field ALONE (2 bytes, little-endian) -- no other
-    # fixed fields, no IEs -- immediately after the same 24-byte non-QoS/
-    # non-4-address management header used by _dot11_addr2 above: FC(2) +
-    # Duration(2) + addr1(6) + addr2(6) + addr3(6) + SeqCtrl(2).
+    # #70 / Arch review on #115: for Deauthentication and Disassociation
+    # frames, the frame body is the Reason Code field ALONE (2 bytes,
+    # little-endian) -- no other fixed fields, no IEs -- immediately after
+    # the same 24-byte non-QoS/non-4-address management header used by
+    # _dot11_addr2 above: FC(2) + Duration(2) + addr1(6) + addr2(6) +
+    # addr3(6) + SeqCtrl(2). But that only holds for a plaintext frame with
+    # no +HT Control field:
+    #   * Protected bit (FC byte 1, 0x40) -- under 802.11w/PMF, deauth/
+    #     disassoc sent after association are encrypted: the body starts
+    #     with a CCMP/GCMP header, not the reason code. Reading these 2
+    #     bytes would decode ciphertext as a confident-looking (wrong)
+    #     reason -- exactly the fabricated fact this parser must not
+    #     produce, so return None rather than guess.
+    #   * Order bit (FC byte 1, 0x80) -- adds a 4-byte +HT Control field
+    #     between SeqCtrl and the frame body, shifting the reason code.
+    # addr2's offset is unaffected by either bit -- it's part of the fixed
+    # MAC header, before SeqCtrl/+HTC/body -- so _dot11_addr2 needs no
+    # equivalent guard.
+    if dot11_start + 2 > len(pkt):
+        return None
+    fc_byte1 = pkt[dot11_start + 1]
+    if fc_byte1 & 0x40:  # Protected Frame
+        return None
     off = dot11_start + 2 + 2 + 6 + 6 + 6 + 2
+    if fc_byte1 & 0x80:  # Order (+HT Control present)
+        off += 4
     if off + 2 > len(pkt):
         return None
     return struct.unpack("<H", pkt[off:off + 2])[0]

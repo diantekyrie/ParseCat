@@ -60,14 +60,20 @@ def _radiotap_with_rssi(rssi_dbm: int) -> bytes:
     return header + rssi_byte  # 9 bytes total
 
 
-def _dot11_frame_control_bytes(ftype: int, subtype: int, retry: bool = False) -> bytes:
+def _dot11_frame_control_bytes(
+    ftype: int, subtype: int, retry: bool = False,
+    protected: bool = False, order: bool = False,
+) -> bytes:
     byte0 = ((subtype & 0xF) << 4) | ((ftype & 0x3) << 2)
-    byte1 = 0x08 if retry else 0x00
+    byte1 = (0x08 if retry else 0x00) | (0x40 if protected else 0x00) | (0x80 if order else 0x00)
     return bytes([byte0, byte1])
 
 
-def _dot11_mgmt_header(ftype: int, subtype: int, addr2: bytes, retry: bool = False) -> bytes:
-    fc = _dot11_frame_control_bytes(ftype, subtype, retry)
+def _dot11_mgmt_header(
+    ftype: int, subtype: int, addr2: bytes, retry: bool = False,
+    protected: bool = False, order: bool = False,
+) -> bytes:
+    fc = _dot11_frame_control_bytes(ftype, subtype, retry, protected, order)
     duration = b"\x00\x00"
     addr1 = b"\xff\xff\xff\xff\xff\xff"
     addr3 = b"\x11\x22\x33\x44\x55\x66"
@@ -144,10 +150,38 @@ def test_dot11_reason_code_reads_the_two_byte_field_after_the_mgmt_header():
     pkt = (
         _radiotap_with_rssi(-60)
         + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff")
-        + struct.pack("<H", 3)  # reason 3: Deauthenticated due to inactivity
+        + struct.pack("<H", 3)  # reason 3: "Deauthenticated: station leaving"
     )
     _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
     assert _dot11_reason_code(pkt, rt_len) == 3
+
+
+def test_dot11_reason_code_is_none_when_protected_bit_set():
+    # Arch review on #115: under 802.11w/PMF, a protected deauth/disassoc's
+    # body starts with a CCMP/GCMP header, not a plaintext reason code --
+    # these 2 bytes would be ciphertext, not frame 3's actual reason. Must
+    # return None rather than decode (and present as fact) a wrong value.
+    pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff", protected=True)
+        + struct.pack("<H", 3)  # would read as reason 3 if the guard were missing
+    )
+    _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
+    assert _dot11_reason_code(pkt, rt_len) is None
+
+
+def test_dot11_reason_code_shifts_past_ht_control_when_order_bit_set():
+    # Arch review on #115: the Order bit adds a 4-byte +HT Control field
+    # between SeqCtrl and the frame body, shifting the reason code 4 bytes
+    # further in. Reading the un-shifted offset would decode HTC bytes.
+    pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff", order=True)
+        + b"\x00\x00\x00\x00"  # +HT Control (4 bytes), value irrelevant here
+        + struct.pack("<H", 7)  # actual reason code, after the HTC field
+    )
+    _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
+    assert _dot11_reason_code(pkt, rt_len) == 7
 
 
 def test_dot11_reason_code_is_none_when_bytes_are_absent():
@@ -184,8 +218,11 @@ def test_fallback_backend_decodes_deauth_and_disassoc_reason_codes(tmp_path):
     assert "reason code 3 (Deauthenticated: station leaving)" in by_kind["deauthentication"].detail
     assert "reason code 4 (Disassociated due to inactivity)" in by_kind["disassociation"].detail
     # Still real per-packet facts, not guesses -- note no longer claims
-    # reason codes are undecoded on this backend.
-    assert "reason code" not in result.note.lower() or "NOT decoded" not in result.note
+    # reason codes are undecoded on this backend (Arch review on #115:
+    # the prior assertion here was vacuous, true regardless of the note's
+    # actual wording -- this checks the two concrete claims instead).
+    assert "NOT decoded" not in result.note
+    assert "reason codes are exact per-packet facts" in result.note
 
 
 def test_fallback_backend_reason_code_absent_says_so_not_unknown(tmp_path):
@@ -202,6 +239,71 @@ def test_fallback_backend_reason_code_absent_says_so_not_unknown(tmp_path):
     assert len(result.anomalies) == 1
     assert "not present in this packet" in result.anomalies[0].detail
     assert "reason code 0" not in result.anomalies[0].detail
+
+
+def test_fallback_backend_protected_deauth_reports_not_present_not_a_wrong_reason(tmp_path):
+    # Arch review on #115, end-to-end through _analyze_dot11_fallback: a
+    # PMF-protected deauth must never surface a decoded-looking reason code
+    # (its body is ciphertext) -- same "not present" wording as truncated
+    # frames, not a fabricated number.
+    deauth_pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff", protected=True)
+        + struct.pack("<H", 3)
+    )
+    pcap_path = tmp_path / "synthetic.pcap"
+    pcap_path.write_bytes(_pcap_global_header(127) + _pcap_record(deauth_pkt))
+
+    result = _analyze_dot11_fallback(pcap_path)
+    assert len(result.anomalies) == 1
+    assert "not present in this packet" in result.anomalies[0].detail
+    assert "reason code 3" not in result.anomalies[0].detail
+
+
+def test_llm_bound_anomaly_rows_keep_reason_code_text_drop_mac(tmp_path):
+    # Arch review on #115: a fixture-based check of the actual LLM-bound
+    # payload (not just the parser's own PacketAnomalyEvent), mirroring how
+    # persistence.py serializes anomalies and reasoning._llm_safe_evidence_row
+    # filters them before they reach the prompt. Confirms SYSTEM_PROMPT rule
+    # 10a's claim holds end to end: a decoded reason code's detail text
+    # survives into the LLM-bound row untouched, a not-decodable one still
+    # says so (never a fabricated number), and mac_or_ip never reaches it.
+    from app.services.reasoning import _llm_safe_evidence_row
+
+    decoded_pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff")
+        + struct.pack("<H", 3)
+    )
+    protected_pkt = (
+        _radiotap_with_rssi(-55)
+        + _dot11_mgmt_header(0, 12, addr2=b"\x11\x22\x33\x44\x55\x66", protected=True)
+        + struct.pack("<H", 7)
+    )
+    pcap_path = tmp_path / "synthetic.pcap"
+    pcap_path.write_bytes(
+        _pcap_global_header(127)
+        + _pcap_record(decoded_pkt)
+        + _pcap_record(protected_pkt)
+    )
+
+    result = _analyze_dot11_fallback(pcap_path)
+    assert len(result.anomalies) == 2
+
+    # Same dict shape persistence.py writes to anomalies_json.
+    rows = [
+        {"timestamp": a.timestamp, "kind": a.kind, "detail": a.detail, "mac_or_ip": a.mac_or_ip}
+        for a in result.anomalies
+    ]
+    llm_rows = [_llm_safe_evidence_row(r) for r in rows]
+
+    decoded_row = next(r for r in llm_rows if "reason code 3" in r["detail"])
+    protected_row = next(r for r in llm_rows if r is not decoded_row)
+
+    assert "Deauthenticated: station leaving" in decoded_row["detail"]
+    assert "not present in this packet" in protected_row["detail"]
+    assert "reason code 7" not in protected_row["detail"]
+    assert "mac_or_ip" not in decoded_row and "mac_or_ip" not in protected_row
 
 
 def test_analyze_packet_capture_uses_fallback_when_tshark_unavailable(tmp_path, monkeypatch):

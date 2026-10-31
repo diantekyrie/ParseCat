@@ -61,6 +61,15 @@ from app.services.pii_redaction import (
     # #99: "number=" only counts when the value itself is phone-shaped
     ("number=+14155550123", "+14155550123", PHONE_TOKEN),
     ("number=800-555-0199", "800-555-0199", PHONE_TOKEN),
+    # #103 review: real phone shapes after number= / cell stay redacted
+    ("number=4155550123", "4155550123", PHONE_TOKEN),
+    ("number=14155550123", "14155550123", PHONE_TOKEN),
+    ("number=415 555 0123", "415 555 0123", PHONE_TOKEN),
+    ("number=415-555.0123", "415-555.0123", PHONE_TOKEN),
+    ("number=(415) 555-0123", "(415) 555-0123", PHONE_TOKEN),
+    ("cell 415 555 0123", "415 555 0123", PHONE_TOKEN),
+    ("cell=4155550123", "4155550123", PHONE_TOKEN),
+    ("cell: 415-555-0123", "415-555-0123", PHONE_TOKEN),
 ])
 def test_each_pii_type_is_redacted(text, secret, token):
     out = redact_pii(text)
@@ -140,6 +149,10 @@ def test_idempotent_and_none_passthrough():
     "cell=310260123456789",
     # #99: "number" alone must not treat an epoch-ms timestamp as a phone
     "number: 1792698392012",
+    # #103 review boundaries: epoch seconds, trailing numeric columns
+    "number: 1792698392",
+    "cell 310 260 1234 567",
+    "number=415 555 0123 4567",
 ])
 def test_non_pii_left_unchanged(text):
     assert redact_pii(text) == text

@@ -12,8 +12,8 @@ Scope, deliberately narrow:
 Patterns are conservative by design: a missed bare number is preferable to
 mangling a timestamp, PID, hex address, MAC, version string or build
 fingerprint that diagnosis depends on. Known false negatives are listed in
-the PR security note (bare 10-digit phone numbers, space-grouped phone
-numbers without a phone keyword or tel: anchor, unformatted bare
+the PR security note (bare 10-digit phone numbers and space-grouped phone
+numbers without a phone / number / cell keyword or tel: anchor, unformatted bare
 15-digit IMEIs and IMSI / ICCID / MEID without a keyword, non-email account names outside the Account{} form, lower-case
 multi-word unquoted account_name= values).
 
@@ -122,16 +122,25 @@ _PHONE_KV_RE = re.compile(
     r"(\+?\(?\d[\d ().-]{6,}\d)" + _NA,
     re.IGNORECASE,
 )
-# `number` alone is too generic (epoch-ms timestamps, counters) to anchor
-# the loose digit-run value pattern above, so it only redacts when the
-# value itself is phone-shaped: a leading '+' (E.164) or NANP grouping via
-# parens or one consistent '-'/'.' separator. A bare digit run like
-# "number: 1792698392012" (an epoch-ms timestamp) is left alone.
-_NUMBER_KV_RE = re.compile(
-    r"\b(number\s*[=:]\s*)"
+# `number` and bare `cell` are too generic to anchor the loose digit-run
+# value pattern above (`number` precedes epoch-ms timestamps and counters;
+# telephony dumps pair `cell` with MCC/MNC/LAC/CID tuples such as
+# "cell 310 260 12345 678"). So they only redact when the value itself is
+# a complete phone shape:
+#   * E.164: a leading '+' then digits,
+#   * NANP grouped by parens, '-', '.' or spaces (separators may mix),
+#   * NANP unseparated: exactly 10 digits with [2-9] area and exchange
+#     (optionally led by 1). Epoch seconds start with 1 and epoch-ms is
+#     13 digits, so neither fits.
+# The value must end the numeric run: no glued digits (_NA) and no further
+# space-separated numeric column, which is what keeps cell-identity tuples
+# and "number: 1792698392012" untouched.
+_KEYWORD_PHONE_SHAPED_RE = re.compile(
+    r"\b((?:number\s*[=:]|cell(?:\s*[=:])?)\s*)"
     r"(\+\d[\d().\- ]{6,}\d"
-    r"|\(\d{3}\)\s?\d{3}[ .-]\d{4}"
-    r"|\d{3}([.-])\d{3}\3\d{4})" + _NA,
+    r"|(?:1[ .-]?)?(?:\(\d{3}\)\s?\d{3}[ .-]?\d{4}"
+    r"|\d{3}[ .-]\d{3}[ .-]\d{4}"
+    r"|[2-9]\d{2}[2-9]\d{6}))" + _NA + r"(?![ ]+\d)",
     re.IGNORECASE,
 )
 _TEL_URI_RE = re.compile(r"\btel:\+?[\d().-]{7,}", re.IGNORECASE)
@@ -193,7 +202,7 @@ def redact_pii(text: Optional[str]) -> Optional[str]:
     out = _EMAIL_RE.sub(_email_sub, out)
     out = _IMEI_SEP_RE.sub(_imei_sep_sub, out)
     out = _PHONE_KV_RE.sub(_phone_kv_sub, out)
-    out = _NUMBER_KV_RE.sub(_phone_kv_sub, out)
+    out = _KEYWORD_PHONE_SHAPED_RE.sub(_phone_kv_sub, out)
     out = _TEL_URI_RE.sub("tel:" + PHONE_TOKEN, out)
     out = _NANP_RE.sub(PHONE_TOKEN, out)
     out = _E164_RE.sub(_e164_sub, out)

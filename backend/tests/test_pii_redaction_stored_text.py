@@ -455,6 +455,7 @@ def test_upload_422_failure_detail_is_scrubbed(monkeypatch):
     import app.api.routes as routes
     from app.db import get_session
     from app.main import app
+    from tests.conftest import auth_headers
 
     pii = "jdoe@example.com"
 
@@ -474,7 +475,7 @@ def test_upload_422_failure_detail_is_scrubbed(monkeypatch):
 
     app.dependency_overrides[get_session] = _override_session
     try:
-        with TestClient(app) as c:
+        with TestClient(app, headers=auth_headers()) as c:
             r = c.post(
                 "/api/captures",
                 data={"device_label": "synthetic-device-109-api"},

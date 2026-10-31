@@ -88,8 +88,9 @@ the Developer-options toggle is what enables fuller HCI logging. See
   file ParseCat can decode; when none is found, ParseCat reports
   `No Bluetooth HCI snoop log found` (or a format mismatch warning).
 - A `.txt`-only upload cannot include the ZIP-resident HCI file.
-- HCI framing decode covers load-bearing connection / disconnect / command
-  status events — **not** full L2CAP / profile disassembly (see README).
+- HCI framing decode covers connection / disconnection, authentication,
+  encryption, link-key / pairing, and command status events — **not** full
+  L2CAP / profile disassembly (see README).
 
 ## Quick checklist
 

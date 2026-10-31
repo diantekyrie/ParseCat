@@ -75,6 +75,9 @@ DHCP_IP_WHATS = {
 
 # IEEE 802.11 reason codes -- the subset most relevant to diagnosing drops.
 # Anything not listed here is reported as "Unknown (N)", never guessed.
+# Names follow IEEE 802.11-2012+ / hostapd ieee802_11_defs.h WLAN_REASON_*.
+# Codes 12 and 25-31 are assigned (BSS transition, TDLS, SSP, location, TS),
+# not reserved — never label an assigned code "Reserved".
 REASON_CODE_NAMES = {
     0: "Reserved/unspecified",
     1: "Unspecified reason",
@@ -88,7 +91,7 @@ REASON_CODE_NAMES = {
     9: "Station requesting (re)association not authenticated",
     10: "Disassociated: unacceptable Power Capability element",
     11: "Disassociated: unacceptable Supported Channels element",
-    12: "Reserved",
+    12: "Disassociated due to BSS transition management",
     13: "Invalid information element",
     14: "Message integrity code (MIC) failure",
     15: "4-way handshake timeout",
@@ -101,13 +104,13 @@ REASON_CODE_NAMES = {
     22: "Invalid RSN information element capabilities",
     23: "IEEE 802.1X authentication failed",
     24: "Cipher suite rejected because of security policy",
-    25: "Reserved",
-    26: "Reserved",
-    27: "Reserved",
-    28: "Reserved",
-    29: "Reserved",
-    30: "Reserved",
-    31: "Reserved",
+    25: "TDLS teardown: peer unreachable via the TDLS direct link",
+    26: "TDLS teardown: unspecified reason",
+    27: "Disassociated: session terminated by SSP request",
+    28: "Disassociated: lack of SSP roaming agreement",
+    29: "Service rejected: SSP cipher suite or AKM requirement",
+    30: "Service not authorized in this location",
+    31: "TS deleted: QoS AP lacks bandwidth after a BSS service change",
     32: "Disassociated for unspecified QoS-related reason",
     33: "Disassociated: QoS AP lacks sufficient bandwidth",
     34: "Disassociated due to excessive frame loss / weak signal",

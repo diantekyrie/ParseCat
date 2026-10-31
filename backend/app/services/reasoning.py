@@ -1759,10 +1759,23 @@ def _format_history(history: list[dict] | None) -> str:
 # opaque run of 32+ chars (which can also hide long model/request ids).
 # The regex runs before the literal key/prefix swap so a truncated echo
 # ("sk-or-v1-0123456789a...") is consumed whole, not split at char 8.
-# NOT covered: masked non-"sk-"
-# keys such as "AIza...wxyz", and a bare masked last-4 ("...abcd",
+# Also covered: non-"sk-" provider prefixes (Google "AIza", Groq "gsk_",
+# xAI "xai-", Perplexity "pplx-", Hugging Face "hf_"), full, truncated, or
+# masked with an ellipsis ("AIzaSyAbc...wxyz"). Prefix-anchored, and a bare
+# prefix word is NOT enough: "AIza" needs 4+ more chars; the others need an
+# ellipsis or a 16+ char tail, so model ids ("xai-grok-2") and library names
+# ("hf_hub") survive.
+# NOT covered: a non-"sk-" key with an unlisted prefix that is masked/short
+# enough to dodge the 32+ rule, the tail after a single-dot mask
+# ("AIzaSy.wxyz" -> "[redacted].wxyz"; a last-4), and a bare masked last-4 ("...abcd",
 # "key ending abcd"). A last-4 alone is not usable as a key.
-_KEY_LIKE_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_.\-]*|(?<![A-Za-z0-9])[A-Za-z0-9_\-]{32,}")
+_KEY_TAIL = r"[A-Za-z0-9_\-]"
+_KEY_LIKE_RE = re.compile(
+    r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_.\-]*"
+    rf"|(?<![A-Za-z0-9])(?:AIza|gsk_|xai-|pplx-|hf_)(?:{_KEY_TAIL}*(?:\.{{2,}}|\u2026){_KEY_TAIL}*|{_KEY_TAIL}{{16,}})"
+    rf"|(?<![A-Za-z0-9])AIza{_KEY_TAIL}{{4,}}"
+    rf"|(?<![A-Za-z0-9]){_KEY_TAIL}{{32,}}"
+)
 
 
 def _redact_llm_error(message: str, key: str | None) -> str:

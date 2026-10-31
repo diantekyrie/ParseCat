@@ -195,11 +195,11 @@ numbers). Rules, no exceptions:
     packet_analysis is real protocol-level dissection -- its "backend"
     field on each entry says whether it came from full tshark dissection
     or the narrower hand-rolled fallback (see that entry's own "note"
-    field for exactly what that backend does and doesn't cover, e.g. the
-    fallback backend does not decode deauth/disassoc reason codes or
-    detect TCP retransmissions -- never state a reason code or
-    retransmission fact unless a packet_analysis entry actually contains
-    one). Frame counts, RSSI range, retry rate, and any listed anomalies
+    field for exactly what that run's backend does and doesn't cover,
+    e.g. TCP retransmission detection is tshark-only, permanently, on
+    both fallback paths -- never state a retransmission fact unless a
+    packet_analysis entry actually contains one). Frame counts, RSSI
+    range, retry rate, reason codes, and any listed anomalies
     in packet_analysis are real per-packet facts, not inferred. SSID/BSSID
     identity signals and anomaly MAC/BSSID fields are intentionally absent
     from this LLM-bound packet_analysis (kept in local SQLite for UI only). If "device_wide_pairing_evidence" includes a

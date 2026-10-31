@@ -162,6 +162,28 @@ def test_non_pii_left_unchanged(text):
     assert redact_pii(text) == text
 
 
+# ------------------------------------------------- pinned known residuals
+# These pin documented tradeoffs so a later regex change can't flip them
+# silently (Arch review on PR #110). Changing either is an FE call.
+
+def test_residual_bare_cell_triple_is_over_redacted():
+    # Over-redaction: MCC/MNC/LAC-shaped `cell 310 260 1234` with nothing
+    # after it has a complete NANP space-grouped shape. Pending FE decision.
+    assert redact_pii("cell 310 260 1234") == "cell " + PHONE_TOKEN
+
+
+@pytest.mark.parametrize("text", [
+    "cell 415 555 0123 4",
+    "cell=415-555-0123-",
+    "number=415 555 0123 4",
+])
+def test_residual_phone_with_trailing_column_is_not_redacted(text):
+    # Leak-direction false negative, listed in the module docstring: a
+    # phone followed by another numeric column / glued digit or dash after
+    # `number` / bare `cell` is skipped so cell-identity tuples survive.
+    assert redact_pii(text) == text
+
+
 # ------------------------------------------------------------- persistence
 
 def _ref():

@@ -15,7 +15,17 @@ fingerprint that diagnosis depends on. Known false negatives are listed in
 the PR security note (bare 10-digit phone numbers and space-grouped phone
 numbers without a phone / number / cell keyword or tel: anchor, unformatted bare
 15-digit IMEIs and IMSI / ICCID / MEID without a keyword, non-email account names outside the Account{} form, lower-case
-multi-word unquoted account_name= values).
+multi-word unquoted account_name= values, and -- after `number=` / bare
+`cell` only -- a phone followed by another numeric column or glued to a
+trailing digit / dash, e.g. `cell 415 555 0123 4` or `cell=415-555-0123-`;
+that is the price of leaving cell-identity tuples like
+`cell 310 260 1234 567` intact).
+
+Known over-redaction (pending FE decision, pinned in tests): a bare 3-field
+cell-identity tuple with nothing after it, shaped exactly like
+`cell 310 260 1234`, matches the NANP space-grouped shape and is redacted as
+a phone. Bare `cell` was dropped as an anchor in #99; it is reinstated here
+only for complete phone shapes that end the numeric run.
 
 Every replacement is a typed token so a reader can still see *that* a value
 was there and what kind it was, e.g. ``[redacted-email]``.

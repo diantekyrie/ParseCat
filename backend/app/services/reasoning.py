@@ -195,11 +195,11 @@ numbers). Rules, no exceptions:
     packet_analysis is real protocol-level dissection -- its "backend"
     field on each entry says whether it came from full tshark dissection
     or the narrower hand-rolled fallback (see that entry's own "note"
-    field for exactly what that backend does and doesn't cover, e.g. the
-    fallback backend does not decode deauth/disassoc reason codes or
-    detect TCP retransmissions -- never state a reason code or
-    retransmission fact unless a packet_analysis entry actually contains
-    one). Frame counts, RSSI range, retry rate, and any listed anomalies
+    field for exactly what that run's backend does and doesn't cover,
+    e.g. TCP retransmission detection is tshark-only, permanently, on
+    both fallback paths -- never state a retransmission fact unless a
+    packet_analysis entry actually contains one). Frame counts, RSSI
+    range, retry rate, reason codes, and any listed anomalies
     in packet_analysis are real per-packet facts, not inferred. SSID/BSSID
     identity signals and anomaly MAC/BSSID fields are intentionally absent
     from this LLM-bound packet_analysis (kept in local SQLite for UI only). If "device_wide_pairing_evidence" includes a
@@ -332,6 +332,18 @@ numbers). Rules, no exceptions:
     understood) -- it is NEVER itself evidence. Every factual claim in
     your report must still trace back to the JSON fact bundle for THIS
     turn, per rule 1, even when answering a follow-up.
+15. Some fact text has been scrubbed of personal data before it ever
+    reached this bundle: a token like "[redacted-email]", "[redacted-
+    phone]", "[redacted-imei]", "[redacted-account]", etc. stands in for a
+    real value that was removed. Quote such a token verbatim exactly as
+    rule 2 requires for confidence labels -- never invent, guess, or
+    reconstruct the value it replaced. A token only means "a value of
+    that kind was present here" -- it is NOT an identifier, so it never
+    supports a same-entity or different-entity conclusion. Two facts that
+    both show "[redacted-account]" are NOT thereby the same account, and
+    two that show different redaction kinds are NOT thereby different
+    entities -- the token carries no identity information at all. Never
+    present a redaction token as if it were the real value.
 """
 
 
@@ -1759,10 +1771,23 @@ def _format_history(history: list[dict] | None) -> str:
 # opaque run of 32+ chars (which can also hide long model/request ids).
 # The regex runs before the literal key/prefix swap so a truncated echo
 # ("sk-or-v1-0123456789a...") is consumed whole, not split at char 8.
-# NOT covered: masked non-"sk-"
-# keys such as "AIza...wxyz", and a bare masked last-4 ("...abcd",
+# Also covered: non-"sk-" provider prefixes (Google "AIza", Groq "gsk_",
+# xAI "xai-", Perplexity "pplx-", Hugging Face "hf_"), full, truncated, or
+# masked with an ellipsis ("AIzaSyAbc...wxyz"). Prefix-anchored, and a bare
+# prefix word is NOT enough: "AIza" needs 4+ more chars; the others need an
+# ellipsis or a 16+ char tail, so model ids ("xai-grok-2") and library names
+# ("hf_hub") survive.
+# NOT covered: a non-"sk-" key with an unlisted prefix that is masked/short
+# enough to dodge the 32+ rule, the tail after a single-dot mask
+# ("AIzaSy.wxyz" -> "[redacted].wxyz"; a last-4), and a bare masked last-4 ("...abcd",
 # "key ending abcd"). A last-4 alone is not usable as a key.
-_KEY_LIKE_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_.\-]*|(?<![A-Za-z0-9])[A-Za-z0-9_\-]{32,}")
+_KEY_TAIL = r"[A-Za-z0-9_\-]"
+_KEY_LIKE_RE = re.compile(
+    r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_.\-]*"
+    rf"|(?<![A-Za-z0-9])(?:AIza|gsk_|xai-|pplx-|hf_)(?:{_KEY_TAIL}*(?:\.{{2,}}|\u2026){_KEY_TAIL}*|{_KEY_TAIL}{{16,}})"
+    rf"|(?<![A-Za-z0-9])AIza{_KEY_TAIL}{{4,}}"
+    rf"|(?<![A-Za-z0-9]){_KEY_TAIL}{{32,}}"
+)
 
 
 def _redact_llm_error(message: str, key: str | None) -> str:

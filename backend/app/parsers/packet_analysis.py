@@ -41,6 +41,24 @@ Two backends, tried in this order:
    not just one device's), so scapy's per-packet overhead is acceptable
    there. A packet-count safety cap still applies in case that assumption
    is wrong for a given file.
+
+Gap-matrix decisions (issue #70, PC-pcap-004):
+  * 802.11 deauth/disassoc reason codes: now decoded on BOTH backends.
+    tshark already reported them (issue #67); the fallback's 24-byte
+    non-QoS/non-4-address MAC header is immediately followed by the
+    Reason Code as the frame body's ONLY fixed field for these two
+    subtypes (no IEs), so it's a simple, deterministic 2-byte read --
+    low risk, same confidence as any other directly-parsed field. Names
+    come from wifi.py's REASON_CODE_NAMES (one shared table, not a
+    second copy that could drift from it).
+  * TCP retransmission: tshark-only, permanently. tshark computes this
+    from its own full bidirectional stream/ACK tracking; hand-rolling an
+    equivalent on either fallback (no TCP stream state on the 802.11
+    path at all, and only single-pass per-packet scapy dissection on the
+    Ethernet path) would mean inventing a retransmission heuristic this
+    project has no way to verify against tshark's own analysis -- against
+    the "invent nothing" rule the rest of this parser follows. Each
+    fallback's `note` field says so explicitly.
 """
 from __future__ import annotations
 
@@ -50,6 +68,7 @@ import subprocess
 from pathlib import Path
 
 from app.parsers.base import PacketAnalysis, PacketAnomalyEvent, PacketFrameTypeStat, PacketIdentitySignal
+from app.parsers.wifi import _reason_name
 
 # ---------------------------------------------------------------------------
 # Shared 802.11 constants
@@ -107,6 +126,9 @@ TSHARK_FIELDS = [
     # falling back for every capture regardless of link layer (issue #67).
     "wlan.fixed.reason_code", "frame.time_epoch",
     "ip.src", "ip.dst", "tcp.flags.reset", "dns.qry.name",
+    # #70: tshark's own stream/ACK-tracking analysis, not a heuristic this
+    # project invents -- see the module docstring's gap-matrix decision.
+    "tcp.analysis.retransmission",
 ]
 
 
@@ -163,7 +185,8 @@ def analyze_with_tshark(path: Path, link_layer: str) -> PacketAnalysis:
 
     for row in rows:
         (wlan_type, wlan_subtype, retry, dbm, ssid, bssid,
-         reason_code, ts, ip_src, ip_dst, tcp_rst, dns_qry) = (row + [""] * 12)[:12]
+         reason_code, ts, ip_src, ip_dst, tcp_rst, dns_qry,
+         tcp_retrans) = (row + [""] * 13)[:13]
 
         if wlan_type and wlan_subtype:
             try:
@@ -210,6 +233,15 @@ def analyze_with_tshark(path: Path, link_layer: str) -> PacketAnalysis:
                 detail=f"TCP RST {ip_src or '?'} -> {ip_dst or '?'}",
                 mac_or_ip=ip_src or None,
             ))
+        # #70: tcp.analysis.retransmission is tshark's own per-packet verdict
+        # from its stream/ACK tracking -- same boolean-text trap as retry and
+        # RST above, so it needs the same _tshark_bool helper.
+        if _tshark_bool(tcp_retrans):
+            anomalies.append(PacketAnomalyEvent(
+                timestamp=ts or None, kind="tcp_retransmission",
+                detail=f"TCP retransmission {ip_src or '?'} -> {ip_dst or '?'}",
+                mac_or_ip=ip_src or None,
+            ))
 
     identity_signals = (
         [PacketIdentitySignal("ssid", k, v) for k, v in ssid_counts.items()]
@@ -230,9 +262,9 @@ def analyze_with_tshark(path: Path, link_layer: str) -> PacketAnalysis:
         identity_signals=identity_signals,
         anomalies=anomalies[:200],
         note=(
-            "Full tshark dissection. Deauthentication/disassociation reason codes and "
-            "TCP resets are real per-packet facts; TCP retransmission analysis is not "
-            "included in this pass."
+            "Full tshark dissection. Deauthentication/disassociation reason codes, "
+            "TCP resets, and TCP retransmissions are all real per-packet facts from "
+            "tshark's own stream analysis."
         ),
     )
 
@@ -304,6 +336,18 @@ def _dot11_addr2(pkt: bytes, dot11_start: int, ftype: int) -> str | None:
     return ":".join(f"{b:02x}" for b in mac)
 
 
+def _dot11_reason_code(pkt: bytes, dot11_start: int) -> int | None:
+    # #70: for Deauthentication and Disassociation frames, the frame body
+    # is the Reason Code field ALONE (2 bytes, little-endian) -- no other
+    # fixed fields, no IEs -- immediately after the same 24-byte non-QoS/
+    # non-4-address management header used by _dot11_addr2 above: FC(2) +
+    # Duration(2) + addr1(6) + addr2(6) + addr3(6) + SeqCtrl(2).
+    off = dot11_start + 2 + 2 + 6 + 6 + 6 + 2
+    if off + 2 > len(pkt):
+        return None
+    return struct.unpack("<H", pkt[off:off + 2])[0]
+
+
 def _dot11_ssid_from_ies(pkt: bytes, dot11_start: int) -> str | None:
     # Beacon/probe-response fixed fields: Timestamp(8) + Beacon Interval(2) +
     # Capability Info(2) = 12 bytes, then tagged parameters begin. Tag 0 = SSID.
@@ -365,10 +409,18 @@ def _analyze_dot11_fallback(path: Path) -> PacketAnalysis:
                     bssid_counts[bssid] = bssid_counts.get(bssid, 0) + 1
             elif ftype == 0 and subtype in (10, 12):  # Disassoc, Deauth
                 bssid = _dot11_addr2(pkt, rt_len, ftype)
+                reason_code = _dot11_reason_code(pkt, rt_len)
+                if reason_code is None:
+                    detail = f"{dot11_frame_label(ftype, subtype)} frame (reason code not present in this packet)"
+                else:
+                    detail = (
+                        f"{dot11_frame_label(ftype, subtype)} frame, reason code "
+                        f"{reason_code} ({_reason_name(reason_code)})"
+                    )
                 anomalies.append(PacketAnomalyEvent(
                     timestamp=None,
                     kind="deauthentication" if subtype == 12 else "disassociation",
-                    detail=f"{dot11_frame_label(ftype, subtype)} frame (reason code not decoded in this backend)",
+                    detail=detail,
                     mac_or_ip=bssid,
                 ))
 
@@ -392,10 +444,10 @@ def _analyze_dot11_fallback(path: Path) -> PacketAnalysis:
         anomalies=anomalies[:200],
         note=(
             "Hand-rolled radiotap/802.11 header parser (tshark not available). Frame "
-            "type/subtype, retry flag, and RSSI are exact per-packet facts. "
-            "Deauthentication/disassociation reason codes are NOT decoded in this "
-            "backend (would need the management-frame fixed-parameters region parsed "
-            "further); no TCP/retransmission analysis is attempted here at all."
+            "type/subtype, retry flag, RSSI, and deauthentication/disassociation "
+            "reason codes are exact per-packet facts. No TCP/retransmission analysis "
+            "is attempted on this 802.11 monitor-mode path -- that stays tshark-only "
+            "by design, not a gap to be closed here."
         ),
     )
 
@@ -444,7 +496,8 @@ def _analyze_ethernet_fallback(path: Path) -> PacketAnalysis:
 
     note = (
         "scapy-based Ethernet/IP dissection (tshark not available). "
-        "No TCP retransmission analysis in this backend."
+        "TCP retransmission analysis stays tshark-only by design, not a gap "
+        "to be closed here."
     )
     if truncated:
         note += f" Capped at the first {MAX_PACKETS} packets -- this capture is larger than that."

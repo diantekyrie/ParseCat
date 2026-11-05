@@ -440,3 +440,50 @@ def test_identity_warning_survives_redact_pii_unchanged():
     from app.services.pii_redaction import redact_pii
 
     assert redact_pii(UNVERIFIED_DEVICE_IDENTITY_WARNING) == UNVERIFIED_DEVICE_IDENTITY_WARNING
+
+
+def test_upload_422_failure_detail_is_scrubbed(monkeypatch):
+    """#109: the 422 'Failed to parse upload: {exc}' detail echoed the raw
+    parser exception, unscrubbed -- the same response-boundary gap #97/#107
+    closed for parse_warnings, but on the failure path instead of success.
+    Drive the real POST /api/captures path with a parser that raises an
+    exception carrying an email, and assert the 422 detail is scrubbed."""
+    from fastapi.testclient import TestClient
+    from sqlalchemy.pool import StaticPool
+
+    import app.api.routes as routes
+    from app.db import get_session
+    from app.main import app
+
+    pii = "jdoe@example.com"
+
+    def _raise_with_pii(path, filename):
+        raise ValueError(f"malformed header line, saw owner={pii}")
+
+    monkeypatch.setattr(routes, "parse_capture_file", _raise_with_pii)
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+
+    def _override_session():
+        with Session(engine) as session:
+            yield session
+
+    app.dependency_overrides[get_session] = _override_session
+    try:
+        with TestClient(app) as c:
+            r = c.post(
+                "/api/captures",
+                data={"device_label": "synthetic-device-109-api"},
+                files={"file": ("logcat.txt", b"irrelevant body", "text/plain")},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert pii not in detail
+    assert EMAIL_TOKEN in detail
+    assert "Failed to parse upload" in detail

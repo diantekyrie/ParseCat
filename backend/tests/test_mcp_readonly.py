@@ -81,6 +81,8 @@ ARCH_JANE = "Jane Doe"
 # Over-redaction fixtures.
 OVER_REDACT_FILE_12 = "12.txt"
 OVER_REDACT_FILE_CRASH = "crash.zip"
+LONG_PACKAGE = "com.example.abcdefghijklmnopqrstuvwxyzabcdef"
+LONG_EXCEPTION = "com.example.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefException"
 
 
 def _assert_no_forbidden(blob: str):
@@ -206,23 +208,29 @@ def writable_db(tmp_path: Path):
         # that #96/#102 (+ MAC/secret KV) scrub — NOT stored labels/filenames
         # (those are planted on Device/Capture rows and in CDM detail, which
         # MCP drops rather than value-scrubbing).
+        # Free-text seeds for FE ruling: present in DB, omitted by default from MCP.
+        free_text_seed = (
+            f"label={FAKE_LABEL} file={FAKE_FILENAME_A} "
+            f"{ARCH_BARE_ALICE} {ARCH_JANE} {ARCH_LABEL_UNDERSCORE}"
+        )
         crash_msg = (
             f"boom contact {FAKE_EMAIL} tel:{FAKE_PHONE} "
             f"key {FAKE_SK} also {FAKE_AIZA} and {FAKE_GSK} "
             f"mac {FAKE_MAC_IN_TEXT} "
             f"password={FAKE_PASSWORD} pwd={FAKE_PASSWORD} "
-            f"Authorization: Bearer {FAKE_BEARER} token={FAKE_TOKEN}"
+            f"Authorization: Bearer {FAKE_BEARER} token={FAKE_TOKEN} "
+            f"{free_text_seed}"
         )
         session.add(CrashEventRow(
             capture_id=cap_a.id,
             timestamp="08-19 12:01:00.000",
             thread="main",
-            package="com.example.app",
+            package=LONG_PACKAGE,
             pid=42,
-            exception_class="RuntimeException",
+            exception_class=LONG_EXCEPTION,
             message=crash_msg,
-            root_cause_class=None,
-            root_cause_message=None,
+            root_cause_class="CauseException",
+            root_cause_message=f"root {free_text_seed}",
             root_cause_frame=None,
             source_section="system_log",
             source_line_start=100,
@@ -235,7 +243,7 @@ def writable_db(tmp_path: Path):
             subject=f"Input dispatching timed out ({FAKE_LABEL})",
             pid=43,
             package="com.example.app",
-            reason="Input dispatching timed out",
+            reason=f"Input dispatching timed out {free_text_seed}",
             timeout_ms=5000,
             rss_kb=1000,
         ))
@@ -245,7 +253,7 @@ def writable_db(tmp_path: Path):
             priority=3,
             priority_name="ERR",
             thread="kworker",
-            message=f"kernel oops password={FAKE_PASSWORD}",
+            message=f"kernel oops password={FAKE_PASSWORD} {free_text_seed}",
             is_panic_family=False,
             source_section="kernel",
             source_line_start=1,
@@ -488,12 +496,11 @@ def test_structured_facts_omit_spliced_identity_and_keep_codes(ro_session):
 
     crash = [f for f in payload["facts"] if f["category"] == "crash"]
     assert crash
-    # Crash message may remain but secrets/PII scrubbed; labels omitted from
-    # structured fields (message scrubbed for PII/keys, not by filename).
-    msg = crash[0].get("message") or ""
-    assert FAKE_PASSWORD not in msg
-    assert FAKE_SK not in msg
-    assert FAKE_EMAIL not in msg
+    # Default: free text omitted.
+    assert "message" not in crash[0]
+    assert "root_cause_message" not in crash[0]
+    assert crash[0]["package"] == LONG_PACKAGE
+    assert crash[0]["exception_class"] == LONG_EXCEPTION
 
 
 def test_arch_leak_cases_absent_from_all_tools(ro_session):
@@ -529,13 +536,22 @@ def test_over_redaction_filename_12_and_crash_survive(ro_session):
     assert wifi[0]["source"]["line_start"] == 12
     blob12 = json.dumps(p12)
     assert OVER_REDACT_FILE_12 not in blob12
+    # Explicit serialized-output assert (was missing/vacuous before).
+    assert '"reason_code": 12' in blob12 or '"reason_code":12' in blob12
+    ser = tool_get_verified_facts(capture_id=ids["capture_12"], limit=50)
+    assert '"reason_code": 12' in ser or '"reason_code":12' in ser
+    ser_obj = json.loads(ser)
+    ser_wifi = [f for f in ser_obj["facts"] if f["category"] == "wifi"]
+    assert ser_wifi and ser_wifi[0]["reason_code"] == 12
 
-    # Filename crash.zip must not delete 'crash' from structured/message text.
+    # Filename crash.zip must not delete 'crash' from structured identifiers.
+    # Free text (message) is omitted by default per FE ruling.
     pc = get_verified_facts(session, ids["capture_crash_name"])
     crash = [f for f in pc["facts"] if f["category"] == "crash"]
     assert crash
     assert crash[0]["package"] == "com.example.crash"
-    assert "crash" in (crash[0].get("message") or "")
+    assert "crash" in crash[0]["package"]
+    assert "message" not in crash[0]
     assert OVER_REDACT_FILE_CRASH not in json.dumps(pc)
 
     # get_fact loops every fixture fact for these captures.
@@ -551,7 +567,8 @@ def test_over_redaction_filename_12_and_crash_survive(ro_session):
                 assert one["fact"]["reason_code"] == 12
                 assert "12:00:12" in one["fact"]["timestamp"]
             if key == "capture_crash_name" and fact["category"] == "crash":
-                assert "crash" in (one["fact"].get("message") or "")
+                assert "crash" in one["fact"]["package"]
+                assert "message" not in one["fact"]
 
 
 def test_fe_free_text_redaction_all_three_tools(ro_session):
@@ -611,6 +628,97 @@ def test_mcp_server_tool_list_has_no_write_tools():
         lowered = name.lower()
         for frag in WRITEISH_TOOL_NAME_FRAGMENTS:
             assert frag not in lowered
+
+
+
+def test_long_package_and_exception_survive_verbatim(ro_session):
+    """Blocker 2: key-token heuristic must not touch structured identifiers."""
+    session, ids, _ = ro_session
+    # Prove the heuristic would mangle the package if applied.
+    mangled = scrub_allowlisted_text(LONG_PACKAGE)
+    assert mangled != LONG_PACKAGE
+
+    facts_json = tool_get_verified_facts(capture_id=ids["capture_a"], limit=500)
+    list_json = tool_list_captures(offset=0, limit=100)
+    facts = json.loads(facts_json)["facts"]
+    crash = [f for f in facts if f["category"] == "crash"]
+    assert crash
+    assert crash[0]["package"] == LONG_PACKAGE
+    assert crash[0]["exception_class"] == LONG_EXCEPTION
+
+    one_json = tool_get_fact(fact_id=crash[0]["fact_id"], capture_id=ids["capture_a"])
+    # list_captures has no per-fact package/exception; check fact tools only.
+    assert LONG_PACKAGE not in list_json  # list has counts only
+    for blob in (facts_json, one_json):
+        assert LONG_PACKAGE in blob
+        assert LONG_EXCEPTION in blob
+    one = json.loads(one_json)["fact"]
+    assert one["package"] == LONG_PACKAGE
+    assert one["exception_class"] == LONG_EXCEPTION
+    # Direct API path too.
+    api = get_verified_facts(session, ids["capture_a"])
+    api_crash = [f for f in api["facts"] if f["category"] == "crash"][0]
+    assert api_crash["package"] == LONG_PACKAGE
+    assert api_crash["exception_class"] == LONG_EXCEPTION
+
+
+def test_free_text_omitted_by_default(ro_session):
+    """FE ruling: crash/ANR/kernel free text dropped unless env flag is 1."""
+    session, ids, _ = ro_session
+    blobs = [tool_list_captures(offset=0, limit=100)]
+    facts_json = tool_get_verified_facts(capture_id=ids["capture_a"], limit=500)
+    blobs.append(facts_json)
+    facts = json.loads(facts_json)["facts"]
+    for fact in facts:
+        assert "message" not in fact
+        assert "root_cause_message" not in fact
+        assert "reason" not in fact or fact["category"] != "anr"
+        if fact["category"] == "anr":
+            assert "reason" not in fact
+        if fact["category"] == "kernel":
+            assert "message" not in fact
+        blobs.append(tool_get_fact(fact_id=fact["fact_id"], capture_id=ids["capture_a"]))
+    for blob in blobs:
+        assert FAKE_LABEL not in blob
+        assert FAKE_FILENAME_A not in blob
+        assert ARCH_BARE_ALICE not in blob
+        assert ARCH_JANE not in blob
+        assert ARCH_LABEL_UNDERSCORE not in blob
+        assert "free_text_untrusted" not in blob
+
+
+def test_free_text_opt_in_redacts_secrets_names_may_survive(ro_session, monkeypatch):
+    """Flag=1 includes free text after PII/key scrub; name seeds are residual risk."""
+    monkeypatch.setenv("PARSECAT_MCP_INCLUDE_FREE_TEXT", "1")
+    session, ids, _ = ro_session
+    facts_json = tool_get_verified_facts(capture_id=ids["capture_a"], limit=500)
+    facts = json.loads(facts_json)["facts"]
+    crash = [f for f in facts if f["category"] == "crash"][0]
+    anr = [f for f in facts if f["category"] == "anr"][0]
+    kernel = [f for f in facts if f["category"] == "kernel"][0]
+    assert crash.get("free_text_untrusted") is True
+    assert "message" in crash and "root_cause_message" in crash
+    assert "reason" in anr
+    assert "message" in kernel
+    # Secrets/PII scrubbed.
+    for text in (crash["message"], crash["root_cause_message"], anr["reason"], kernel["message"]):
+        assert FAKE_PASSWORD not in text
+        assert FAKE_SK not in text
+        assert FAKE_EMAIL not in text
+        assert FAKE_BEARER not in text
+    # Residual risk (documented): name/label seeds inside log text may survive.
+    joined = " ".join([
+        crash["message"], crash["root_cause_message"], anr["reason"], kernel["message"],
+    ])
+    assert ARCH_BARE_ALICE in joined or ARCH_JANE in joined or FAKE_LABEL in joined
+    one = tool_get_fact(fact_id=crash["fact_id"], capture_id=ids["capture_a"])
+    assert "message" in json.loads(one)["fact"]
+
+    # Non-exact values must not enable the flag.
+    monkeypatch.setenv("PARSECAT_MCP_INCLUDE_FREE_TEXT", "true")
+    off = get_verified_facts(session, ids["capture_a"])
+    off_crash = [f for f in off["facts"] if f["category"] == "crash"][0]
+    assert "message" not in off_crash
 
 
 def test_default_fact_limit_constant():

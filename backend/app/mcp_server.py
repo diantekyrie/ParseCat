@@ -186,6 +186,10 @@ async def _call_tool_no_echo(name: str, arguments: dict | None = None, context=N
         sanitized = _sanitize_tool_validation_error(exc)
         if sanitized is not None:
             raise sanitized from None
+        # Arch nit: never echo the submitted tool name on unknown-tool.
+        msg = str(exc)
+        if msg.startswith("Unknown tool:") or msg.startswith("unknown tool"):
+            raise ToolError("unknown tool") from None
         raise
 
 

@@ -52,6 +52,13 @@ from app.models.db_models import (
 from app.services.fact_id import stamp_fact_id
 from app.services.pii_redaction import redact_pii
 from app.services.reasoning import _redact_llm_error
+from app.parsers import WANTED_SECTIONS
+from app.parsers.kernel import PRIORITY_NAMES
+from app.parsers.wifi import (
+    DHCP_IP_WHATS,
+    KNOWN_SUPPLICANT_STATES,
+    REASON_CODE_NAMES,
+)
 from app.services.summary import capture_severity
 
 # --- limits -----------------------------------------------------------------
@@ -230,7 +237,13 @@ def assert_engine_is_readonly(engine) -> None:
         raise RuntimeError("expected read-only SQLite engine; write succeeded")
 
 
-# --- capture identity (exact-token checks / free-text scrub) ----------------
+
+# --- capture identity (exact + containment token checks) --------------------
+
+# Only match capture tokens that are at least 4 chars and not purely numeric,
+# so short/numeric stems (e.g. filename "12.txt" → stem "12") cannot null
+# every field via containment.
+_IDENTITY_TOKEN_MIN_LEN = 4
 
 @dataclass(frozen=True)
 class CaptureIdentity:
@@ -239,14 +252,29 @@ class CaptureIdentity:
     serial: str | None = None
     ssids: frozenset[str] = field(default_factory=frozenset)
     bssids: frozenset[str] = field(default_factory=frozenset)
+    device_ids: frozenset[str] = field(default_factory=frozenset)
 
-    def exact_identifier_tokens(self) -> frozenset[str]:
+    def _raw_tokens(self) -> set[str]:
         out: set[str] = set()
         for v in (self.label, self.filename, self.serial):
             if isinstance(v, str) and v:
                 out.add(v)
         out.update(s for s in self.ssids if s)
-        return frozenset(out)
+        out.update(d for d in self.device_ids if d)
+        if isinstance(self.filename, str) and self.filename:
+            out.add(Path(self.filename).name)
+            out.add(Path(self.filename).stem)
+        return out
+
+    def exact_identifier_tokens(self) -> frozenset[str]:
+        return frozenset(self._raw_tokens())
+
+    def containment_tokens(self) -> frozenset[str]:
+        """Tokens for case-insensitive substring checks on thread/executable/section."""
+        return frozenset(
+            t for t in self._raw_tokens()
+            if len(t) >= _IDENTITY_TOKEN_MIN_LEN and not t.isdigit()
+        )
 
     def free_text_scrub_tokens(self) -> frozenset[str]:
         out: set[str] = set()
@@ -260,7 +288,7 @@ class CaptureIdentity:
             base = Path(self.filename).name
             stem = Path(self.filename).stem
             for part in (base, stem):
-                if len(part) >= 4 and not part.isdigit():
+                if len(part) >= _IDENTITY_TOKEN_MIN_LEN and not part.isdigit():
                     out.add(part)
         return frozenset(out)
 
@@ -271,6 +299,15 @@ def load_capture_identity(session: Session, capture_id: int) -> CaptureIdentity:
         select(DeviceInfoRow).where(DeviceInfoRow.capture_id == capture_id)
     ).first()
     serial = info.serial if info is not None else None
+    device_ids: set[str] = set()
+    if info is not None:
+        for attr in (
+            "serial", "build_fingerprint", "build_id", "model", "manufacturer",
+            "hardware", "radio", "network",
+        ):
+            val = getattr(info, attr, None)
+            if isinstance(val, str) and val:
+                device_ids.add(val)
     ssids: set[str] = set()
     bssids: set[str] = set()
     for w in session.exec(
@@ -286,6 +323,7 @@ def load_capture_identity(session: Session, capture_id: int) -> CaptureIdentity:
         serial=serial,
         ssids=frozenset(ssids),
         bssids=frozenset(bssids),
+        device_ids=frozenset(device_ids),
     )
 
 
@@ -295,7 +333,6 @@ _IPV4_RE = re.compile(
     r"(?<!\d)(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}"
     r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\d)"
 )
-# Candidate IPv6 runs (colon-hex). Filtered in _scrub_ipv6 to skip HH:MM:SS.
 _IPV6_CANDIDATE_RE = re.compile(
     r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])"
 )
@@ -309,35 +346,73 @@ def _scrub_ipv6(text: str) -> str:
             return s
         if ":" not in s:
             return s
-        # Require :: or a hex letter or >=5 groups so plain times stay.
         groups = [g for g in s.split(":") if g != ""]
         if "::" in s or any(c in s for c in "abcdefABCDEF") or len(groups) >= 5:
             return "[redacted-ip]"
         return s
     return _IPV6_CANDIDATE_RE.sub(repl, text)
 
+
+# Key *prefixes* only (Arch): withhold on match for free-form IDs / classes / section.
+# Long-token heuristic stays off for package/package_name (segment prefix check only).
+_KEY_PREFIX_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:sk-|gsk_|AIza|xai-|pplx-|hf_)",
+)
+
 _PACKAGE_RE = re.compile(
     r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+(:[A-Za-z0-9._-]+)?$"
 )
+# Java / Kotlin class names — `$` allowed for Outer$Inner (Cat QA120-6).
 _JAVA_CLASS_RE = re.compile(
-    r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$"
+    r"^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)*$"
 )
-_THREAD_RE = re.compile(r"^[A-Za-z0-9._:/\-+# \[\]()]{1,64}$")
-_EXECUTABLE_ABS_RE = re.compile(r"^/[A-Za-z0-9._+/-]+$")
-_EXECUTABLE_BARE_RE = re.compile(r"^[A-Za-z0-9._+-]{1,128}$")
+
+# Thread: positive allowlist of shapes emitted by parsers/fixtures + common
+# Android/JVM names Arch listed. Everything else is withheld.
+_THREAD_EXACT = frozenset({
+    "main",
+    "RenderThread",
+    "FinalizerDaemon",
+    "HeapTaskDaemon",
+    "Jit thread pool",
+    "Signal Catcher",
+    "ReferenceQueueD",
+    "kworker",
+})
+_THREAD_PATTERNS = tuple(
+    re.compile(p) for p in (
+        r"^Binder:\d+_\w+$",
+        r"^HwBinder:\d+_\w+$",
+        r"^pool-\d+-thread-\d+$",
+        r"^Thread-\d+$",
+        r"^AsyncTask #\d+$",
+        r"^actvpool\[\d+\]$",
+        r"^kworker/\d+:\d+$",
+        r"^T\d+$",  # kernel log thread markers as parsed
+    )
+)
+
+# Executable: FE prefixes only; conservative segments; no archive/log ext;
+# no /data/local or /tmp (Arch). Bare names withheld.
 _EXECUTABLE_PREFIXES = (
-    "/system/", "/system_ext/", "/vendor/", "/product/", "/odm/", "/apex/",
-    "/data/app/", "/data/data/", "/data/user/", "/data/local/",
+    "/system/", "/vendor/", "/apex/", "/product/", "/data/app/",
 )
+_EXECUTABLE_ABS_RE = re.compile(
+    r"^/(?:system|vendor|apex|product|data/app)"
+    r"(?:/[A-Za-z0-9._+-]+)+$"
+)
+_EXECUTABLE_BAD_EXT = frozenset({
+    ".zip", ".txt", ".log", ".gz", ".tgz", ".tar", ".rar", ".7z",
+    ".bugreport", ".csv", ".json", ".xml", ".html",
+})
+
 _SIGNAL_NAME_RE = re.compile(r"^SIG[A-Z0-9]+$")
 _SIGNAL_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,32}$")
-_PRIORITY_NAME_RE = re.compile(r"^[A-Z]{1,8}$")
-_KIND_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
-_REASON_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,80}$")
 _TAG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 _LEVEL_RE = re.compile(r"^[A-Za-z]$")
 _SELINUX_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_:.-]{0,127}$")
-_SELINUX_PERM_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_SELINUX_PERM_AVC_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_ANDROID_PERM_RE = re.compile(r"^android\.permission\.[A-Z0-9_]+$")
 _COMM_RE = re.compile(r"^[A-Za-z0-9._+:\-]{1,16}$")
 _PROC_STATE_RE = re.compile(r"^[A-Z]{1,8}$")
 _UID_TOKEN_RE = re.compile(r"^u\d+[a-z]?\d*$")
@@ -347,10 +422,39 @@ _PROCESS_RE = re.compile(
 )
 _DEVICE_PROFILE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,31}$")
 _TIMESTAMP_RE = re.compile(r"^[\d\- T:\.Z+]{1,40}$")
-_SECTION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._\-]{0,63}$")
 _CONFIDENCE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,31}$")
-_VERDICT_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_VERDICT_ALLOWED = frozenset({"denied", "granted"})
 _GENERIC_ID_RE = re.compile(r"^[A-Za-z0-9._+\-]{1,128}$")
+
+# Source sections the parsers actually emit (WANTED_SECTIONS + hard-coded
+# SourceRef literals + anr/<filename>). Do not invent.
+_ALLOWED_SOURCE_SECTIONS = frozenset(WANTED_SECTIONS) | frozenset({
+    "bt_hci",
+    "bluetooth_manager",  # also in WANTED; kept explicit
+})
+_UNKNOWN_80211_RE = re.compile(r"^Unknown \(802\.11 reason \d+\)$")
+_UNKNOWN_SUPPLICANT_RE = re.compile(r"^Unknown \([A-Z0-9_]+\)$")
+
+# Enum membership from parser lookup tables (Cat QA120-6).
+_PRIORITY_NAME_ALLOWED = frozenset(PRIORITY_NAMES.values()) | frozenset(
+    f"priority_{i}" for i in range(8)
+)
+_REASON_NAME_ALLOWED = (
+    frozenset(REASON_CODE_NAMES.values())
+    | frozenset(KNOWN_SUPPLICANT_STATES)
+    | frozenset(outcome for _, outcome in DHCP_IP_WHATS.values())
+)
+_WIFI_KIND_ALLOWED = frozenset({
+    "disconnection", "association", "supplicant_state", "network_connection",
+}) | frozenset(kind for kind, _ in DHCP_IP_WHATS.values())
+_MEMORY_KIND_ALLOWED = frozenset({"kill", "died"})
+_PAIRING_KIND_ALLOWED = frozenset({
+    "fast_pair_ui_opened", "provider_lookup_failed", "device_found",
+    "association_approved", "association_added", "association_updated",
+    "device_presence_connected", "bt_device_connected",
+    "secure_channel_established", "association_requested", "anomaly",
+    "association",
+})
 
 _FIELD_SHAPE: dict[str, str] = {
     "package": "package",
@@ -381,6 +485,14 @@ _FIELD_SHAPE: dict[str, str] = {
     "note": "note",
 }
 
+# Free-form identifier fields: key-prefix → withhold (Arch / Cat QA120-7).
+_KEY_PREFIX_FIELDS = frozenset({
+    "thread", "executable", "exception_class", "root_cause_class", "comm",
+    "process", "tag",
+})
+# Containment check (case-insensitive) on these fields.
+_CONTAINMENT_FIELDS = frozenset({"thread", "executable"})
+
 
 def include_free_text_enabled() -> bool:
     """True only when PARSECAT_MCP_INCLUDE_FREE_TEXT is exactly ``1``."""
@@ -388,12 +500,6 @@ def include_free_text_enabled() -> bool:
 
 
 def _apply_secret_detectors(text: str, *, include_key_heuristic: bool = True) -> str:
-    """PII + secret + MAC + IP detectors (no truncation, no identity scrub).
-
-    ``include_key_heuristic`` applies #102 ``_KEY_LIKE_RE`` (free text only).
-    Structured identifiers must leave it off — long package/class names are
-    legitimate and must not be withheld as fake keys (Cat P2 / blocker 2).
-    """
     out = redact_pii(text) or ""
     if include_key_heuristic:
         out = _redact_llm_error(out, None)
@@ -404,6 +510,20 @@ def _apply_secret_detectors(text: str, *, include_key_heuristic: bool = True) ->
     out = _IPV4_RE.sub("[redacted-ip]", out)
     out = _scrub_ipv6(out)
     return out
+
+
+def _has_key_prefix(text: str) -> bool:
+    return _KEY_PREFIX_RE.search(text) is not None
+
+
+def _package_segment_has_key_prefix(value: str) -> bool:
+    """Prefix-only check per package segment (Arch); no long-token heuristic."""
+    for seg in re.split(r"[.:]", value):
+        if not seg:
+            continue
+        if seg.startswith(("sk-", "gsk_", "AIza", "xai-", "pplx-", "hf_")):
+            return True
+    return False
 
 
 def _scrub_identity_tokens(text: str, identity: CaptureIdentity | None) -> str:
@@ -433,11 +553,69 @@ def scrub_allowlisted_text(
 
 
 def scrub_text(text: str | None, **_ignored: Any) -> str | None:
-    """Deprecated alias — ignores label/filename kwargs by design."""
     return scrub_allowlisted_text(text)
 
 
-def _shape_ok(kind: str, value: str) -> bool:
+def _thread_allowed(value: str) -> bool:
+    if len(value) > MAX_THREAD_CHARS:
+        return False
+    if value in _THREAD_EXACT:
+        return True
+    if any(p.fullmatch(value) for p in _THREAD_PATTERNS):
+        return True
+    # Package-shaped thread names (some apps name threads after the package).
+    if _PACKAGE_RE.fullmatch(value):
+        return True
+    return False
+
+
+def _executable_allowed(value: str) -> bool:
+    if len(value) > MAX_IDENTIFIER_CHARS:
+        return False
+    # Bare names withheld (FE).
+    if not value.startswith("/"):
+        return False
+    low = value.lower()
+    if "/data/local" in low or "/tmp" in low:
+        return False
+    if not any(value.startswith(p) for p in _EXECUTABLE_PREFIXES):
+        return False
+    if not _EXECUTABLE_ABS_RE.fullmatch(value):
+        return False
+    # No archive / log extensions (Arch).
+    for ext in _EXECUTABLE_BAD_EXT:
+        if low.endswith(ext):
+            return False
+    return True
+
+
+def _section_allowed(value: str) -> bool:
+    if value in _ALLOWED_SOURCE_SECTIONS:
+        return True
+    # anr.py emits SourceRef(f"anr/{filename}", ...)
+    if value.startswith("anr/") and len(value) > 4:
+        rest = value[4:]
+        if re.fullmatch(r"[A-Za-z0-9._+\-]+", rest):
+            return True
+    return False
+
+
+def _reason_name_allowed(value: str) -> bool:
+    if value in _REASON_NAME_ALLOWED:
+        return True
+    if _UNKNOWN_80211_RE.fullmatch(value) or _UNKNOWN_SUPPLICANT_RE.fullmatch(value):
+        return True
+    return False
+
+
+def _kind_allowed(category_hint: str | None, value: str) -> bool:
+    if value in _WIFI_KIND_ALLOWED | _MEMORY_KIND_ALLOWED | _PAIRING_KIND_ALLOWED:
+        return True
+    # Conservative fallback for other kinds already in fixtures.
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", value))
+
+
+def _shape_ok(kind: str, value: str, *, category: str | None = None) -> bool:
     if kind == "package":
         return bool(_PACKAGE_RE.fullmatch(value)) and len(value) <= MAX_IDENTIFIER_CHARS
     if kind == "package_or_app":
@@ -448,26 +626,19 @@ def _shape_ok(kind: str, value: str) -> bool:
     if kind == "java_class":
         return bool(_JAVA_CLASS_RE.fullmatch(value)) and len(value) <= MAX_IDENTIFIER_CHARS
     if kind == "thread":
-        return bool(_THREAD_RE.fullmatch(value)) and len(value) <= MAX_THREAD_CHARS
+        return _thread_allowed(value)
     if kind == "executable":
-        if len(value) > MAX_IDENTIFIER_CHARS:
-            return False
-        if value.startswith("/"):
-            return (
-                any(value.startswith(p) for p in _EXECUTABLE_PREFIXES)
-                and bool(_EXECUTABLE_ABS_RE.fullmatch(value))
-            )
-        return bool(_EXECUTABLE_BARE_RE.fullmatch(value))
+        return _executable_allowed(value)
     if kind == "signal_name":
         return bool(_SIGNAL_NAME_RE.fullmatch(value))
     if kind == "signal_code":
         return bool(_SIGNAL_CODE_RE.fullmatch(value))
     if kind == "priority_name":
-        return bool(_PRIORITY_NAME_RE.fullmatch(value))
+        return value in _PRIORITY_NAME_ALLOWED
     if kind == "kind":
-        return bool(_KIND_RE.fullmatch(value))
+        return _kind_allowed(category, value)
     if kind == "reason_name":
-        return bool(_REASON_NAME_RE.fullmatch(value))
+        return _reason_name_allowed(value)
     if kind == "tag":
         return bool(_TAG_RE.fullmatch(value))
     if kind == "level":
@@ -477,7 +648,7 @@ def _shape_ok(kind: str, value: str) -> bool:
     if kind == "comm":
         return bool(_COMM_RE.fullmatch(value))
     if kind == "verdict":
-        return bool(_VERDICT_RE.fullmatch(value))
+        return value in _VERDICT_ALLOWED
     if kind == "process":
         return bool(_PROCESS_RE.fullmatch(value)) and len(value) <= MAX_IDENTIFIER_CHARS
     if kind == "proc_state":
@@ -493,14 +664,24 @@ def _shape_ok(kind: str, value: str) -> bool:
     if kind == "note":
         return value == DETAIL_WITHHELD
     if kind == "section":
-        return bool(_SECTION_RE.fullmatch(value))
+        return _section_allowed(value)
     if kind == "generic":
         return bool(_GENERIC_ID_RE.fullmatch(value))
     return bool(_GENERIC_ID_RE.fullmatch(value))
 
 
+def _permission_item_ok(item: str) -> bool:
+    """FE: android.permission.* or package-shaped; plus AVC short verbs selinux.py emits."""
+    if _ANDROID_PERM_RE.fullmatch(item):
+        return True
+    if _PACKAGE_RE.fullmatch(item):
+        return True
+    if _SELINUX_PERM_AVC_RE.fullmatch(item):
+        return True
+    return False
+
+
 def _split_permissions(raw: Any) -> list[str] | None:
-    """Persistence stores permissions space-joined; MCP returns a list of strings."""
     if raw is None:
         return None
     if isinstance(raw, list):
@@ -510,20 +691,37 @@ def _split_permissions(raw: Any) -> list[str] | None:
     return parts
 
 
+def _contains_identity(value: str, identity: CaptureIdentity | None) -> bool:
+    if identity is None:
+        return False
+    low = value.lower()
+    return any(tok.lower() in low for tok in identity.containment_tokens())
+
+
 def _validate_identifier(
     field: str,
     value: str,
     identity: CaptureIdentity | None,
+    *,
+    category: str | None = None,
 ) -> str | None:
     """Return withhold reason, or None if the value may be emitted verbatim."""
     if len(value) > MAX_IDENTIFIER_CHARS:
         return "too_long"
     shape = _FIELD_SHAPE.get(field, "generic")
-    if not _shape_ok(shape, value):
+    if not _shape_ok(shape, value, category=category):
         return "shape"
+    # Key-prefix: withhold (never mutate) on free-form IDs + exception classes.
+    if field in _KEY_PREFIX_FIELDS and _has_key_prefix(value):
+        return "key-shaped"
+    # Package: segment-level prefix only (long-token heuristic stays off).
+    if field in ("package", "package_name") and _package_segment_has_key_prefix(value):
+        return "key-shaped"
     if _apply_secret_detectors(value, include_key_heuristic=False) != value:
         return "pii"
     if identity is not None and value in identity.exact_identifier_tokens():
+        return "identity"
+    if field in _CONTAINMENT_FIELDS and _contains_identity(value, identity):
         return "identity"
     return None
 
@@ -532,13 +730,36 @@ def _allowdict(data: dict, allowed: frozenset[str]) -> dict:
     return {k: data[k] for k in data.keys() if k in allowed}
 
 
-def _source(section: str | None, line_start: int | None, line_end: int | None) -> dict | None:
-    if not section or not isinstance(line_start, int) or line_start < 1:
-        return None
-    if not isinstance(section, str) or not _shape_ok("section", section):
-        return None
+def _source(
+    section: str | None,
+    line_start: int | None,
+    line_end: int | None,
+    identity: CaptureIdentity | None = None,
+) -> tuple[dict | None, list[dict[str, str]]]:
+    """Return (source_dict_or_None, withheld_entries).
+
+    Unknown sections are withheld with metadata (Arch nit), not silently dropped.
+    """
+    withheld: list[dict[str, str]] = []
+    if not isinstance(line_start, int) or line_start < 1:
+        return None, withheld
     end = line_end if isinstance(line_end, int) and line_end >= line_start else line_start
-    return {"section": section, "line_start": line_start, "line_end": end}
+    if not section or not isinstance(section, str):
+        withheld.append({"field": "source.section", "reason": "shape"})
+        return {"section": None, "line_start": line_start, "line_end": end}, withheld
+    if not _section_allowed(section):
+        withheld.append({"field": "source.section", "reason": "shape"})
+        return {"section": None, "line_start": line_start, "line_end": end}, withheld
+    if _has_key_prefix(section):
+        withheld.append({"field": "source.section", "reason": "key-shaped"})
+        return {"section": None, "line_start": line_start, "line_end": end}, withheld
+    if identity is not None and (
+        section in identity.exact_identifier_tokens()
+        or _contains_identity(section, identity)
+    ):
+        withheld.append({"field": "source.section", "reason": "identity"})
+        return {"section": None, "line_start": line_start, "line_end": end}, withheld
+    return {"section": section, "line_start": line_start, "line_end": end}, withheld
 
 
 def _stamp(
@@ -554,6 +775,7 @@ def _stamp(
     include_free = include_free_text_enabled()
     free_truncated = False
 
+    # Source is built via _source when callers pass section/line triples as a dict.
     for key, value in fields.items():
         if key not in allowed or value is None:
             continue
@@ -575,19 +797,29 @@ def _stamp(
             parts = _split_permissions(value)
             if parts is None:
                 continue
-            if not parts or any(not _SELINUX_PERM_RE.fullmatch(p) for p in parts):
-                body[key] = None
+            kept = [p for p in parts if _permission_item_ok(p)]
+            dropped = len(parts) - len(kept)
+            body[key] = kept  # keep list shape even if empty
+            if dropped:
                 withheld.append({"field": key, "reason": "shape"})
-            else:
-                body[key] = parts
             continue
 
         if key == "source" and isinstance(value, dict):
-            body[key] = value
+            src, src_withheld = _source(
+                value.get("section"),
+                value.get("line_start"),
+                value.get("line_end"),
+                identity,
+            )
+            if src is not None:
+                body[key] = src
+            withheld.extend(src_withheld)
             continue
 
         if isinstance(value, str):
-            reason = _validate_identifier(key, value, identity)
+            reason = _validate_identifier(
+                key, value, identity, category=category,
+            )
             if reason is not None:
                 body[key] = None
                 withheld.append({"field": key, "reason": reason})
@@ -621,7 +853,6 @@ def _stamp(
     body["fact_id"] = stamped["fact_id"]
     body.setdefault("confidence", "UNCONFIRMED")
     return _allowdict(body, allowed | frozenset({"fact_id"}))
-
 
 
 def _clamp_limit(value: int | None, default: int, maximum: int) -> int:
@@ -713,7 +944,7 @@ def _facts_from_capture(session: Session, capture_id: int) -> list[dict]:
             "message": c.message,
             "root_cause_message": c.root_cause_message,
             "confidence": "LOW",
-            "source": _source(c.source_section, c.source_line_start, c.source_line_end),
+            "source": {"section": c.source_section, "line_start": c.source_line_start, "line_end": c.source_line_end},
         }))
 
     for a in session.exec(select(AnrRow).where(AnrRow.capture_id == capture_id)).all():
@@ -756,7 +987,7 @@ def _facts_from_capture(session: Session, capture_id: int) -> list[dict]:
             "is_panic_family": k.is_panic_family,
             "message": k.message,  # allowlisted kernel free text
             "confidence": "LOW",
-            "source": _source(k.source_section, k.source_line_start, k.source_line_end),
+            "source": {"section": k.source_section, "line_start": k.source_line_start, "line_end": k.source_line_end},
         }))
 
     for w in session.exec(
@@ -771,7 +1002,7 @@ def _facts_from_capture(session: Session, capture_id: int) -> list[dict]:
             "locally_generated": w.locally_generated,
             "roam": w.roam,
             "confidence": "LOW",
-            "source": _source(w.source_section, w.source_line_start, w.source_line_end),
+            "source": {"section": w.source_section, "line_start": w.source_line_start, "line_end": w.source_line_end},
         }))
 
     for e in session.exec(
@@ -786,7 +1017,7 @@ def _facts_from_capture(session: Session, capture_id: int) -> list[dict]:
             "package_name": e.package_name,
             "association_id": e.association_id,
             "confidence": "LOW",
-            "source": _source(e.source_section, e.source_line_start, e.source_line_end),
+            "source": {"section": e.source_section, "line_start": e.source_line_start, "line_end": e.source_line_end},
             "note": DETAIL_WITHHELD,
         }))
 
@@ -805,7 +1036,7 @@ def _facts_from_capture(session: Session, capture_id: int) -> list[dict]:
             "pending": a.pending,
             "trusted": a.trusted,
             "confidence": "LOW",
-            "source": _source(a.source_section, a.source_line_start, a.source_line_end),
+            "source": {"section": a.source_section, "line_start": a.source_line_start, "line_end": a.source_line_end},
             "note": DETAIL_WITHHELD,
         }))
 
@@ -822,7 +1053,7 @@ def _facts_from_capture(session: Session, capture_id: int) -> list[dict]:
             "rss_kb": k.rss_kb,
             "proc_state": k.proc_state,
             "confidence": "LOW",
-            "source": _source(k.source_section, k.source_line_start, k.source_line_end),
+            "source": {"section": k.source_section, "line_start": k.source_line_start, "line_end": k.source_line_end},
             "note": DETAIL_WITHHELD,  # kill reason free text withheld
         }))
 
@@ -840,7 +1071,7 @@ def _facts_from_capture(session: Session, capture_id: int) -> list[dict]:
             "enforcing": d.enforcing,
             "verdict": d.verdict,
             "confidence": "LOW",
-            "source": _source(d.source_section, d.source_line_start, d.source_line_end),
+            "source": {"section": d.source_section, "line_start": d.source_line_start, "line_end": d.source_line_end},
         }))
 
     for b in session.exec(
@@ -855,7 +1086,7 @@ def _facts_from_capture(session: Session, capture_id: int) -> list[dict]:
             "bg_mah": b.bg_mah,
             "fgs_mah": b.fgs_mah,
             "confidence": "LOW",
-            "source": _source(b.source_section, b.source_line_start, b.source_line_end),
+            "source": {"section": b.source_section, "line_start": b.source_line_start, "line_end": b.source_line_end},
         }))
 
     return out

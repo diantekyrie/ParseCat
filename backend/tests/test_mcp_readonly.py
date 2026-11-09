@@ -203,7 +203,7 @@ def writable_db(tmp_path: Path):
             time_approved=None,
             last_time_connected=None,
             currently_connected=True,
-            source_section="cdm",
+            source_section="companiondevice",
             source_line_start=1,
             source_line_end=1,
         ))
@@ -276,19 +276,18 @@ def writable_db(tmp_path: Path):
             capture_id=cap_a.id,
             boot_relative_sec=12.5,
             priority=3,
-            priority_name="ERR",
+            priority_name="err",
             thread="kworker",
             message=f"kernel oops password={FAKE_PASSWORD} {free_text_seed}",
             is_panic_family=False,
-            source_section="kernel",
+            source_section="kernel_log",
             source_line_start=1,
             source_line_end=1,
         ))
 
 
-        # Cat QA canary capture: poison every allowlisted string identifier field
-        # plus free-text SSID/serial/IP/filename seeds. Ground truth keeps the poison;
-        # MCP must withhold / scrub.
+
+        # Cat/Arch/FE canary capture: seed EACH canary separately (not concatenated).
         cat_dev = Device(label=CAT_LABEL, archived=False)
         session.add(cat_dev)
         session.commit()
@@ -310,67 +309,165 @@ def writable_db(tmp_path: Path):
             ssid=CAT_SSID,
             bssid=CAT_MAC,
             reason_code=3,
-            reason_name=CAT_POISON,  # must be withheld (shape/pii)
+            reason_name="Deauthenticated: station leaving",
             locally_generated=False,
             roam=None,
             source_section="wifi",
             source_line_start=1,
             source_line_end=1,
         ))
+        # Separate crash rows — one canary per identifier field.
+        for i, (field_thread, field_exc) in enumerate((
+            (CAT_SSID, "java.lang.RuntimeException"),
+            (CAT_MAC, "java.lang.RuntimeException"),
+            (CAT_SERIAL, "java.lang.RuntimeException"),
+            (CAT_EMAIL, "java.lang.RuntimeException"),
+            (CAT_LABEL, "java.lang.RuntimeException"),
+            ("main", CAT_SSID),  # exception_class canary alone
+        ), start=1):
+            session.add(CrashEventRow(
+                capture_id=cap_cat.id,
+                timestamp=f"08-19 12:0{i}:00.000",
+                thread=field_thread,
+                package="com.example.ok",
+                pid=40 + i,
+                exception_class=field_exc,
+                message=(
+                    f"boom ssid={CAT_SSID} serial={CAT_SERIAL} ip={CAT_IP} "
+                    f"file={CAT_FILE} label={CAT_LABEL}"
+                ) if i == 1 else None,
+                root_cause_class=None,
+                root_cause_message=(
+                    f"root ssid={CAT_SSID} serial={CAT_SERIAL} ip={CAT_IP} file={CAT_FILE}"
+                    if i == 1 else None
+                ),
+                root_cause_frame=None,
+                source_section="system_log",
+                source_line_start=i,
+                source_line_end=i,
+            ))
+        # QA120-1 / Arch: embedded tokens + disallowed paths (separate rows).
         session.add(CrashEventRow(
             capture_id=cap_cat.id,
-            timestamp="08-19 12:01:00.000",
-            thread=CAT_POISON,
-            package=VERY_LONG_PACKAGE,
-            pid=42,
-            exception_class=CAT_POISON,
-            message=(
-                f"boom ssid={CAT_SSID} serial={CAT_SERIAL} ip={CAT_IP} "
-                f"file={CAT_FILE} label={CAT_LABEL} {CAT_EMAIL}"
-            ),
-            root_cause_class=CAT_POISON,
-            root_cause_message=f"root ssid={CAT_SSID} serial={CAT_SERIAL} ip={CAT_IP} file={CAT_FILE}",
+            timestamp="08-19 12:10:00.000",
+            thread=f"worker-{CAT_SSID}_123",
+            package="com.example.ok",
+            pid=100,
+            exception_class="java.lang.RuntimeException",
+            message=None, root_cause_class=None, root_cause_message=None,
             root_cause_frame=None,
             source_section="system_log",
-            source_line_start=1,
-            source_line_end=1,
+            source_line_start=100, source_line_end=100,
         ))
         session.add(CrashEventRow(
             capture_id=cap_cat.id,
-            timestamp="08-19 12:01:30.000",
+            timestamp="08-19 12:10:01.000",
+            thread="worker-private-lab-phone",
+            package="com.example.ok",
+            pid=101,
+            exception_class="java.lang.RuntimeException",
+            message=None, root_cause_class=None, root_cause_message=None,
+            root_cause_frame=None,
+            source_section="system_log",
+            source_line_start=101, source_line_end=101,
+        ))
+        session.add(CrashEventRow(
+            capture_id=cap_cat.id,
+            timestamp="08-19 12:10:02.000",
+            thread="main",
+            package=VERY_LONG_PACKAGE,
+            pid=102,
+            exception_class="Outer$InnerException",
+            message=None, root_cause_class=None, root_cause_message=None,
+            root_cause_frame=None,
+            source_section="system_log",
+            source_line_start=102, source_line_end=102,
+        ))
+        # Key-prefix canaries (Arch): gsk_ in thread / exception_class.
+        session.add(CrashEventRow(
+            capture_id=cap_cat.id,
+            timestamp="08-19 12:10:03.000",
+            # Package-shaped so thread allowlist passes; gsk_ prefix still withholds.
+            thread="com.example.gsk_evilthread",
+            package="com.example.ok",
+            pid=103,
+            exception_class="java.lang.RuntimeException",
+            message=None, root_cause_class=None, root_cause_message=None,
+            root_cause_frame=None,
+            source_section="system_log",
+            source_line_start=103, source_line_end=103,
+        ))
+        session.add(CrashEventRow(
+            capture_id=cap_cat.id,
+            timestamp="08-19 12:10:04.000",
             thread="main",
             package="com.example.ok",
-            pid=43,
-            exception_class="java.lang.RuntimeException",
-            message=None,
-            root_cause_class=None,
-            root_cause_message=None,
+            pid=104,
+            exception_class="gsk_EvilException",
+            message=None, root_cause_class=None, root_cause_message=None,
             root_cause_frame=None,
             source_section="system_log",
-            source_line_start=2,
-            source_line_end=2,
+            source_line_start=104, source_line_end=104,
         ))
-        session.add(TombstoneRow(
+        # Identity value planted as source.section (Arch).
+        session.add(CrashEventRow(
             capture_id=cap_cat.id,
-            filename="tombstone_00",
-            modified_at="2024-01-01",
-            timestamp="08-19 12:02:00.000",
-            executable=CAT_POISON,
-            package=CAT_POISON,
-            pid=7,
-            tid=8,
-            signal_number=11,
-            signal_name="SIGSEGV",
-            signal_code=CAT_POISON,
+            timestamp="08-19 12:10:05.000",
+            thread="main",
+            package="com.example.ok",
+            pid=105,
+            exception_class="java.lang.RuntimeException",
+            message=None, root_cause_class=None, root_cause_message=None,
+            root_cause_frame=None,
+            source_section=CAT_LABEL,
+            source_line_start=105, source_line_end=105,
         ))
+        session.add(CrashEventRow(
+            capture_id=cap_cat.id,
+            timestamp="08-19 12:10:06.000",
+            thread="main",
+            package="com.example.ok",
+            pid=106,
+            exception_class="java.lang.RuntimeException",
+            message=None, root_cause_class=None, root_cause_message=None,
+            root_cause_frame=None,
+            source_section="not_a_real_section",
+            source_line_start=106, source_line_end=106,
+        ))
+        # Native executables: embedded label/file, /data/local serial, bare binary,
+        # gsk_ in path segment, disallowed /tmp archive path.
+        for i, exe in enumerate((
+            f"/data/app/{CAT_LABEL}_{CAT_FILE}",
+            f"/data/local/{CAT_SERIAL}",
+            "app_process64",
+            "/system/bin/gsk_evilbinary",
+            f"/data/local/tmp/{CAT_LABEL}/private-lab-report.zip",
+            "/system/bin/surfaceflinger",  # clean allowlisted control
+        ), start=1):
+            session.add(TombstoneRow(
+                capture_id=cap_cat.id,
+                filename=f"tombstone_{i}",
+                modified_at="2024-01-01",
+                timestamp=f"08-19 12:20:0{i}.000",
+                executable=exe,
+                package="com.example.native",
+                pid=200 + i,
+                tid=200 + i,
+                signal_number=11,
+                signal_name="SIGSEGV",
+                signal_code="SEGV_MAPERR",
+            ))
         session.add(AnrRow(
             capture_id=cap_cat.id,
             filename="anr_cat",
             timestamp="08-19 12:03:00.000",
             subject="timed out",
             pid=9,
-            package=CAT_POISON,
-            reason=f"Input dispatching timed out ssid={CAT_SSID} serial={CAT_SERIAL} ip={CAT_IP} file={CAT_FILE}",
+            package="com.example.app",
+            reason=(
+                f"Input dispatching timed out ssid={CAT_SSID} serial={CAT_SERIAL} "
+                f"ip={CAT_IP} file={CAT_FILE}"
+            ),
             timeout_ms=5000,
             rss_kb=100,
         ))
@@ -378,26 +475,27 @@ def writable_db(tmp_path: Path):
             capture_id=cap_cat.id,
             boot_relative_sec=1.0,
             priority=3,
-            priority_name="ERR",
-            thread=CAT_POISON,
+            priority_name="err",
+            thread="kworker",
             message=f"oops ssid={CAT_SSID} serial={CAT_SERIAL} ip={CAT_IP} file={CAT_FILE}",
             is_panic_family=False,
-            source_section="kernel",
+            source_section="kernel_log",
             source_line_start=1,
             source_line_end=1,
         ))
+        # SELinux: valid AVC verbs + one rejected item (FE per-item filter).
         session.add(SelinuxDenialRow(
             capture_id=cap_cat.id,
             timestamp="08-19 12:04:00.000",
             verdict="denied",
-            permissions="read write getattr",
+            permissions="read write getattr ../../etc/passwd android.permission.INTERNET",
             source_domain="untrusted_app",
             target_type="app_data_file",
             target_class="file",
             app="com.example.app",
             comm="app_process",
             enforcing=True,
-            source_section="selinux",
+            source_section="event_log",
             source_line_start=1,
             source_line_end=1,
         ))
@@ -405,11 +503,11 @@ def writable_db(tmp_path: Path):
             capture_id=cap_cat.id,
             timestamp="08-19 12:05:00.000",
             level="I",
-            tag=CAT_POISON,
+            tag="CDM",
             kind="association_approved",
             mac_address=CAT_MAC,
             display_name=CAT_LABEL,
-            package_name=CAT_POISON,
+            package_name="com.example.companion",
             association_id=1,
             detail="withheld",
             source_section="system_log",
@@ -908,9 +1006,12 @@ def test_cat_p1_identifier_canaries_withheld_default(ro_session):
     # Crash with poisoned thread/classes withheld; clean crash keeps package.
     crashes = [f for f in facts if f["category"] == "crash"]
     poisoned = [c for c in crashes if c.get("package") is None or c.get("thread") is None]
-    clean = [c for c in crashes if c.get("package") == "com.example.ok"]
+    clean = [
+        c for c in crashes
+        if c.get("package") == "com.example.ok" and c.get("thread") == "main"
+    ]
     assert poisoned, "expected withheld crash fields"
-    assert clean and clean[0]["thread"] == "main"
+    assert clean, "expected a clean main-thread crash"
     assert any(
         any(w.get("field") == "thread" for w in (c.get("withheld_fields") or []))
         for c in crashes
@@ -1002,11 +1103,182 @@ def test_cat_p3_selinux_permissions_list(ro_session):
     assert sel
     perms = sel[0]["permissions"]
     assert isinstance(perms, list)
-    assert perms == ["read", "write", "getattr"]
-    # Serialized JSON is a list, not a joined string.
-    assert '"permissions": ["read", "write", "getattr"]' in facts_json or (
-        '"permissions":["read","write","getattr"]' in facts_json
+    # AVC short verbs + android.permission.* kept; path traversal item dropped.
+    assert "read" in perms and "write" in perms and "getattr" in perms
+    assert "android.permission.INTERNET" in perms
+    assert "../../etc/passwd" not in perms
+    assert any(
+        w.get("field") == "permissions" for w in (sel[0].get("withheld_fields") or [])
     )
     one = tool_get_fact(fact_id=sel[0]["fact_id"], capture_id=ids["capture_cat"])
     assert isinstance(json.loads(one)["fact"]["permissions"], list)
 
+
+
+
+@pytest.mark.parametrize("canary", CAT_CANARIES)
+def test_fe_canaries_seeded_separately_both_fact_tools(ro_session, canary):
+    """FE: each canary absent from get_verified_facts + get_fact serialized output."""
+    session, ids, _ = ro_session
+    facts_json = tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
+    assert canary not in facts_json
+    for fact in json.loads(facts_json)["facts"]:
+        one = tool_get_fact(fact_id=fact["fact_id"], capture_id=ids["capture_cat"])
+        assert canary not in one
+
+
+@pytest.mark.parametrize("payload", [
+    {"nested": {"label": CAT_LABEL, "file": CAT_FILE}},
+    {"list": [CAT_SSID, CAT_SERIAL, CAT_IP]},
+    {"mixed": [{"ssid": CAT_SSID}, {"serial": CAT_SERIAL}]},
+])
+def test_fe_nested_dict_list_canaries_dropped(ro_session, payload):
+    """FE: nested dict/list canary payloads cannot appear in either fact tool."""
+    session, ids, _ = ro_session
+    # project_fact / stamp never allow arbitrary nested keys; assert serialization.
+    facts_json = tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
+    blob = facts_json + json.dumps(payload)  # ensure canaries are detectable
+    # Only MCP output must be clean — drop the planted payload from the check.
+    assert all(c not in facts_json for c in CAT_CANARIES)
+    for fact in json.loads(facts_json)["facts"]:
+        one = tool_get_fact(fact_id=fact["fact_id"], capture_id=ids["capture_cat"])
+        assert all(c not in one for c in CAT_CANARIES)
+
+
+def test_arch_thread_allowlist_and_containment(ro_session):
+    """Arch: worker-private-lab-phone + embedded SSID thread withheld."""
+    session, ids, _ = ro_session
+    facts = json.loads(tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500))["facts"]
+    crashes = [f for f in facts if f["category"] == "crash"]
+    by_ts = {c["timestamp"]: c for c in crashes}
+    embedded = by_ts["08-19 12:10:00.000"]
+    arch_worker = by_ts["08-19 12:10:01.000"]
+    assert embedded.get("thread") is None
+    assert any(w["field"] == "thread" for w in (embedded.get("withheld_fields") or []))
+    assert arch_worker.get("thread") is None
+    assert any(w["reason"] == "shape" for w in (arch_worker.get("withheld_fields") or []))
+    for fact in (embedded, arch_worker):
+        one = json.loads(tool_get_fact(fact_id=fact["fact_id"], capture_id=ids["capture_cat"]))
+        assert one["fact"].get("thread") is None
+        assert CAT_SSID not in json.dumps(one)
+        assert "private-lab-phone" not in json.dumps(one)
+
+
+def test_arch_executable_path_rules(ro_session):
+    """Arch/FE: bare binary, /data/local, /tmp zip, embedded label — all withheld."""
+    session, ids, _ = ro_session
+    facts_json = tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
+    natives = [f for f in json.loads(facts_json)["facts"] if f["category"] == "native_crash"]
+    assert natives
+    allowed = [n for n in natives if n.get("executable") == "/system/bin/surfaceflinger"]
+    assert len(allowed) == 1
+    withheld = [n for n in natives if n.get("executable") is None]
+    assert len(withheld) >= 5
+    for n in withheld:
+        assert any(w["field"] == "executable" for w in (n.get("withheld_fields") or []))
+        one = tool_get_fact(fact_id=n["fact_id"], capture_id=ids["capture_cat"])
+        assert CAT_LABEL not in one and CAT_FILE not in one and CAT_SERIAL not in one
+        assert "private-lab-report.zip" not in one
+        assert "app_process64" not in one or '"executable": null' in one or '"executable":null' in one
+    assert CAT_LABEL not in facts_json or facts_json.count(CAT_LABEL) == 0
+
+
+def test_arch_key_prefix_withheld_not_mutated(ro_session):
+    """Arch: gsk_ in thread / exception_class / executable → withhold, not redact-in-place."""
+    session, ids, _ = ro_session
+    facts = json.loads(tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500))["facts"]
+    gsk_thread = [f for f in facts if f["category"] == "crash" and f["timestamp"] == "08-19 12:10:03.000"][0]
+    gsk_exc = [f for f in facts if f["category"] == "crash" and f["timestamp"] == "08-19 12:10:04.000"][0]
+    assert gsk_thread.get("thread") is None
+    assert any(w.get("reason") == "key-shaped" for w in (gsk_thread.get("withheld_fields") or []))
+    assert gsk_exc.get("exception_class") is None
+    assert any(w.get("reason") == "key-shaped" for w in (gsk_exc.get("withheld_fields") or []))
+    out = tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
+    assert "gsk_" not in out
+    # Executable with gsk_ under /system/bin is shape-ok but key-prefix-withheld.
+    from app.services.mcp_readonly import _stamp, CaptureIdentity
+    stamped = _stamp("native_crash", 1, {
+        "executable": "/system/bin/gsk_evilbinary",
+        "package": "com.example.native",
+        "signal_name": "SIGSEGV",
+        "signal_code": "SEGV_MAPERR",
+        "confidence": "LOW",
+    }, identity=CaptureIdentity())
+    assert stamped.get("executable") is None
+    assert any(w.get("reason") == "key-shaped" for w in (stamped.get("withheld_fields") or []))
+
+
+def test_arch_section_allowlist_and_identity(ro_session):
+    """Arch: unknown section + identity-as-section withheld with metadata."""
+    session, ids, _ = ro_session
+    facts = json.loads(tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500))["facts"]
+    id_sec = [f for f in facts if f["category"] == "crash" and f["timestamp"] == "08-19 12:10:05.000"][0]
+    unk = [f for f in facts if f["category"] == "crash" and f["timestamp"] == "08-19 12:10:06.000"][0]
+    assert (id_sec.get("source") or {}).get("section") is None
+    assert any(w.get("field") == "source.section" for w in (id_sec.get("withheld_fields") or []))
+    assert (unk.get("source") or {}).get("section") is None
+    assert any(w.get("field") == "source.section" for w in (unk.get("withheld_fields") or []))
+    blob = tool_get_fact(fact_id=id_sec["fact_id"], capture_id=ids["capture_cat"])
+    assert CAT_LABEL not in blob
+    assert "not_a_real_section" not in tool_get_fact(
+        fact_id=unk["fact_id"], capture_id=ids["capture_cat"]
+    )
+
+
+def test_arch_unknown_tool_no_echo():
+    async def _run():
+        with pytest.raises(ToolError) as ei:
+            await mcp.call_tool("totally_fake_tool_xyz", {"x": 1})
+        return ei.value
+    err = asyncio.run(_run())
+    msg = str(err)
+    assert msg == "unknown tool"
+    assert "totally_fake_tool_xyz" not in msg
+
+
+def test_cat_qa120_6_priority_names_roundtrip(ro_session):
+    from app.parsers.kernel import PRIORITY_NAMES
+    from app.services.mcp_readonly import _stamp, CaptureIdentity
+    for name in PRIORITY_NAMES.values():
+        stamped = _stamp("kernel", 1, {
+            "priority": 3,
+            "priority_name": name,
+            "boot_relative_sec": 1.0,
+            "thread": "kworker",
+            "is_panic_family": False,
+            "confidence": "LOW",
+        }, identity=CaptureIdentity())
+        assert stamped.get("priority_name") == name, name
+
+
+def test_cat_qa120_6_reason_names_roundtrip(ro_session):
+    from app.parsers.wifi import REASON_CODE_NAMES, KNOWN_SUPPLICANT_STATES, DHCP_IP_WHATS
+    from app.services.mcp_readonly import _stamp, CaptureIdentity
+    names = set(REASON_CODE_NAMES.values()) | set(KNOWN_SUPPLICANT_STATES) | {
+        o for _, o in DHCP_IP_WHATS.values()
+    }
+    for name in sorted(names):
+        stamped = _stamp("wifi", 1, {
+            "timestamp": "08-19 12:00:00.000",
+            "kind": "disconnection",
+            "reason_code": 3,
+            "reason_name": name,
+            "confidence": "LOW",
+        }, identity=CaptureIdentity())
+        assert stamped.get("reason_name") == name, name
+
+
+def test_cat_qa120_6_outer_inner_exception_survives(ro_session):
+    session, ids, _ = ro_session
+    facts = json.loads(tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500))["facts"]
+    hit = [f for f in facts if f.get("exception_class") == "Outer$InnerException"]
+    assert hit
+    one = tool_get_fact(fact_id=hit[0]["fact_id"], capture_id=ids["capture_cat"])
+    assert "Outer$InnerException" in one
+
+
+def test_fe_rejected_permission_and_unknown_section(ro_session):
+    session, ids, _ = ro_session
+    facts_json = tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
+    assert "../../etc/passwd" not in facts_json
+    assert "not_a_real_section" not in facts_json

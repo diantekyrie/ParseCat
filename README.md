@@ -440,6 +440,105 @@ cd backend
 pytest -q
 ```
 
+## Read-only MCP server (agent clients)
+
+Local **stdio-only** MCP server that hands agents ParseCat's deterministic
+`verified_facts` (parser ground truth with `fact_id` + SourceRef). It does
+**not** call an LLM, does not narrate, and exposes no write/upload/diagnose
+tools. SQLite is opened with `mode=ro`. SSID/BSSID/MAC/serial are stripped
+with the same policy as the Diagnose/Scan LLM bundle (#22).
+
+Why stdio only: main has no capture ownership / auth yet (#87 unmerged). An
+HTTP/SSE listener would expose every user's captures on the machine. Remote
+transport is an explicit follow-up gated on #87.
+
+### Run
+
+```bash
+cd backend
+pip install -r requirements.txt
+# DB path defaults to ./parsecat.db (same as the API). Override with PARSECAT_DB_PATH.
+python -m app.mcp_server
+```
+
+Tools: `list_captures`, `get_verified_facts(capture_id, category?, limit?)`,
+`get_fact(fact_id, capture_id?)`.
+
+### Client config (official formats)
+
+Snippets below match the launch shape documented by the MCP Python SDK host
+guide ([Connect to a real host](https://py.sdk.modelcontextprotocol.io/get-started/real-host/)),
+Cursor's MCP docs, and the OpenAI Agents SDK MCP guide. Use absolute paths.
+
+**Claude Desktop** (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "parsecat": {
+      "command": "python",
+      "args": ["-m", "app.mcp_server"],
+      "cwd": "/absolute/path/to/ParseCat/backend",
+      "env": {
+        "PARSECAT_DB_PATH": "/absolute/path/to/ParseCat/backend/parsecat.db"
+      }
+    }
+  }
+}
+```
+
+(`cwd` is convenient when supported; if a host ignores it, set `PYTHONPATH`
+to the backend directory and keep absolute paths in `args` / `env`.)
+
+**Claude Code**:
+
+```bash
+claude mcp add parsecat -- python -m app.mcp_server
+```
+
+(Run from `backend/`, or wrap with `env` / absolute interpreter as needed.)
+
+**Cursor** (`.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "parsecat": {
+      "command": "python",
+      "args": ["-m", "app.mcp_server"],
+      "env": {
+        "PARSECAT_DB_PATH": "/absolute/path/to/ParseCat/backend/parsecat.db",
+        "PYTHONPATH": "/absolute/path/to/ParseCat/backend"
+      }
+    }
+  }
+}
+```
+
+**OpenAI Agents SDK** (Python `MCPServerStdio`, from the
+[Agents SDK MCP docs](https://openai.github.io/openai-agents-python/mcp/)):
+
+```python
+from agents.mcp import MCPServerStdio
+
+async with MCPServerStdio(
+    name="parsecat",
+    params={
+        "command": "python",
+        "args": ["-m", "app.mcp_server"],
+        "cwd": "/absolute/path/to/ParseCat/backend",
+        "env": {
+            "PARSECAT_DB_PATH": "/absolute/path/to/ParseCat/backend/parsecat.db",
+        },
+    },
+) as server:
+    ...
+```
+
+Codex / other OpenAI stdio hosts use the same `command` + `args` (+ optional
+`env` / `cwd`) shape; confirm against the host's own MCP config reference if
+it differs.
+
 ## Bluetooth / Wi-Fi: what's decoded vs. not
 
 `bt_hci.py` decodes the diagnostically load-bearing HCI event types per-record

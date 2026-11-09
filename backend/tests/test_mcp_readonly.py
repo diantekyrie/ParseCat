@@ -98,6 +98,9 @@ FAKE_TOKEN = "xyz123abcTOKEN01"
 ARCH_LABEL_UNDERSCORE = "_private-lab-phone_"
 ARCH_NESTED_LABEL = "phone"
 ARCH_BARE_ALICE = "Alice"
+FE_CDM_NAME = "FeCdmWatch42"
+FE_DEADBEEF_EXC = "vf_deadbeef01234567"
+FE_ALICE_PROCESS = "xalicex"
 ARCH_JANE = "Jane Doe"
 
 # Over-redaction fixtures.
@@ -505,7 +508,7 @@ def writable_db(tmp_path: Path):
             capture_id=cap_cat.id,
             timestamp="08-19 12:04:00.000",
             verdict="denied",
-            permissions="read write getattr ../../etc/passwd android.permission.INTERNET",
+            permissions="read write getattr ../../etc/passwd android.permission.INTERNET com.example.custom.PERM",
             source_domain="untrusted_app",
             target_type="app_data_file",
             target_class="file",
@@ -523,7 +526,7 @@ def writable_db(tmp_path: Path):
             tag="CDM",
             kind="association_approved",
             mac_address=CAT_MAC,
-            display_name=CAT_LABEL,
+            display_name=FE_CDM_NAME,
             package_name="com.example.companion",
             association_id=1,
             detail="withheld",
@@ -567,7 +570,7 @@ def writable_db(tmp_path: Path):
             capture_id=cap_cat.id,
             association_id=2,
             mac_address=CAT_MAC,
-            display_name=CAT_LABEL,
+            display_name=FE_CDM_NAME,
             package_name="com.example.companion",
             device_profile="WATCH",
             self_managed=False,
@@ -665,6 +668,92 @@ def writable_db(tmp_path: Path):
                 source_line_end=1,
             ))
 
+        # FE leak #1: Alice label → process embeds Alice as substring.
+        session.add(ProcessKillEventRow(
+            capture_id=cap_alice.id,
+            timestamp="08-19 12:00:01.000",
+            kind="kill",
+            user_id=0,
+            pid=9001,
+            process=FE_ALICE_PROCESS,
+            package="com.example.app",
+            oom_adj=0,
+            reason="oom",
+            rss_kb=1000,
+            proc_state=None,
+            source_section="system_log",
+            source_line_start=2,
+            source_line_end=2,
+        ))
+
+        # FE leak #2: vf_-shaped exception_class on a Deadbeef-labeled capture.
+        deadbeef_dev = Device(label="Deadbeef", archived=False)
+        session.add(deadbeef_dev)
+        session.commit()
+        session.refresh(deadbeef_dev)
+        cap_deadbeef = Capture(
+            device_id=deadbeef_dev.id, original_filename="deadbeef-report.zip",
+        )
+        session.add(cap_deadbeef)
+        session.commit()
+        session.refresh(cap_deadbeef)
+        session.add(CrashEventRow(
+            capture_id=cap_deadbeef.id,
+            timestamp="08-19 12:00:00.000",
+            thread="main",
+            package="com.example.app",
+            pid=1,
+            exception_class=FE_DEADBEEF_EXC,
+            message=None,
+            root_cause_class=None,
+            root_cause_message=None,
+            root_cause_frame=None,
+            source_section="system_log",
+            source_line_start=1,
+            source_line_end=1,
+        ))
+
+        # FE leak #3: CDM display_name repeated in process (substring).
+        # (cat CdmPairingEventRow display_name set to FE_CDM_NAME below via replace)
+        session.add(ProcessKillEventRow(
+            capture_id=cap_cat.id,
+            timestamp="08-19 12:07:00.000",
+            kind="kill",
+            user_id=0,
+            pid=9002,
+            process=f"wrap{FE_CDM_NAME}x",
+            package="com.example.app",
+            oom_adj=0,
+            reason="oom",
+            rss_kb=1000,
+            proc_state=None,
+            source_section="system_log",
+            source_line_start=40,
+            source_line_end=40,
+        ))
+
+        # FE nested/list canary payloads planted into crash messages (source rows).
+        for i, nested_payload in enumerate((
+            {"nested": {"label": CAT_LABEL, "file": CAT_FILE}},
+            {"list": [CAT_SSID, CAT_SERIAL, CAT_IP]},
+            {"mixed": [{"ssid": CAT_SSID}, {"serial": CAT_SERIAL}]},
+        ), start=1):
+            session.add(CrashEventRow(
+                capture_id=cap_cat.id,
+                timestamp=f"08-19 12:11:0{i}.000",
+                thread="main",
+                package="com.example.app",
+                pid=110 + i,
+                exception_class="RuntimeException",
+                message=json.dumps(nested_payload, separators=(",", ":")),
+                root_cause_class=None,
+                root_cause_message=None,
+                root_cause_frame=None,
+                source_section="system_log",
+                source_line_start=110 + i,
+                source_line_end=110 + i,
+            ))
+
         session.commit()
         ids = {
             "db_path": db_path,
@@ -676,6 +765,7 @@ def writable_db(tmp_path: Path):
             "capture_alice": cap_alice.id,
             "capture_jane": cap_jane.id,
             "capture_us": cap_us.id,
+            "capture_deadbeef": cap_deadbeef.id,
             "hidden": hidden.id,
         }
     engine.dispose()
@@ -817,7 +907,10 @@ def test_structured_facts_omit_spliced_identity_and_keep_codes(ro_session):
         assert "original_filename" not in fact
         assert "device_label" not in fact
         assert set(fact.keys()) <= (
-            {"fact_id", "category", "capture_id", "timestamp", "confidence", "source", "note"}
+            {
+                "fact_id", "category", "capture_id", "timestamp", "confidence",
+                "source", "note", "withheld_fields", "free_text_untrusted", "truncated",
+            }
             | FACT_KIND_KEYS.get(fact["category"], frozenset())
         )
 
@@ -1184,9 +1277,10 @@ def test_cat_p3_selinux_permissions_list(ro_session):
     assert sel
     perms = sel[0]["permissions"]
     assert isinstance(perms, list)
-    # AVC short verbs + android.permission.* kept; path traversal item dropped.
-    assert "read" in perms and "write" in perms and "getattr" in perms
+    # FE: only android.permission.* or package-shaped; AVC verbs + paths withheld.
     assert "android.permission.INTERNET" in perms
+    assert "com.example.custom.PERM" in perms
+    assert "read" not in perms and "write" not in perms and "getattr" not in perms
     assert "../../etc/passwd" not in perms
     assert any(
         w.get("field") == "permissions" for w in (sel[0].get("withheld_fields") or [])
@@ -1214,16 +1308,128 @@ def test_fe_canaries_seeded_separately_both_fact_tools(ro_session, canary):
     {"mixed": [{"ssid": CAT_SSID}, {"serial": CAT_SERIAL}]},
 ])
 def test_fe_nested_dict_list_canaries_dropped(ro_session, payload):
-    """FE: nested dict/list canary payloads cannot appear in either fact tool."""
+    """FE: nested dict/list canaries seeded in DB source rows, absent from tools."""
+    from app.models.db_models import CrashEventRow
+    from sqlmodel import select
+
     session, ids, _ = ro_session
-    # project_fact / stamp never allow arbitrary nested keys; assert serialization.
+    planted = json.dumps(payload, separators=(",", ":"))
+    rows = session.exec(
+        select(CrashEventRow).where(CrashEventRow.capture_id == ids["capture_cat"])
+    ).all()
+    assert any(r.message == planted for r in rows), (
+        f"payload not present in source rows: {planted!r}"
+    )
     facts_json = tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
-    blob = facts_json + json.dumps(payload)  # ensure canaries are detectable
-    # Only MCP output must be clean — drop the planted payload from the check.
-    assert all(c not in facts_json for c in CAT_CANARIES)
+    assert planted not in facts_json
+    for c in (CAT_LABEL, CAT_FILE, CAT_SSID, CAT_SERIAL, CAT_IP):
+        if c in planted:
+            assert c not in facts_json
     for fact in json.loads(facts_json)["facts"]:
         one = tool_get_fact(fact_id=fact["fact_id"], capture_id=ids["capture_cat"])
-        assert all(c not in one for c in CAT_CANARIES)
+        assert planted not in one
+        for c in (CAT_LABEL, CAT_FILE, CAT_SSID, CAT_SERIAL, CAT_IP):
+            if c in planted:
+                assert c not in one
+
+
+
+def test_fe_alice_substring_in_process_withheld(ro_session):
+    """FE #1: label Alice → process=xalicex withheld (4+ substring hybrid)."""
+    from app.models.db_models import ProcessKillEventRow
+    from sqlmodel import select
+
+    session, ids, _ = ro_session
+    rows = session.exec(
+        select(ProcessKillEventRow).where(
+            ProcessKillEventRow.capture_id == ids["capture_alice"]
+        )
+    ).all()
+    assert any(r.process == FE_ALICE_PROCESS for r in rows)
+    facts = json.loads(
+        tool_get_verified_facts(capture_id=ids["capture_alice"], limit=500)
+    )["facts"]
+    mem = [f for f in facts if f["category"] == "memory"]
+    assert mem
+    blob = json.dumps(facts)
+    assert FE_ALICE_PROCESS not in blob
+    assert ARCH_BARE_ALICE not in blob
+    for f in mem:
+        assert f.get("process") is None
+        one = tool_get_fact(fact_id=f["fact_id"], capture_id=ids["capture_alice"])
+        assert FE_ALICE_PROCESS not in one
+        assert ARCH_BARE_ALICE not in one
+
+
+def test_fe_fact_id_exemption_path_only_vf_shaped_exception(ro_session):
+    """FE #2: vf_-shaped exception_class is NOT exempt; deadbeef withheld."""
+    from app.models.db_models import CrashEventRow
+    from sqlmodel import select
+
+    session, ids, _ = ro_session
+    rows = session.exec(
+        select(CrashEventRow).where(
+            CrashEventRow.capture_id == ids["capture_deadbeef"]
+        )
+    ).all()
+    assert any(r.exception_class == FE_DEADBEEF_EXC for r in rows)
+    facts = json.loads(
+        tool_get_verified_facts(capture_id=ids["capture_deadbeef"], limit=500)
+    )["facts"]
+    assert facts
+    blob = json.dumps(facts)
+    assert FE_DEADBEEF_EXC not in blob
+    for f in facts:
+        if f["category"] == "crash":
+            assert f.get("exception_class") is None
+            assert _FACT_ID_RE.fullmatch(f["fact_id"])
+            one = tool_get_fact(fact_id=f["fact_id"], capture_id=ids["capture_deadbeef"])
+            assert FE_DEADBEEF_EXC not in one
+            # Hex 'deadbeef' may appear inside a real fact_id; the planted
+            # exception_class value must not.
+            assert "vf_deadbeef01234567" not in one
+
+
+def test_fe_cdm_display_name_in_process_withheld(ro_session):
+    """FE #3: CDM display_name in identity; process wrap{name}x withheld."""
+    from app.models.db_models import CdmPairingEventRow, ProcessKillEventRow
+    from sqlmodel import select
+
+    session, ids, _ = ro_session
+    cdm = session.exec(
+        select(CdmPairingEventRow).where(
+            CdmPairingEventRow.capture_id == ids["capture_cat"]
+        )
+    ).all()
+    assert any(r.display_name == FE_CDM_NAME for r in cdm)
+    kills = session.exec(
+        select(ProcessKillEventRow).where(
+            ProcessKillEventRow.capture_id == ids["capture_cat"]
+        )
+    ).all()
+    wrapped = f"wrap{FE_CDM_NAME}x"
+    assert any(r.process == wrapped for r in kills)
+    # Identity loader must see the display name
+    loaded = load_capture_identity(session, ids["capture_cat"])
+    assert FE_CDM_NAME in loaded.display_names
+    facts = json.loads(
+        tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
+    )["facts"]
+    blob = json.dumps(facts)
+    assert wrapped not in blob
+    assert FE_CDM_NAME not in blob
+    for f in facts:
+        if f.get("process") is not None:
+            assert FE_CDM_NAME not in f["process"]
+            assert wrapped not in f["process"]
+
+
+def test_fe_executable_rejects_dotdot_and_empty_segments():
+    from app.services.mcp_readonly import _executable_allowed
+    assert _executable_allowed("/system/bin/surfaceflinger")
+    assert not _executable_allowed("/system/bin/../bin/sh")
+    assert not _executable_allowed("/system/bin//sh")
+    assert not _executable_allowed("/system/bin/./sh")
 
 
 def test_arch_thread_allowlist_and_containment(ro_session):
@@ -2039,4 +2245,95 @@ def test_arch_outbound_gate_schema_fuzz(ro_session, monkeypatch):
         "canaries": len(canaries),
         "covered": len(covered),
         "categories": sorted(cats),
+    }
+
+
+def test_fe_outbound_gate_fuzz_preseed_db(writable_db, monkeypatch):
+    """FE: seed canaries into DB rows *before* tools run; assert absent from output.
+
+    Complements the post-execution apply_outbound_gate fuzz by writing into
+    process / exception_class / tag source columns on capture_cat, then calling
+    the real tools through the readonly engine.
+    """
+    from sqlmodel import Session, create_engine, select
+    from app.models.db_models import (
+        CrashEventRow, ProcessKillEventRow, CdmPairingEventRow,
+    )
+
+    db_path = writable_db["db_path"]
+    cap_id = writable_db["capture_cat"]
+    monkeypatch.setenv("PARSECAT_DB_PATH", str(db_path))
+
+    canaries = [
+        CAT_LABEL, CAT_FILE, CAT_SERIAL, CAT_SSID, FE_CDM_NAME,
+        "JaneDoe", "janedoe",
+        "com.example.JaneDoeService", "com.example.janedoeException",
+        "sk-escapeCANARY0001", "gsk_escapeCANARY0001",
+        "readgsk_SyntheticKey000000000000000001",
+    ]
+    eng = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False},
+    )
+    with Session(eng) as s:
+        # Pairing carries JaneDoe; companion keeps FE_CDM_NAME — both are identity.
+        for row in s.exec(
+            select(CdmPairingEventRow).where(CdmPairingEventRow.capture_id == cap_id)
+        ).all():
+            row.display_name = "JaneDoe"
+            s.add(row)
+        for i, canary in enumerate(canaries):
+            # Embed canary so 4+ substring / key / JaneDoe forms all hit.
+            proc = canary if "." in canary or canary.startswith(("sk-", "gsk_", "read")) else f"wrap{canary}x"
+            s.add(ProcessKillEventRow(
+                capture_id=cap_id,
+                timestamp=f"08-19 14:{i:02d}:00.000",
+                kind="kill",
+                user_id=0,
+                pid=8000 + i,
+                process=proc,
+                package="com.example.app",
+                oom_adj=0,
+                reason="oom",
+                rss_kb=1,
+                proc_state=None,
+                source_section="system_log",
+                source_line_start=500 + i,
+                source_line_end=500 + i,
+            ))
+            s.add(CrashEventRow(
+                capture_id=cap_id,
+                timestamp=f"08-19 15:{i:02d}:00.000",
+                thread="main",
+                package="com.example.app",
+                pid=8100 + i,
+                exception_class=(
+                    canary if canary[0].isalpha() else "RuntimeException"
+                ),
+                message=None,
+                root_cause_class=None,
+                root_cause_message=None,
+                root_cause_frame=None,
+                source_section="system_log",
+                source_line_start=600 + i,
+                source_line_end=600 + i,
+            ))
+        s.commit()
+    eng.dispose()
+
+    facts_json = tool_get_verified_facts(capture_id=cap_id, limit=500)
+    list_json = tool_list_captures(offset=0, limit=100)
+    facts_obj = json.loads(facts_json)
+    assert facts_obj["facts"]
+    one_json = tool_get_fact(
+        fact_id=facts_obj["facts"][0]["fact_id"], capture_id=cap_id,
+    )
+    injections = 0
+    for blob in (facts_json, list_json, one_json):
+        for c in canaries:
+            assert c not in blob, f"preseed canary leaked: {c!r}"
+            injections += 1
+    test_fe_outbound_gate_fuzz_preseed_db.last_stats = {  # type: ignore[attr-defined]
+        "canaries": len(canaries),
+        "injections": injections,
+        "tools": 3,
     }

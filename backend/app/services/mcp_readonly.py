@@ -254,6 +254,9 @@ def assert_engine_is_readonly(engine) -> None:
 # Residuals intentionally not chased (over-withhold destroys ground truth):
 #   short filename stems (<4), serials under 8 digits, short key fragments.
 _IDENTITY_WORD_MIN_LEN = 2
+# Hybrid FE+Arch threshold: name tokens of this length or more use substring
+# containment; shorter (2–3) stay whole-token + adjacent-join (Al ↛ AlarmException).
+_IDENTITY_SUBSTRING_MIN_LEN = 4
 _IDENTITY_FILENAME_PART_MIN_LEN = 4
 _IDENTITY_NUMERIC_MIN_LEN = 8
 
@@ -264,6 +267,7 @@ _FACT_ID_RE = re.compile(r"^vf_[0-9a-f]{16}$")
 _LABEL_STOPLIST_BASE = frozenset({
     "test", "pixel", "phone", "galaxy", "android", "device", "google",
     "samsung", "crash", "wifi", "bt", "debug", "main", "work", "home", "lab",
+    "watch",  # common device_profile / CDM noun — never identity
 })
 
 
@@ -335,12 +339,15 @@ def _label_stoplist() -> frozenset[str]:
     return frozenset(words)
 
 
-def _is_generated_id(value: str, path: str) -> bool:
-    """True for server-generated IDs verified against their exact format."""
-    if _FACT_ID_RE.fullmatch(value):
-        return True
+def _is_generated_id_field(value: str, path: str) -> bool:
+    """Exempt only real fact_id / capture_id fields by path (FE).
+
+    A ``vf_``-shaped value in any other field (e.g. exception_class) gets the
+    full identity/key/shape checks — format alone never exempts it.
+    """
     leaf = path.split(".")[-1].split("[")[0] if path else ""
-    # capture_id is normally an int; if it appears as a decimal string, exempt.
+    if leaf == "fact_id" and _FACT_ID_RE.fullmatch(value):
+        return True
     if leaf == "capture_id" and value.isdigit():
         return True
     return False
@@ -354,32 +361,33 @@ class CaptureIdentity:
     ssids: frozenset[str] = field(default_factory=frozenset)
     bssids: frozenset[str] = field(default_factory=frozenset)
     device_ids: frozenset[str] = field(default_factory=frozenset)
+    # CDM / companion display names and other stored person-like names (FE).
+    display_names: frozenset[str] = field(default_factory=frozenset)
 
     def label_word_tokens(self) -> frozenset[str]:
-        """Whole-word label tokens + joined compact form, minus stoplist.
+        """Name tokens from label + CDM/companion display names, minus stoplist.
 
-        Individual words from ``_tokenize_words`` plus the label with spaces
+        Individual words from ``_tokenize_words`` plus each name with spaces
         and punctuation removed then casefolded (``Jane Doe`` / ``JaneDoe``
         → ``janedoe``). Stoplist words are never treated as identity
-        (Arch usefulness). Empty when the label is missing or only stoplist
-        words — those labels are not gated.
+        (Arch usefulness). Empty when every name is missing or only stoplist
+        words — those names are not gated.
         """
-        if not self.label:
-            return frozenset()
         stop = _label_stoplist()
-        words = {
-            w for w in _tokenize_words(self.label)
-            if w not in stop and not w.isdigit()
-        }
-        # Joined form: strip spaces/punctuation, NFKC+casefold.
-        joined = re.sub(r"[^\w]+", "", _nfkc(self.label), flags=re.UNICODE)
-        joined = joined.replace("_", "").casefold()
-        if (
-            len(joined) >= _IDENTITY_WORD_MIN_LEN
-            and joined not in stop
-            and not joined.isdigit()
-        ):
-            words.add(joined)
+        words: set[str] = set()
+        for raw in filter(None, (self.label, *self.display_names)):
+            words.update(
+                w for w in _tokenize_words(raw)
+                if w not in stop and not w.isdigit()
+            )
+            joined = re.sub(r"[^\w]+", "", _nfkc(raw), flags=re.UNICODE)
+            joined = joined.replace("_", "").casefold()
+            if (
+                len(joined) >= _IDENTITY_WORD_MIN_LEN
+                and joined not in stop
+                and not joined.isdigit()
+            ):
+                words.add(joined)
         return frozenset(words)
 
     def high_entropy_substring_tokens(self, *, include_filename_parts: bool) -> frozenset[str]:
@@ -462,7 +470,7 @@ class CaptureIdentity:
 
     def free_text_scrub_tokens(self) -> frozenset[str]:
         out: set[str] = set()
-        for v in (self.label, self.serial):
+        for v in (self.label, self.serial, *self.display_names):
             if isinstance(v, str) and v:
                 out.add(v)
                 out.add(_nfkc(v))
@@ -507,6 +515,20 @@ def load_capture_identity(session: Session, capture_id: int) -> CaptureIdentity:
             ssids.add(w.ssid)
         if w.bssid:
             bssids.add(w.bssid)
+    # CDM / companion display names are identity (FE) — tokenized like labels.
+    display_names: set[str] = set()
+    for e in session.exec(
+        select(CdmPairingEventRow).where(CdmPairingEventRow.capture_id == capture_id)
+    ).all():
+        if e.display_name:
+            display_names.add(e.display_name)
+    for a in session.exec(
+        select(CompanionDeviceAssociationRow).where(
+            CompanionDeviceAssociationRow.capture_id == capture_id
+        )
+    ).all():
+        if a.display_name:
+            display_names.add(a.display_name)
     return CaptureIdentity(
         label=device.label,
         filename=capture.original_filename,
@@ -514,6 +536,7 @@ def load_capture_identity(session: Session, capture_id: int) -> CaptureIdentity:
         ssids=frozenset(ssids),
         bssids=frozenset(bssids),
         device_ids=frozenset(device_ids),
+        display_names=frozenset(display_names),
     )
 
 
@@ -791,6 +814,11 @@ def _executable_allowed(value: str) -> bool:
         return False
     if not _EXECUTABLE_ABS_RE.fullmatch(value):
         return False
+    # Reject empty / "." / ".." path segments (FE).
+    segs = value.split("/")
+    for seg in segs[1:]:  # segs[0] is "" for absolute paths
+        if seg in ("", ".", ".."):
+            return False
     # No archive / log extensions (Arch).
     for ext in _EXECUTABLE_BAD_EXT:
         if low.endswith(ext):
@@ -907,12 +935,10 @@ def _shape_ok(kind: str, value: str, *, category: str | None = None) -> bool:
 
 
 def _permission_item_ok(item: str) -> bool:
-    """FE: android.permission.* or package-shaped; plus AVC short verbs selinux.py emits."""
+    """FE: android.permission.* or package-shaped only; withhold everything else."""
     if _ANDROID_PERM_RE.fullmatch(item):
         return True
     if _PACKAGE_RE.fullmatch(item):
-        return True
-    if _SELINUX_PERM_AVC_RE.fullmatch(item):
         return True
     return False
 
@@ -953,21 +979,34 @@ def _contains_numeric_identity(value: str, identity: CaptureIdentity | None) -> 
 
 
 def _whole_word_label_hit(value: str, identity: CaptureIdentity) -> bool:
-    """True when a leaf token or 2–3 adjacent leaf tokens equals a label form.
+    """Hybrid FE+Arch name matching against label + CDM display names.
 
-    Label forms are individual words plus the joined compact label
-    (``janedoe``). Equality only — so label ``Al`` does not match leaf
-    tokens ``alarm``/``exception`` or their concatenations.
+    * Tokens / joined compact forms of length >= ``_IDENTITY_SUBSTRING_MIN_LEN``
+      (4): NFKC+casefold **substring** containment in the leaf. Tradeoff: a
+      4+ character name that is a common substring (e.g. ``Alice`` inside
+      ``xalicex``) over-withholds — fail-closed by design. Stoplist words are
+      never identity tokens, which limits the blast radius.
+    * Tokens of length 2–3: whole-token equality plus 2–3 adjacent leaf-token
+      joins only, so ``Al`` still spares ``AlarmException``.
     """
     label_words = identity.label_word_tokens()
     if not label_words:
         return False
+    norm_leaf = _nfkc(value).casefold()
+    # Long tokens: substring containment.
+    for tok in label_words:
+        if len(tok) >= _IDENTITY_SUBSTRING_MIN_LEN and tok in norm_leaf:
+            return True
+    # Short tokens (2–3): whole-token + adjacent-join equality only.
+    short = {t for t in label_words if _IDENTITY_WORD_MIN_LEN <= len(t) < _IDENTITY_SUBSTRING_MIN_LEN}
+    if not short:
+        return False
     leaf = _tokenize_words(value)
-    if any(tok in label_words for tok in leaf):
+    if any(tok in short for tok in leaf):
         return True
     for n in (2, 3):
         for i in range(0, len(leaf) - n + 1):
-            if "".join(leaf[i : i + n]) in label_words:
+            if "".join(leaf[i : i + n]) in short:
                 return True
     return False
 
@@ -1289,15 +1328,15 @@ def _leaf_hits_gate(
 ) -> str | None:
     """Return withhold reason or None. Never mutates text.
 
-    Order: key-prefix → generated-ID exemption → exact → numeric (NFKC) →
-    label whole-word → high-entropy substring (filename stem skipped on
-    package-like paths).
+    Order: key-prefix → path-scoped generated-ID exemption → exact → numeric
+    (NFKC) → hybrid label/CDM name match → high-entropy substring (filename
+    stem skipped on package-like paths).
     """
     if _has_key_prefix(value):
         return "key-shaped"
-    # Server-generated IDs (vf_ + 16 hex, numeric capture_id strings) are exempt
-    # from containment so short labels like Ed/Ada cannot null fact_ids.
-    if _is_generated_id(value, path):
+    # Only the fact_id / capture_id *fields* are exempt (FE). A vf_-shaped
+    # value in exception_class etc. still gets full checks.
+    if _is_generated_id_field(value, path):
         return None
     if skip_containment or identity is None:
         return None

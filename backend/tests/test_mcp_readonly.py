@@ -22,6 +22,7 @@ from app.mcp_server import (
 )
 from app.models.db_models import (
     AnrRow,
+    BatteryUidStatRow,
     Capture,
     CdmPairingEventRow,
     CompanionDeviceAssociationRow,
@@ -29,6 +30,7 @@ from app.models.db_models import (
     Device,
     DeviceInfoRow,
     KernelLogEventRow,
+    ProcessKillEventRow,
     SelinuxDenialRow,
     TombstoneRow,
     WifiEventRow,
@@ -55,7 +57,10 @@ from app.services.mcp_readonly import (
     _stamp,
     FACT_KIND_KEYS,
     _KIND_BY_CATEGORY,
+    _WITHHELD_REASON_CODES,
     _ground_truth_exempt_values,
+    _has_key_prefix,
+    load_capture_identity,
 )
 
 
@@ -305,7 +310,7 @@ def writable_db(tmp_path: Path):
         session.add(DeviceInfoRow(
             capture_id=cap_cat.id,
             serial=CAT_SERIAL,
-            manufacturer="Synth",
+            manufacturer="Google",  # must NOT become a capture token
             model="CatQA",
         ))
         session.add(WifiEventRow(
@@ -519,6 +524,70 @@ def writable_db(tmp_path: Path):
             source_section="system_log",
             source_line_start=20,
             source_line_end=20,
+        ))
+        # Maximal fixture: memory / battery / companion association / root_cause.
+        session.add(ProcessKillEventRow(
+            capture_id=cap_cat.id,
+            timestamp="08-19 12:06:00.000",
+            kind="kill",
+            user_id=0,
+            pid=4242,
+            process="com.example.mem",
+            package="com.example.mem",
+            oom_adj=900,
+            reason="oom",
+            rss_kb=12000,
+            proc_state=None,
+            source_section="system_log",
+            source_line_start=30,
+            source_line_end=30,
+        ))
+        session.add(BatteryUidStatRow(
+            capture_id=cap_cat.id,
+            uid_token="u0a123",
+            uid=10123,
+            package="com.example.battery",
+            total_mah=12.5,
+            fg_mah=10.0,
+            bg_mah=2.0,
+            fgs_mah=0.5,
+            cached_mah=0.0,
+            components_mah_json="{}",
+            source_section="batterystats",
+            source_line_start=1,
+            source_line_end=1,
+        ))
+        session.add(CompanionDeviceAssociationRow(
+            capture_id=cap_cat.id,
+            association_id=2,
+            mac_address=CAT_MAC,
+            display_name=CAT_LABEL,
+            package_name="com.example.companion",
+            device_profile="WATCH",
+            self_managed=False,
+            revoked=False,
+            pending=False,
+            trusted=True,
+            time_approved=None,
+            last_time_connected=None,
+            currently_connected=True,
+            source_section="companiondevice",
+            source_line_start=1,
+            source_line_end=1,
+        ))
+        session.add(CrashEventRow(
+            capture_id=cap_cat.id,
+            timestamp="08-19 12:10:07.000",
+            thread="main",
+            package="com.example.ok",
+            pid=107,
+            exception_class="java.lang.RuntimeException",
+            message="boom with root",
+            root_cause_class="java.lang.IllegalStateException",
+            root_cause_message="root cause text",
+            root_cause_frame=None,
+            source_section="system_log",
+            source_line_start=107, source_line_end=107,
         ))
 
         # Sibling B wifi only.
@@ -1446,197 +1515,357 @@ def test_arch_key_prefix_blocked_on_kind_selinux_permissions():
     assert "gsk_" not in json.dumps(gated2)
 
 
-# Paths the fuzz must cover — updated when tools grow new string leaves.
-# Discovery compares against this; extras fail the test.
-_FUZZ_REQUIRED_FACT_STRING_FIELDS = frozenset({
-    "category", "fact_id", "timestamp", "package", "exception_class", "thread",
-    "root_cause_class", "confidence", "note", "executable", "signal_name",
-    "signal_code", "priority_name", "kind", "reason_name", "tag", "level",
-    "package_name", "device_profile", "process", "proc_state", "permissions",
-    "source_domain", "target_type", "target_class", "app", "comm", "verdict",
-    "uid_token", "message", "root_cause_message", "reason",
-})
+
+# --- Arch follow-up: mid-token keys / identity / withheld / manufacturer / fuzz -
 
 
-def _discover_string_field_names(payload: dict) -> set[str]:
-    names: set[str] = set()
+def test_arch_mid_token_key_prefixes_withheld():
+    """Keys embedded mid-token (readgsk_…) withhold; long packages still pass."""
+    from app.services.mcp_readonly import _stamp, CaptureIdentity, apply_outbound_gate
+
+    mid = "readgsk_SyntheticKey000000000000000001"
+    mid_perm = "readgsk_abcdefghijklmnopqrstuv"
+    assert _has_key_prefix(mid)
+    assert _has_key_prefix(mid_perm)
+    long_pkg = "com.example." + ("v" * 300)
+    assert not _has_key_prefix(long_pkg)
+
+    ident = CaptureIdentity()
+    stamped = _stamp("crash", 1, {
+        "timestamp": "08-19 12:00:00.000",
+        "thread": mid,
+        "package": long_pkg,
+        "exception_class": "java.lang.RuntimeException",
+        "confidence": "LOW",
+    }, identity=ident)
+    # Force mid-token into thread after stamp (shape may already withhold).
+    stamped["thread"] = mid
+    stamped["package"] = long_pkg
+    gated = apply_outbound_gate({"facts": [stamped]}, ident)
+    blob = json.dumps(gated)
+    assert mid not in blob
+    assert "gsk_SyntheticKey" not in blob
+    assert gated["facts"][0].get("package") == long_pkg  # long legit package survives
+
+    sel = _stamp("selinux", 1, {
+        "timestamp": "08-19 12:00:00.000",
+        "permissions": ["read"],
+        "source_domain": "untrusted_app",
+        "verdict": "denied",
+        "confidence": "LOW",
+    }, identity=ident)
+    sel["permissions"] = ["read", mid_perm, "android.permission.INTERNET"]
+    gated2 = apply_outbound_gate({"facts": [sel]}, ident)
+    assert mid_perm not in json.dumps(gated2)
+    assert "gsk_abcdefghijklmnopqrstuv" not in json.dumps(gated2)
+
+
+def test_arch_identity_nfkc_casefold_and_short_bob():
+    """NFKC+casefold containment; Bob (3 chars) catches BobException."""
+    from app.services.mcp_readonly import apply_outbound_gate, CaptureIdentity
+
+    # Bob is 3 chars — word floor allows it (documented over-withhold tradeoff).
+    ident = CaptureIdentity(label="Bob")
+    tokens = ident.containment_tokens()
+    assert any(t == "Bob" or t.casefold() == "bob" for t in tokens)
+
+    payload = {
+        "facts": [{
+            "category": "crash", "fact_id": "f1", "capture_id": 1,
+            "package": "com.example.BobException",
+            "exception_class": "com.example.BobException",
+            "thread": "main", "confidence": "LOW",
+        }]
+    }
+    gated = apply_outbound_gate(payload, ident)
+    assert gated["facts"][0].get("package") is None
+    assert gated["facts"][0].get("exception_class") is None
+
+    # Straße vs STRASSEException (casefold: ß → ss).
+    ident2 = CaptureIdentity(label="Straße")
+    payload2 = {
+        "facts": [{
+            "category": "crash", "fact_id": "f2", "capture_id": 1,
+            "package": "com.example.app",
+            "exception_class": "STRASSEException",
+            "thread": "main", "confidence": "LOW",
+        }]
+    }
+    gated2 = apply_outbound_gate(payload2, ident2)
+    assert gated2["facts"][0].get("exception_class") is None
+
+
+def test_arch_numeric_identity_digit_boundary():
+    """Numeric serials >= 8 digits gate; 12.txt / timestamps unaffected."""
+    from app.services.mcp_readonly import apply_outbound_gate, CaptureIdentity, _stamp
+
+    serial = "123456789012"  # 12-digit IMEI-like
+    ident = CaptureIdentity(serial=serial, filename="12.txt")
+    assert serial in ident.numeric_identity_tokens()
+    # stem "12" must NOT be a containment token
+    assert "12" not in ident.containment_tokens()
+
+    stamped = _stamp("crash", 1, {
+        "timestamp": "08-19 12:00:12.000",
+        "thread": "main",
+        "package": "com.example.app",
+        "exception_class": "RuntimeException",
+        "confidence": "LOW",
+        "message": f"imei={serial} ok",
+    }, identity=ident)
+    stamped["message"] = f"imei={serial} ok"
+    stamped["thread"] = f"worker-{serial}"
+    gated = apply_outbound_gate({"facts": [stamped]}, ident)
+    blob = json.dumps(gated)
+    assert serial not in blob
+    # timestamp with 12 must survive
+    assert gated["facts"][0].get("timestamp") == "08-19 12:00:12.000"
+
+
+def test_arch_multi_word_label_tokens_across_fields():
+    """Multi-word label → per-word tokens; first/last across fields both hit."""
+    from app.services.mcp_readonly import apply_outbound_gate, CaptureIdentity
+
+    ident = CaptureIdentity(label="Ada Lovelace")
+    toks = ident.containment_tokens()
+    assert "Ada" in toks
+    assert "Lovelace" in toks
+
+    # First name in thread, last name in package — per-token gating covers Arch's case.
+    payload = {
+        "facts": [{
+            "category": "crash", "fact_id": "f1", "capture_id": 1,
+            "thread": "Ada",
+            "package": "com.example.LovelaceHelper",
+            "exception_class": "RuntimeException",
+            "confidence": "LOW",
+        }]
+    }
+    gated = apply_outbound_gate(payload, ident)
+    fact = gated["facts"][0]
+    assert fact.get("thread") is None
+    assert fact.get("package") is None
+    reasons = {w["field"].split(".")[-1] for w in (fact.get("withheld_fields") or [])}
+    # paths are full like facts[0].thread when gated at response — here fact-local
+    fields = {w["field"] for w in (fact.get("withheld_fields") or [])}
+    assert any("thread" in f for f in fields)
+    assert any("package" in f for f in fields)
+
+
+def test_arch_manufacturer_not_capture_token(ro_session):
+    """Manufacturer (Google/Samsung) must not withhold vendor packages."""
+    session, ids, _ = ro_session
+    from app.services.mcp_readonly import apply_outbound_gate, CaptureIdentity, _stamp
+    from app.models.db_models import DeviceInfoRow
+    from sqlmodel import select
+
+    # Fixture already sets manufacturer="Synth" on cat DeviceInfoRow.
+    info = session.exec(
+        select(DeviceInfoRow).where(DeviceInfoRow.capture_id == ids["capture_cat"])
+    ).first()
+    assert info is not None
+    assert info.manufacturer == "Google"
+    loaded = load_capture_identity(session, ids["capture_cat"])
+    assert "Google" not in loaded.device_ids
+    assert "Google" not in loaded.containment_tokens()
+
+    # Packages survive when identity carries only model (not manufacturer).
+    ident_ok = CaptureIdentity(
+        label="lab-phone",
+        device_ids=frozenset({"Pixel 8"}),
+    )
+    stamped = _stamp("crash", 1, {
+        "timestamp": "08-19 12:00:00.000",
+        "thread": "main",
+        "package": "com.google.android.gms",
+        "exception_class": "RuntimeException",
+        "confidence": "LOW",
+    }, identity=ident_ok)
+    stamped["package"] = "com.google.android.gms"
+    gated = apply_outbound_gate({"facts": [stamped]}, ident_ok)
+    assert gated["facts"][0].get("package") == "com.google.android.gms"
+
+    stamped2 = dict(stamped)
+    stamped2["package"] = "com.samsung.android.app"
+    gated2 = apply_outbound_gate({"facts": [stamped2]}, CaptureIdentity(
+        label="lab-phone", device_ids=frozenset({"SM-S911U"}),
+    ))
+    assert gated2["facts"][0].get("package") == "com.samsung.android.app"
+
+
+def test_arch_withheld_fields_sanitized_no_source_values():
+    """Existing withheld_fields entries are gated; only path + fixed reason codes."""
+    from app.services.mcp_readonly import apply_outbound_gate, CaptureIdentity
+
+    poison = "gsk_ProducerMeta0000000000001"
+    ident = CaptureIdentity(label="SecretLabel")
+    payload = {
+        "facts": [{
+            "category": "crash", "fact_id": "f1", "capture_id": 1,
+            "thread": "main", "package": "com.example.app",
+            "exception_class": "RuntimeException", "confidence": "LOW",
+            "withheld_fields": [
+                {"field": "thread", "reason": "shape", "value": poison, "note": "SecretLabel"},
+                {"field": poison, "reason": "identity"},
+                {"field": "package", "reason": poison},
+                "not-a-dict",
+            ],
+        }]
+    }
+    gated = apply_outbound_gate(payload, ident)
+    blob = json.dumps(gated)
+    assert poison not in blob
+    assert "SecretLabel" not in blob
+    wh = gated["facts"][0].get("withheld_fields") or []
+    for entry in wh:
+        assert set(entry.keys()) <= {"field", "reason"}
+        assert entry["reason"] in _WITHHELD_REASON_CODES
+        assert poison not in entry["field"]
+        assert "SecretLabel" not in entry["field"]
+
+
+def _collect_string_leaf_paths(payload: dict) -> set[str]:
+    paths: set[str] = set()
 
     def walk(node, path=""):
         if isinstance(node, dict):
             for k, v in node.items():
-                if k in ("withheld_fields", "untrusted_data_notice", "source"):
-                    if k == "source" and isinstance(v, dict):
-                        for sk, sv in v.items():
-                            if isinstance(sv, str):
-                                names.add(f"source.{sk}")
-                    continue
-                if isinstance(v, str):
-                    # fact-level key
-                    if path.startswith("facts") or path == "fact" or path.endswith("fact"):
-                        names.add(k)
-                    elif not path:
-                        names.add(k)
-                    else:
-                        names.add(k)
-                else:
-                    walk(v, f"{path}.{k}" if path else k)
+                walk(v, f"{path}.{k}" if path else k)
         elif isinstance(node, list):
             for i, v in enumerate(node):
                 walk(v, f"{path}[{i}]")
+        elif isinstance(node, str):
+            paths.add(path)
     walk(payload)
-    return names
+    return paths
+
+
+def _path_template(path: str) -> str:
+    import re as _re
+    return _re.sub(r"\[\d+\]", "[]", path)
+
+
+def _set_by_path(root, path: str, value):
+    """Set a dotted/indexed path on a nested dict/list structure."""
+    import re as _re
+    tokens = []
+    for part in _re.findall(r"[^.\[\]]+|\[\d+\]", path):
+        if part.startswith("[") and part.endswith("]"):
+            tokens.append(int(part[1:-1]))
+        else:
+            tokens.append(part)
+    cur = root
+    for tok in tokens[:-1]:
+        cur = cur[tok]
+    cur[tokens[-1]] = value
 
 
 def test_arch_outbound_gate_schema_fuzz(ro_session, monkeypatch):
-    """Schema-driven fuzz: every emitted string field × each canary → absent.
+    """Auto-derive fuzz coverage from maximal three-tool serialized output.
 
-    Discovers fields from serialized tool output of the populated cat fixture.
-    Fails if a new fact string field appears that the required set doesn't cover.
-    Injects via _stamp + apply_outbound_gate (one canary at a time).
+    Walks every string leaf path across list_captures / get_verified_facts /
+    get_fact (cat fixture with nullable fields populated). Fails if any
+    discovered string leaf path template is not covered by an injection.
     """
+    import copy
+    import re as _re
+
     session, ids, _ = ro_session
     monkeypatch.setenv("PARSECAT_MCP_INCLUDE_FREE_TEXT", "1")
     facts_json = tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
     facts_obj = json.loads(facts_json)
-    assert facts_obj["facts"]
+    assert facts_obj["facts"], "maximal fixture must emit facts"
     list_json = tool_list_captures(offset=0, limit=100)
+    list_obj = json.loads(list_json)
     one_json = tool_get_fact(
         fact_id=facts_obj["facts"][0]["fact_id"], capture_id=ids["capture_cat"],
     )
+    one_obj = json.loads(one_json)
 
-    discovered = set()
-    for blob in (facts_obj, json.loads(list_json), json.loads(one_json)):
-        discovered |= _discover_string_field_names(blob)
+    discovered_paths: set[str] = set()
+    for blob in (facts_obj, list_obj, one_obj):
+        discovered_paths |= _collect_string_leaf_paths(blob)
+    templates = {_path_template(p) for p in discovered_paths}
+    assert templates, "expected string leaves in tool output"
 
-    # source.section counted as source.section
-    fact_fields = {n for n in discovered if n not in (
-        "untrusted_data_notice", "kind",  # list capture kind is bugreport|pcap
-    )}
-    # Compare required coverage for fact string fields we know about.
-    missing_coverage = _FUZZ_REQUIRED_FACT_STRING_FIELDS - discovered
-    # Some required fields may be absent when free-text off / no battery rows —
-    # only fail on NEW fields in output that aren't in required or known meta.
-    known_meta = {
-        "untrusted_data_notice", "id", "captured_at", "ingested_at",
-        "section", "source.section",  # discovered as source.section
-    }
-    new_fields = discovered - _FUZZ_REQUIRED_FACT_STRING_FIELDS - known_meta - {
-        "source.section", "section",
-    }
-    # list capture "kind" is fine
-    new_fields.discard("kind")  # appears on list + wifi facts (required includes kind)
-    # Recompute: fields on facts that look new
-    fact_string_keys = set()
-    for fact in facts_obj["facts"]:
-        for k, v in fact.items():
-            if isinstance(v, str):
-                fact_string_keys.add(k)
-            if k == "source" and isinstance(v, dict):
-                for sk, sv in v.items():
-                    if isinstance(sv, str):
-                        fact_string_keys.add(f"source.{sk}")
-            if k == "permissions" and isinstance(v, list):
-                fact_string_keys.add("permissions")
-    uncovered = fact_string_keys - _FUZZ_REQUIRED_FACT_STRING_FIELDS - {"source.section"}
-    assert not uncovered, f"new fact string fields not in fuzz cover set: {uncovered}"
+    # Categories present (maximal)
+    cats = {f["category"] for f in facts_obj["facts"]}
+    for required in ("crash", "native_crash", "anr", "wifi", "pairing", "selinux",
+                     "kernel", "memory", "battery"):
+        assert required in cats, f"maximal fixture missing category {required}: {cats}"
 
     canaries = [
         CAT_LABEL, CAT_FILE, CAT_SERIAL, CAT_SSID, ARCH_JANE,
         "sk-escapeCANARY0001", "gsk_escapeCANARY0001",
         "AIzaSyEscapeCANARY0001", "xai-escapeCANARY0001",
         "pplx-escapeCANARY0001", "hf_escapeCANARY0001",
+        "readgsk_SyntheticKey000000000000000001",
     ]
-    # Injectable stamp fields per category (source data analogues).
-    inject_plan: list[tuple[str, str, dict]] = []
-    base_crash = {
-        "timestamp": "08-19 12:00:00.000", "thread": "main",
-        "package": "com.example.app", "exception_class": "RuntimeException",
-        "confidence": "LOW",
-    }
-    for field in (
-        "thread", "package", "exception_class", "root_cause_class", "message",
-        "root_cause_message",
-    ):
-        inject_plan.append(("crash", field, dict(base_crash)))
-    inject_plan.append(("native_crash", "executable", {
-        "executable": "/system/bin/surfaceflinger", "package": "com.example.native",
-        "signal_name": "SIGSEGV", "signal_code": "SEGV_MAPERR", "confidence": "LOW",
-    }))
-    inject_plan.append(("wifi", "kind", {
-        "timestamp": "08-19 12:00:00.000", "kind": "disconnection",
-        "reason_code": 3, "reason_name": "Unspecified reason", "confidence": "LOW",
-    }))
-    inject_plan.append(("wifi", "reason_name", {
-        "timestamp": "08-19 12:00:00.000", "kind": "disconnection",
-        "reason_code": 3, "reason_name": "Unspecified reason", "confidence": "LOW",
-    }))
-    inject_plan.append(("pairing", "tag", {
-        "kind": "anomaly", "tag": "CDM", "level": "I", "confidence": "LOW",
-    }))
-    inject_plan.append(("memory", "process", {
-        "timestamp": "08-19 12:00:00.000", "kind": "kill",
-        "process": "com.example.app", "package": "com.example.app", "confidence": "LOW",
-    }))
-    inject_plan.append(("selinux", "source_domain", {
-        "timestamp": "08-19 12:00:00.000", "permissions": ["read"],
-        "source_domain": "untrusted_app", "verdict": "denied", "confidence": "LOW",
-    }))
-    inject_plan.append(("selinux", "permissions", {
-        "timestamp": "08-19 12:00:00.000", "permissions": ["read"],
-        "source_domain": "untrusted_app", "verdict": "denied", "confidence": "LOW",
-    }))
-    inject_plan.append(("kernel", "priority_name", {
-        "boot_relative_sec": 1.0, "priority": 3, "priority_name": "err",
-        "thread": "kworker", "is_panic_family": False, "confidence": "LOW",
-    }))
 
+    # Map each template → one concrete path from discovery for injection.
+    concrete_for: dict[str, str] = {}
+    for path in sorted(discovered_paths):
+        concrete_for.setdefault(_path_template(path), path)
+
+    covered: set[str] = set()
     injections = 0
-    for cat, field, base in inject_plan:
-        for canary in canaries:
-            fields = dict(base)
-            if field == "permissions":
-                fields[field] = ["read", canary]
-            elif field == "executable" and canary.startswith(("/", "sk", "gsk", "AIza", "xai", "pplx", "hf")):
-                # Keep under allowlisted prefix when testing key canaries.
-                if any(canary.startswith(p) for p in ("sk-", "gsk_", "AIza", "xai-", "pplx-", "hf_")):
-                    fields[field] = f"/system/bin/{canary}"
-                else:
-                    fields[field] = canary
-            else:
-                fields[field] = canary
-            ident = CaptureIdentity(
-                label=CAT_LABEL if canary != CAT_LABEL else canary,
-                filename=CAT_FILE if canary != CAT_FILE else canary,
-                serial=CAT_SERIAL if canary != CAT_SERIAL else canary,
-                ssids=frozenset({CAT_SSID} if canary != CAT_SSID else {canary}),
-            )
-            # Always include the canary itself as a containment token.
-            if canary in (CAT_LABEL, CAT_FILE, CAT_SERIAL, CAT_SSID, ARCH_JANE):
-                ident = CaptureIdentity(
-                    label=canary if canary == CAT_LABEL or canary == ARCH_JANE else CAT_LABEL,
-                    filename=canary if canary == CAT_FILE else CAT_FILE,
-                    serial=canary if canary == CAT_SERIAL else CAT_SERIAL,
-                    ssids=frozenset([canary]) if canary == CAT_SSID else frozenset({CAT_SSID}),
-                    device_ids=frozenset([canary]),
-                )
-            stamped = _stamp(cat, 1, fields, identity=ident)
-            # Also force the field after stamp for cases shape-withheld pre-gate.
-            if field == "permissions":
-                stamped["permissions"] = ["read", canary]
-            elif field in stamped or True:
-                stamped[field] = (
-                    ["read", canary] if field == "permissions" else (
-                        f"/system/bin/{canary}" if field == "executable" and not str(canary).startswith("/")
-                        and any(str(canary).startswith(p) for p in ("sk-", "gsk_", "AIza", "xai-", "pplx-", "hf_"))
-                        else canary
-                    )
-                )
-            gated = apply_outbound_gate({"facts": [stamped]}, ident)
-            blob = json.dumps(gated)
-            assert canary not in blob, f"{cat}.{field} leaked {canary!r}: {blob[:400]}"
-            injections += 1
 
-    # Also run both live tools and assert no canary from the cat fixture identity.
+    def _ident_for(canary: str) -> CaptureIdentity:
+        if canary in (CAT_LABEL, ARCH_JANE):
+            return CaptureIdentity(label=canary, filename=CAT_FILE, serial=CAT_SERIAL,
+                                   ssids=frozenset({CAT_SSID}))
+        if canary == CAT_FILE:
+            return CaptureIdentity(label=CAT_LABEL, filename=canary, serial=CAT_SERIAL,
+                                   ssids=frozenset({CAT_SSID}))
+        if canary == CAT_SERIAL:
+            return CaptureIdentity(label=CAT_LABEL, filename=CAT_FILE, serial=canary,
+                                   ssids=frozenset({CAT_SSID}))
+        if canary == CAT_SSID:
+            return CaptureIdentity(label=CAT_LABEL, filename=CAT_FILE, serial=CAT_SERIAL,
+                                   ssids=frozenset({canary}))
+        return CaptureIdentity(label=CAT_LABEL, filename=CAT_FILE, serial=CAT_SERIAL,
+                               ssids=frozenset({CAT_SSID}), device_ids=frozenset({canary}))
+
+    # Inject into a copy of each tool payload at the concrete path.
+    base_payloads = {
+        "facts": facts_obj,
+        "list": list_obj,
+        "one": one_obj,
+    }
+
+    def _owner_for(concrete: str) -> str:
+        if concrete.startswith("captures"):
+            return "list"
+        if concrete.startswith("fact.") or concrete == "fact":
+            return "one"
+        # Shared top-level keys appear on multiple tools; prefer the payload
+        # that actually contains this concrete path.
+        for name, blob in base_payloads.items():
+            if concrete in _collect_string_leaf_paths(blob):
+                return name
+        return "facts"
+
+    for tmpl, concrete in concrete_for.items():
+        owner_name = _owner_for(concrete)
+        for canary in canaries:
+            payload = copy.deepcopy(base_payloads[owner_name])
+            try:
+                _set_by_path(payload, concrete, canary)
+            except (KeyError, IndexError, TypeError):
+                continue
+            ident = _ident_for(canary)
+            gated = apply_outbound_gate(payload, ident)
+            blob = json.dumps(gated)
+            assert canary not in blob, (
+                f"path {concrete} (tmpl={tmpl}) leaked {canary!r} via {owner_name}"
+            )
+            injections += 1
+        covered.add(tmpl)
+
+    uncovered = templates - covered
+    assert not uncovered, f"string leaf paths not covered by injection: {sorted(uncovered)}"
+
+    # Live tool outputs must not contain fixture identity / key prefixes.
     for blob in (facts_json, list_json, one_json):
         for c in (CAT_LABEL, CAT_FILE, CAT_SERIAL, CAT_SSID, ARCH_JANE):
             assert c not in blob
@@ -1644,11 +1873,12 @@ def test_arch_outbound_gate_schema_fuzz(ro_session, monkeypatch):
             assert prefix not in blob
 
     assert injections >= 100, injections
-    # Expose counts for the report via assertion message pattern
     test_arch_outbound_gate_schema_fuzz.last_stats = {  # type: ignore[attr-defined]
-        "fact_string_fields": sorted(fact_string_keys),
-        "field_count": len(fact_string_keys),
+        "templates": sorted(templates),
+        "template_count": len(templates),
+        "path_count": len(discovered_paths),
         "injections": injections,
         "canaries": len(canaries),
-        "inject_fields": len(inject_plan),
+        "covered": len(covered),
+        "categories": sorted(cats),
     }

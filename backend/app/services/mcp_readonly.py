@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -240,10 +241,25 @@ def assert_engine_is_readonly(engine) -> None:
 
 # --- capture identity (exact + containment token checks) --------------------
 
-# Only match capture tokens that are at least 4 chars and not purely numeric,
-# so short/numeric stems (e.g. filename "12.txt" → stem "12") cannot null
-# every field via containment.
-_IDENTITY_TOKEN_MIN_LEN = 4
+# Token length floors (Arch):
+#   * Label / SSID / device *word* tokens: >= 3 chars after NFKC+casefold.
+#     Tradeoff: short real words ("Bob", "Lee", "Doe") over-withhold when they
+#     appear inside otherwise-benign identifiers (e.g. com.example.BobException,
+#     or any leaf containing "Doe" when the label is "Jane Doe").
+#   * Filename basename/stem: >= 4 chars, so "12.txt" → stem "12" never tokens
+#     and cannot punch holes in timestamps / reason codes.
+#   * Numeric identities (serial / IMEI-like): >= 8 digits, digit-boundary only.
+_IDENTITY_WORD_MIN_LEN = 3
+_IDENTITY_FILENAME_PART_MIN_LEN = 4
+_IDENTITY_NUMERIC_MIN_LEN = 8
+
+_WORD_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _norm_token(value: str) -> str:
+    """NFKC + casefold so Bob/BOB and Straße/STRASSE compare equal."""
+    return unicodedata.normalize("NFKC", value).casefold()
+
 
 @dataclass(frozen=True)
 class CaptureIdentity:
@@ -254,45 +270,64 @@ class CaptureIdentity:
     bssids: frozenset[str] = field(default_factory=frozenset)
     device_ids: frozenset[str] = field(default_factory=frozenset)
 
-    def _raw_tokens(self) -> set[str]:
+    def _add_word_tokens(self, raw: str, out: set[str], *, min_len: int) -> None:
+        if not raw:
+            return
+        out.add(raw)
+        for word in _WORD_TOKEN_RE.findall(raw):
+            if len(_norm_token(word)) >= min_len and not word.isdigit():
+                out.add(word)
+
+    def _text_tokens(self, *, include_filename_parts: bool) -> set[str]:
         out: set[str] = set()
-        for v in (self.label, self.filename, self.serial):
-            if isinstance(v, str) and v:
-                out.add(v)
-        out.update(s for s in self.ssids if s)
-        out.update(d for d in self.device_ids if d)
-        if isinstance(self.filename, str) and self.filename:
-            out.add(Path(self.filename).name)
-            out.add(Path(self.filename).stem)
+        if self.label:
+            # Multi-word labels → each word token gated separately (Arch 2c),
+            # so a first name in one field and a last name in another both hit.
+            self._add_word_tokens(self.label, out, min_len=_IDENTITY_WORD_MIN_LEN)
+        if self.filename:
+            out.add(self.filename)
+            if include_filename_parts:
+                base = Path(self.filename).name
+                stem = Path(self.filename).stem
+                for part in (base, stem):
+                    if (
+                        len(_norm_token(part)) >= _IDENTITY_FILENAME_PART_MIN_LEN
+                        and not part.isdigit()
+                    ):
+                        out.add(part)
+        for s in self.ssids:
+            self._add_word_tokens(s, out, min_len=_IDENTITY_WORD_MIN_LEN)
+        for d in self.device_ids:
+            # Pure digit device ids go through numeric_identity_tokens.
+            if d.isdigit():
+                continue
+            self._add_word_tokens(d, out, min_len=_IDENTITY_WORD_MIN_LEN)
+        if self.serial and not self.serial.isdigit():
+            self._add_word_tokens(self.serial, out, min_len=_IDENTITY_WORD_MIN_LEN)
         return out
 
     def exact_identifier_tokens(self) -> frozenset[str]:
-        return frozenset(self._raw_tokens())
+        return frozenset(self._text_tokens(include_filename_parts=True))
 
     def containment_tokens(self) -> frozenset[str]:
-        """All identity tokens (incl. filename basename/stem) for free-form leaves."""
-        return frozenset(
-            t for t in self._raw_tokens()
-            if len(t) >= _IDENTITY_TOKEN_MIN_LEN and not t.isdigit()
-        )
+        """Text tokens incl. filename parts for free-form leaves."""
+        return frozenset(self._text_tokens(include_filename_parts=True))
 
     def containment_tokens_without_filename_parts(self) -> frozenset[str]:
-        """Label/serial/ssid/device/full-filename only — not basename/stem.
+        """Label/ssid/device/full-filename words — not basename/stem.
 
-        Filename stems like ``crash`` (from crash.zip) must not null package
-        segments such as ``com.example.crash`` (Arch: crash.zip ground-truth
-        stays green). Labels/serials/SSIDs still apply to package-shaped leaves.
+        Filename stems like ``crash`` (crash.zip) must not null package
+        segments such as ``com.example.crash``.
         """
+        return frozenset(self._text_tokens(include_filename_parts=False))
+
+    def numeric_identity_tokens(self) -> frozenset[str]:
+        """Digit-only identities (serial etc.) with length >= 8."""
         out: set[str] = set()
-        for v in (self.label, self.filename, self.serial):
-            if isinstance(v, str) and v:
+        for v in (self.serial, *self.device_ids):
+            if isinstance(v, str) and v.isdigit() and len(v) >= _IDENTITY_NUMERIC_MIN_LEN:
                 out.add(v)
-        out.update(self.ssids)
-        out.update(self.device_ids)
-        return frozenset(
-            t for t in out
-            if len(t) >= _IDENTITY_TOKEN_MIN_LEN and not t.isdigit()
-        )
+        return frozenset(out)
 
     def free_text_scrub_tokens(self) -> frozenset[str]:
         out: set[str] = set()
@@ -306,8 +341,13 @@ class CaptureIdentity:
             base = Path(self.filename).name
             stem = Path(self.filename).stem
             for part in (base, stem):
-                if len(part) >= _IDENTITY_TOKEN_MIN_LEN and not part.isdigit():
+                if len(part) >= _IDENTITY_FILENAME_PART_MIN_LEN and not part.isdigit():
                     out.add(part)
+        if self.label:
+            for word in _WORD_TOKEN_RE.findall(self.label):
+                if len(_norm_token(word)) >= _IDENTITY_WORD_MIN_LEN and not word.isdigit():
+                    out.add(word)
+        out.update(self.numeric_identity_tokens())
         return frozenset(out)
 
 
@@ -319,8 +359,10 @@ def load_capture_identity(session: Session, capture_id: int) -> CaptureIdentity:
     serial = info.serial if info is not None else None
     device_ids: set[str] = set()
     if info is not None:
+        # manufacturer is NOT identifying (Arch usefulness): com.google.* /
+        # com.samsung.* packages must survive when manufacturer is Google/Samsung.
         for attr in (
-            "serial", "build_fingerprint", "build_id", "model", "manufacturer",
+            "serial", "build_fingerprint", "build_id", "model",
             "hardware", "radio", "network",
         ):
             val = getattr(info, attr, None)
@@ -371,11 +413,26 @@ def _scrub_ipv6(text: str) -> str:
     return _IPV6_CANDIDATE_RE.sub(repl, text)
 
 
-# Key *prefixes* only (Arch): withhold on match for free-form IDs / classes / section.
-# Long-token heuristic stays off for package/package_name (segment prefix check only).
-_KEY_PREFIX_RE = re.compile(
+# Key detection (Arch):
+#   * Word-boundary prefix (legacy): sk-/gsk_/AIza/xai-/pplx-/hf_ at a
+#     non-alnum boundary — catches short fixture forms (gsk_EvilException).
+#   * Mid-token + run-length: same prefixes anywhere when followed by a
+#     KEY_LIKE_RE-length tail (gsk_/xai-/pplx-/hf_ → 16+; AIza → 4+; sk- →
+#     any). Catches readgsk_SyntheticKey… / readgsk_abcdefghijklmnopqrstuv.
+# Bare 32+ opaque run stays OFF so long legit packages still pass.
+_KEY_TAIL = r"[A-Za-z0-9_\-]"
+_KEY_BOUNDARY_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:sk-|gsk_|AIza|xai-|pplx-|hf_)",
 )
+_KEY_EMBEDDED_RE = re.compile(
+    r"(?:"
+    r"sk-[A-Za-z0-9_.\-]*"
+    r"|(?:gsk_|xai-|pplx-|hf_)(?:" + _KEY_TAIL + r"*(?:\.{2,}|\u2026)" + _KEY_TAIL + r"*|" + _KEY_TAIL + r"{16,})"
+    r"|AIza" + _KEY_TAIL + r"{4,}"
+    r")"
+)
+# Back-compat alias (either detector).
+_KEY_PREFIX_RE = _KEY_BOUNDARY_RE
 
 _PACKAGE_RE = re.compile(
     r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+(:[A-Za-z0-9._-]+)?$"
@@ -531,17 +588,16 @@ def _apply_secret_detectors(text: str, *, include_key_heuristic: bool = True) ->
 
 
 def _has_key_prefix(text: str) -> bool:
-    return _KEY_PREFIX_RE.search(text) is not None
+    """True on boundary prefix OR mid-token prefix with KEY_LIKE run-length."""
+    return (
+        _KEY_BOUNDARY_RE.search(text) is not None
+        or _KEY_EMBEDDED_RE.search(text) is not None
+    )
 
 
 def _package_segment_has_key_prefix(value: str) -> bool:
-    """Prefix-only check per package segment (Arch); no long-token heuristic."""
-    for seg in re.split(r"[.:]", value):
-        if not seg:
-            continue
-        if seg.startswith(("sk-", "gsk_", "AIza", "xai-", "pplx-", "hf_")):
-            return True
-    return False
+    """Key-prefix + run anywhere (incl. mid-segment); no bare 32+ heuristic."""
+    return _has_key_prefix(value)
 
 
 def _scrub_identity_tokens(text: str, identity: CaptureIdentity | None) -> str:
@@ -726,11 +782,59 @@ def _split_permissions(raw: Any) -> list[str] | None:
     return parts
 
 
+_WITHHELD_REASON_CODES = frozenset({
+    "shape", "pii", "identity", "key-shaped", "too_long",
+})
+
+_NUMERIC_ID_IN_TEXT_RE = re.compile(r"(?<!\d)(\d{8,})(?!\d)")
+
+
 def _contains_identity(value: str, identity: CaptureIdentity | None) -> bool:
     if identity is None:
         return False
-    low = value.lower()
-    return any(tok.lower() in low for tok in identity.containment_tokens())
+    return _contains_token(value, identity.containment_tokens(), segment=False)
+
+
+def _exact_identity_match(value: str, identity: CaptureIdentity | None) -> bool:
+    if identity is None:
+        return False
+    norm = _norm_token(value)
+    return any(_norm_token(tok) == norm for tok in identity.exact_identifier_tokens())
+
+
+def _contains_numeric_identity(value: str, identity: CaptureIdentity | None) -> bool:
+    """Digit-boundary match for serials / IMEI-like ids (>= 8 digits)."""
+    if identity is None:
+        return False
+    nums = identity.numeric_identity_tokens()
+    if not nums:
+        return False
+    return any(m.group(1) in nums for m in _NUMERIC_ID_IN_TEXT_RE.finditer(value))
+
+
+def _sanitize_withheld_entry(
+    entry: Any,
+    identity: CaptureIdentity | None,
+) -> dict[str, str] | None:
+    """Keep only field path + fixed reason code; never source values (Arch)."""
+    if not isinstance(entry, dict):
+        return None
+    field = entry.get("field")
+    reason = entry.get("reason")
+    if not isinstance(field, str) or not field:
+        return None
+    if _has_key_prefix(field) or (
+        identity is not None
+        and (
+            _contains_token(field, identity.containment_tokens(), segment=False)
+            or _contains_numeric_identity(field, identity)
+            or _exact_identity_match(field, identity)
+        )
+    ):
+        field = "<withheld>"
+    if not isinstance(reason, str) or reason not in _WITHHELD_REASON_CODES:
+        reason = "shape"
+    return {"field": field, "reason": reason}
 
 
 def _validate_identifier(
@@ -754,7 +858,9 @@ def _validate_identifier(
         return "key-shaped"
     if _apply_secret_detectors(value, include_key_heuristic=False) != value:
         return "pii"
-    if identity is not None and value in identity.exact_identifier_tokens():
+    if _exact_identity_match(value, identity):
+        return "identity"
+    if _contains_numeric_identity(value, identity):
         return "identity"
     if field in _CONTAINMENT_FIELDS and _contains_identity(value, identity):
         return "identity"
@@ -789,8 +895,9 @@ def _source(
         withheld.append({"field": "source.section", "reason": "key-shaped"})
         return {"section": None, "line_start": line_start, "line_end": end}, withheld
     if identity is not None and (
-        section in identity.exact_identifier_tokens()
+        _exact_identity_match(section, identity)
         or _contains_identity(section, identity)
+        or _contains_numeric_identity(section, identity)
     ):
         withheld.append({"field": "source.section", "reason": "identity"})
         return {"section": None, "line_start": line_start, "line_end": end}, withheld
@@ -832,10 +939,21 @@ def _stamp(
             parts = _split_permissions(value)
             if parts is None:
                 continue
-            kept = [p for p in parts if _permission_item_ok(p)]
-            dropped = len(parts) - len(kept)
+            kept: list[str] = []
+            dropped_shape = 0
+            dropped_key = 0
+            for p in parts:
+                if _has_key_prefix(p):
+                    dropped_key += 1
+                    continue
+                if not _permission_item_ok(p):
+                    dropped_shape += 1
+                    continue
+                kept.append(p)
             body[key] = kept  # keep list shape even if empty
-            if dropped:
+            if dropped_key:
+                withheld.append({"field": key, "reason": "key-shaped"})
+            if dropped_shape:
                 withheld.append({"field": key, "reason": "shape"})
             continue
 
@@ -965,12 +1083,13 @@ def _path_is_package_like(path: str) -> bool:
 
 
 def _contains_token(value: str, tokens: frozenset[str], *, segment: bool) -> bool:
-    low = value.lower()
+    """Containment with NFKC + casefold (Arch 2a)."""
+    norm_val = _norm_token(value)
     if not segment:
-        return any(tok.lower() in low for tok in tokens)
+        return any(_norm_token(tok) in norm_val for tok in tokens)
     segs = [s for s in re.split(r"[.$:]", value) if s]
-    seg_low = {s.lower() for s in segs}
-    return any(tok.lower() in seg_low for tok in tokens)
+    seg_norm = {_norm_token(s) for s in segs}
+    return any(_norm_token(tok) in seg_norm for tok in tokens)
 
 
 def _leaf_hits_gate(
@@ -985,7 +1104,9 @@ def _leaf_hits_gate(
         return "key-shaped"
     if skip_containment or identity is None:
         return None
-    if value in identity.exact_identifier_tokens():
+    if _exact_identity_match(value, identity):
+        return "identity"
+    if _contains_numeric_identity(value, identity):
         return "identity"
     if _path_is_package_like(path):
         # Substring vs label/serial/ssid/full-filename (NOT filename stem/basename),
@@ -1024,17 +1145,26 @@ def apply_outbound_gate(
                 and "capture_id" in node
             )
             if is_fact:
-                local_withheld = list(node.get("withheld_fields") or [])
+                # Start empty; seed by sanitizing existing entries below so
+                # producer metadata cannot leak through pre-gate withheld_fields.
+                local_withheld = []
             for k, v in node.items():
                 if k == "withheld_fields":
+                    cleaned: list[dict[str, str]] = []
+                    if isinstance(v, list):
+                        for item in v:
+                            sanitized = _sanitize_withheld_entry(item, identity)
+                            if sanitized is not None:
+                                cleaned.append(sanitized)
+                    if is_fact:
+                        local_withheld.extend(cleaned)
+                    else:
+                        out[k] = cleaned
                     continue
                 child_path = f"{path}.{k}" if path else k
                 out[k] = walk(v, child_path, local_withheld)
-            if is_fact:
-                if local_withheld:
-                    out["withheld_fields"] = local_withheld
-                elif "withheld_fields" in node and node["withheld_fields"]:
-                    out["withheld_fields"] = node["withheld_fields"]
+            if is_fact and local_withheld:
+                out["withheld_fields"] = local_withheld
             return out
         if isinstance(node, list):
             return [walk(v, f"{path}[{i}]", fact_withheld) for i, v in enumerate(node)]
@@ -1060,8 +1190,15 @@ def apply_outbound_gate(
         # Facts responses don't list this key — fold into each fact already.
         # For leftover response-level hits, attach to payload when possible.
         gated = dict(gated)
-        existing = list(gated.get("withheld_fields") or [])
-        existing.extend(response_withheld)
+        existing: list[dict[str, str]] = []
+        for item in list(gated.get("withheld_fields") or []):
+            s = _sanitize_withheld_entry(item, identity)
+            if s is not None:
+                existing.append(s)
+        for item in response_withheld:
+            s = _sanitize_withheld_entry(item, identity)
+            if s is not None:
+                existing.append(s)
         gated["withheld_fields"] = existing
     return gated
 

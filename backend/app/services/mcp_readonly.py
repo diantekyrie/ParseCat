@@ -282,22 +282,24 @@ def _has_non_ascii_digit(value: str) -> bool:
 
 
 def _tokenize_words(value: str) -> list[str]:
-    """NFKC, split on case/digit/punctuation, casefold; keep len >= min.
+    """Split identifiers, then NFKC-casefold; keep len >= min.
 
-    Unicode letters (e.g. ß in Straße) are preserved until casefold so
-    Straße → strasse, matching STRASSEException's strasse word.
+    Split on package dots, ``$``, ``_``, ``-``, and CamelCase boundaries.
+    Lowercase runs stay whole so ``janedoeException`` → ``janedoe``, ``exception``.
+    Unicode letters (e.g. ß) are preserved until casefold (Straße → strasse).
     """
     if not value:
         return []
     text = _nfkc(value)
-    # CamelCase / acronyms / digit boundaries while case is intact.
+    # Package / inner-class / snake / kebab separators first.
+    text = re.sub(r"[.$\-_]+", " ", text)
+    # CamelCase / acronyms / digit boundaries; lowercase runs stay intact.
     text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
     text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
     text = re.sub(r"([A-Za-z])(\d)", r"\1 \2", text)
     text = re.sub(r"(\d)([A-Za-z])", r"\1 \2", text)
-    # Punctuation / underscore / hyphen → separators; keep Unicode letters.
+    # Remaining non-word chars → separators; keep Unicode letters.
     text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
-    text = text.replace("_", " ")
     out: list[str] = []
     for w in text.split():
         cf = w.casefold()
@@ -354,10 +356,13 @@ class CaptureIdentity:
     device_ids: frozenset[str] = field(default_factory=frozenset)
 
     def label_word_tokens(self) -> frozenset[str]:
-        """Whole-word label tokens (NFKC+casefold), minus stoplist.
+        """Whole-word label tokens + joined compact form, minus stoplist.
 
-        Empty when the label is missing or only stoplist words — those labels
-        are not identifying and are not gated (Arch usefulness).
+        Individual words from ``_tokenize_words`` plus the label with spaces
+        and punctuation removed then casefolded (``Jane Doe`` / ``JaneDoe``
+        → ``janedoe``). Stoplist words are never treated as identity
+        (Arch usefulness). Empty when the label is missing or only stoplist
+        words — those labels are not gated.
         """
         if not self.label:
             return frozenset()
@@ -366,6 +371,15 @@ class CaptureIdentity:
             w for w in _tokenize_words(self.label)
             if w not in stop and not w.isdigit()
         }
+        # Joined form: strip spaces/punctuation, NFKC+casefold.
+        joined = re.sub(r"[^\w]+", "", _nfkc(self.label), flags=re.UNICODE)
+        joined = joined.replace("_", "").casefold()
+        if (
+            len(joined) >= _IDENTITY_WORD_MIN_LEN
+            and joined not in stop
+            and not joined.isdigit()
+        ):
+            words.add(joined)
         return frozenset(words)
 
     def high_entropy_substring_tokens(self, *, include_filename_parts: bool) -> frozenset[str]:
@@ -939,11 +953,23 @@ def _contains_numeric_identity(value: str, identity: CaptureIdentity | None) -> 
 
 
 def _whole_word_label_hit(value: str, identity: CaptureIdentity) -> bool:
-    """True when any leaf word equals any label word (NFKC+casefold)."""
+    """True when a leaf token or 2–3 adjacent leaf tokens equals a label form.
+
+    Label forms are individual words plus the joined compact label
+    (``janedoe``). Equality only — so label ``Al`` does not match leaf
+    tokens ``alarm``/``exception`` or their concatenations.
+    """
     label_words = identity.label_word_tokens()
     if not label_words:
         return False
-    return bool(set(_tokenize_words(value)) & label_words)
+    leaf = _tokenize_words(value)
+    if any(tok in label_words for tok in leaf):
+        return True
+    for n in (2, 3):
+        for i in range(0, len(leaf) - n + 1):
+            if "".join(leaf[i : i + n]) in label_words:
+                return True
+    return False
 
 
 def _substring_high_entropy_hit(

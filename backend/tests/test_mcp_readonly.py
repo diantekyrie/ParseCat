@@ -1685,11 +1685,35 @@ def test_arch_whole_word_al_jo_survive_alarm_job():
 
 
 def test_arch_jane_doe_whole_word_tokens_withheld():
-    """Jane Doe → jane/doe whole words; worker-Jane_Doe withheld."""
+    """JaneDoe / Jane Doe → jane/doe/janedoe; JanedoeService & janedoeException withheld."""
     from app.services.mcp_readonly import apply_outbound_gate, CaptureIdentity
 
-    ident = CaptureIdentity(label="Jane Doe")
-    assert ident.label_word_tokens() == frozenset({"jane", "doe"})
+    for label in ("Jane Doe", "JaneDoe"):
+        ident = CaptureIdentity(label=label)
+        assert ident.label_word_tokens() == frozenset({"jane", "doe", "janedoe"}), label
+
+    ident = CaptureIdentity(label="JaneDoe")
+    # Compact lowercase / title forms Arch found escaping through both fact tools.
+    for pkg, exc in (
+        ("com.example.JanedoeService", "JanedoeService"),
+        ("com.example.janedoeException", "janedoeException"),
+        ("com.example.JaneDoeService", "JaneDoeService"),
+        ("com.example.JaneDoeException", "JaneDoeException"),
+    ):
+        payload = {
+            "facts": [{
+                "category": "crash", "fact_id": "vf_0123456789abcdef", "capture_id": 1,
+                "thread": "main",
+                "package": pkg,
+                "exception_class": exc,
+                "confidence": "LOW",
+            }]
+        }
+        gated = apply_outbound_gate(payload, ident)
+        assert gated["facts"][0].get("package") is None, pkg
+        assert gated["facts"][0].get("exception_class") is None, exc
+
+    # Hyphen/underscore split still hits.
     payload = {
         "facts": [{
             "category": "crash", "fact_id": "vf_0123456789abcdef", "capture_id": 1,
@@ -1699,8 +1723,7 @@ def test_arch_jane_doe_whole_word_tokens_withheld():
             "confidence": "LOW",
         }]
     }
-    # Force thread past stamp allowlist
-    gated = apply_outbound_gate(payload, ident)
+    gated = apply_outbound_gate(payload, CaptureIdentity(label="Jane Doe"))
     assert gated["facts"][0].get("thread") is None
 
 
@@ -1709,7 +1732,7 @@ def test_arch_multi_word_label_tokens_across_fields():
     from app.services.mcp_readonly import apply_outbound_gate, CaptureIdentity
 
     ident = CaptureIdentity(label="Ada Lovelace")
-    assert ident.label_word_tokens() == frozenset({"ada", "lovelace"})
+    assert ident.label_word_tokens() == frozenset({"ada", "lovelace", "adalovelace"})
 
     payload = {
         "facts": [{
@@ -1919,6 +1942,9 @@ def test_arch_outbound_gate_schema_fuzz(ro_session, monkeypatch):
 
     canaries = [
         CAT_LABEL, CAT_FILE, CAT_SERIAL, CAT_SSID, ARCH_JANE,
+        "JaneDoe", "Janedoe", "janedoe",
+        "com.example.JaneDoeService", "com.example.JanedoeService",
+        "com.example.JaneDoeException", "com.example.janedoeException",
         "sk-escapeCANARY0001", "gsk_escapeCANARY0001",
         "AIzaSyEscapeCANARY0001", "xai-escapeCANARY0001",
         "pplx-escapeCANARY0001", "hf_escapeCANARY0001",
@@ -1934,7 +1960,16 @@ def test_arch_outbound_gate_schema_fuzz(ro_session, monkeypatch):
     injections = 0
 
     def _ident_for(canary: str) -> CaptureIdentity:
-        if canary in (CAT_LABEL, ARCH_JANE):
+        jane_forms = {"JaneDoe", "Janedoe", "janedoe", ARCH_JANE}
+        jane_pkgs = {
+            "com.example.JaneDoeService", "com.example.JanedoeService",
+            "com.example.JaneDoeException", "com.example.janedoeException",
+        }
+        if canary in jane_forms or canary in jane_pkgs:
+            # Gate against the compact CamelCase label Arch escaped.
+            return CaptureIdentity(label="JaneDoe", filename=CAT_FILE, serial=CAT_SERIAL,
+                                   ssids=frozenset({CAT_SSID}))
+        if canary == CAT_LABEL:
             return CaptureIdentity(label=canary, filename=CAT_FILE, serial=CAT_SERIAL,
                                    ssids=frozenset({CAT_SSID}))
         if canary == CAT_FILE:

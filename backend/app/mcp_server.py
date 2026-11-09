@@ -49,8 +49,8 @@ mcp = MCPServer(
         "display names, SSID/BSSID/MAC/serial, and coordinates are omitted. "
         "Crash/ANR/kernel free text is omitted unless "
         "PARSECAT_MCP_INCLUDE_FREE_TEXT=1; when enabled it is PII/key-scrubbed "
-        "evidence — residual risk: names/labels inside log text may reach "
-        "the model. No write/upload/diagnose/LLM tools. "
+        "evidence — residual risk: names, labels, and filenames that appear "
+        "inside log text may reach the model. No write/upload/diagnose/LLM tools. "
         f"{UNTRUSTED_DATA_NOTICE}"
     ),
 )
@@ -105,8 +105,7 @@ def list_captures(offset: int | None = None, limit: int | None = None) -> str:
         f"Paginated via offset/limit (default {DEFAULT_FACT_LIMIT}, max "
         f"{MAX_FACT_LIMIT}). Allowlisted structured fields only. "
         "Crash/ANR/kernel free text omitted unless "
-        "PARSECAT_MCP_INCLUDE_FREE_TEXT=1 (residual risk when on: names/"
-        "labels in log text may reach the model). Never returns labels, "
+        "PARSECAT_MCP_INCLUDE_FREE_TEXT=1 (residual risk when on: names, labels, and filenames that appear inside log text may reach the model). Never returns labels, "
         "filenames, CDM names, SSID/BSSID/MAC/serial, coordinates, or LLM "
         "narration."
     ),
@@ -136,7 +135,7 @@ def get_verified_facts(
         "scope the search to that capture (required for precise lookups). "
         "Without capture_id, at most a small number of captures are scanned. "
         "A fact from sibling capture B is never returned when capture_id=A. "
-        "Structured fields only; free text omitted unless PARSECAT_MCP_INCLUDE_FREE_TEXT=1 (residual risk: names/labels in log text may reach the model)."
+        "Structured fields only; free text omitted unless PARSECAT_MCP_INCLUDE_FREE_TEXT=1 (residual risk: names, labels, and filenames that appear inside log text may reach the model)."
     ),
 )
 def get_fact(fact_id: str, capture_id: int | None = None) -> str:

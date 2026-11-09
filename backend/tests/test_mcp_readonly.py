@@ -688,7 +688,7 @@ def test_free_text_omitted_by_default(ro_session):
 
 
 def test_free_text_opt_in_redacts_secrets_names_may_survive(ro_session, monkeypatch):
-    """Flag=1 includes free text after PII/key scrub; name seeds are residual risk."""
+    """Flag=1 includes free text after PII/key scrub; name/label/filename seeds are residual risk."""
     monkeypatch.setenv("PARSECAT_MCP_INCLUDE_FREE_TEXT", "1")
     session, ids, _ = ro_session
     facts_json = tool_get_verified_facts(capture_id=ids["capture_a"], limit=500)
@@ -706,7 +706,7 @@ def test_free_text_opt_in_redacts_secrets_names_may_survive(ro_session, monkeypa
         assert FAKE_SK not in text
         assert FAKE_EMAIL not in text
         assert FAKE_BEARER not in text
-    # Residual risk (documented): name/label seeds inside log text may survive.
+    # Residual risk (documented): name/label/filename seeds inside log text may survive.
     joined = " ".join([
         crash["message"], crash["root_cause_message"], anr["reason"], kernel["message"],
     ])

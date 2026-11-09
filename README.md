@@ -471,8 +471,9 @@ capture IDs instead of filenames). Labels, filenames, CDM display names,
 SSID/BSSID/MAC/serial, and coordinates are omitted — never spliced into
 MCP text. Crash/ANR/kernel free text is omitted by default; set
 `PARSECAT_MCP_INCLUDE_FREE_TEXT=1` to include it after #96 `redact_pii` +
-key-shaped scrubbing (residual risk when enabled: names/labels inside log
-text may reach the model). Capture-scoped (no sibling bleed). Stdio only;
+key-shaped scrubbing (residual risk when enabled: names, labels, and
+filenames that appear inside log text may reach the model). Capture-scoped
+(no sibling bleed). Stdio only;
 a local MCP client may still forward returned facts to its model provider.
 
 ### Client config (official formats)

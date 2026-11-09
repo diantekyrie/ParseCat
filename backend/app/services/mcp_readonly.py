@@ -270,9 +270,27 @@ class CaptureIdentity:
         return frozenset(self._raw_tokens())
 
     def containment_tokens(self) -> frozenset[str]:
-        """Tokens for case-insensitive substring checks on thread/executable/section."""
+        """All identity tokens (incl. filename basename/stem) for free-form leaves."""
         return frozenset(
             t for t in self._raw_tokens()
+            if len(t) >= _IDENTITY_TOKEN_MIN_LEN and not t.isdigit()
+        )
+
+    def containment_tokens_without_filename_parts(self) -> frozenset[str]:
+        """Label/serial/ssid/device/full-filename only — not basename/stem.
+
+        Filename stems like ``crash`` (from crash.zip) must not null package
+        segments such as ``com.example.crash`` (Arch: crash.zip ground-truth
+        stays green). Labels/serials/SSIDs still apply to package-shaped leaves.
+        """
+        out: set[str] = set()
+        for v in (self.label, self.filename, self.serial):
+            if isinstance(v, str) and v:
+                out.add(v)
+        out.update(self.ssids)
+        out.update(self.device_ids)
+        return frozenset(
+            t for t in out
             if len(t) >= _IDENTITY_TOKEN_MIN_LEN and not t.isdigit()
         )
 
@@ -381,8 +399,8 @@ _THREAD_EXACT = frozenset({
 })
 _THREAD_PATTERNS = tuple(
     re.compile(p) for p in (
-        r"^Binder:\d+_\w+$",
-        r"^HwBinder:\d+_\w+$",
+        r"^Binder:\d+_\d+$",  # fixtures: Binder:14329_2
+        r"^HwBinder:\d+_\d+$",
         r"^pool-\d+-thread-\d+$",
         r"^Thread-\d+$",
         r"^AsyncTask #\d+$",
@@ -615,11 +633,21 @@ def _reason_name_allowed(value: str) -> bool:
     return False
 
 
+# kind values each MCP category actually emits (parser code — no open shape).
+_KIND_BY_CATEGORY: dict[str, frozenset[str]] = {
+    "wifi": _WIFI_KIND_ALLOWED,
+    "memory": _MEMORY_KIND_ALLOWED,
+    "pairing": _PAIRING_KIND_ALLOWED,
+}
+
+
 def _kind_allowed(category_hint: str | None, value: str) -> bool:
-    if value in _WIFI_KIND_ALLOWED | _MEMORY_KIND_ALLOWED | _PAIRING_KIND_ALLOWED:
-        return True
-    # Conservative fallback for other kinds already in fixtures.
-    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", value))
+    if not category_hint:
+        return False
+    allowed = _KIND_BY_CATEGORY.get(category_hint)
+    if not allowed:
+        return False
+    return value in allowed
 
 
 def _shape_ok(kind: str, value: str, *, category: str | None = None) -> bool:
@@ -886,6 +914,158 @@ def _clamp_offset(value: int | None) -> int:
     return max(0, n)
 
 
+
+# --- outbound gate (Arch): final serialized-response walk --------------------
+# Ground-truth exemption: values that are exact members of a fixed code-defined
+# set (enum/lookup tables, kind sets, section allowlist, permission/AVC
+# constants, capture kind, confidence, note) cannot carry user data. Exempt
+# them from capture-token CONTAINMENT so a label/filename stem like "crash"
+# or "wifi" or "12" does not null `kind: wifi` / reason codes. Key-prefix
+# checks still apply to every string leaf (never mutate — withhold only).
+
+_AVC_PERM_CONSTANTS = frozenset({
+    # Short verbs selinux.py splits from `{ read write }` style payloads.
+    "read", "write", "getattr", "search", "open", "ioctl", "lock", "map",
+    "execute", "create", "setattr", "unlink", "rename", "connect", "bind",
+    "listen", "accept", "use", "append", "ioctl_getattr",
+})
+_CONFIDENCE_CONSTANTS = frozenset({"LOW", "HIGH", "UNCONFIRMED", "MEDIUM"})
+_CAPTURE_KIND_CONSTANTS = frozenset({"bugreport", "pcap"})
+
+
+def _ground_truth_exempt_values() -> frozenset[str]:
+    exempt: set[str] = set()
+    exempt.update(_PRIORITY_NAME_ALLOWED)
+    exempt.update(_REASON_NAME_ALLOWED)
+    exempt.update(_WIFI_KIND_ALLOWED)
+    exempt.update(_MEMORY_KIND_ALLOWED)
+    exempt.update(_PAIRING_KIND_ALLOWED)
+    exempt.update(_ALLOWED_SOURCE_SECTIONS)
+    exempt.update(_VERDICT_ALLOWED)
+    exempt.update(_AVC_PERM_CONSTANTS)
+    exempt.update(_CONFIDENCE_CONSTANTS)
+    exempt.update(_CAPTURE_KIND_CONSTANTS)
+    exempt.update(FACT_KIND_KEYS.keys())  # category names
+    exempt.add(DETAIL_WITHHELD)
+    # Signal names/codes are regex-shaped, not a closed table — do not exempt.
+    return frozenset(exempt)
+
+
+_PACKAGE_LIKE_PATH_SUFFIXES = (
+    ".package", ".package_name", ".exception_class", ".root_cause_class", ".app",
+)
+
+
+def _path_is_package_like(path: str) -> bool:
+    return any(path.endswith(s) or path.endswith(s + "]") for s in (
+        "package", "package_name", "exception_class", "root_cause_class", "app",
+    )) or path.endswith("package") or path.split(".")[-1].split("[")[0] in {
+        "package", "package_name", "exception_class", "root_cause_class", "app",
+    }
+
+
+def _contains_token(value: str, tokens: frozenset[str], *, segment: bool) -> bool:
+    low = value.lower()
+    if not segment:
+        return any(tok.lower() in low for tok in tokens)
+    segs = [s for s in re.split(r"[.$:]", value) if s]
+    seg_low = {s.lower() for s in segs}
+    return any(tok.lower() in seg_low for tok in tokens)
+
+
+def _leaf_hits_gate(
+    value: str,
+    identity: CaptureIdentity | None,
+    *,
+    path: str,
+    skip_containment: bool,
+) -> str | None:
+    """Return withhold reason or None. Never mutates text."""
+    if _has_key_prefix(value):
+        return "key-shaped"
+    if skip_containment or identity is None:
+        return None
+    if value in identity.exact_identifier_tokens():
+        return "identity"
+    if _path_is_package_like(path):
+        # Substring vs label/serial/ssid/full-filename (NOT filename stem/basename),
+        # so EscapeLabel99Exception is caught while com.example.crash survives crash.zip.
+        tokens = identity.containment_tokens_without_filename_parts()
+        if _contains_token(value, tokens, segment=False):
+            return "identity"
+        return None
+    if _contains_token(value, identity.containment_tokens(), segment=False):
+        return "identity"
+    return None
+
+
+def apply_outbound_gate(
+    payload: dict[str, Any],
+    identity: CaptureIdentity | None,
+) -> dict[str, Any]:
+    """Walk every string leaf of the tool payload; withhold on containment/key.
+
+    Replaces hitting leaves with null and records ``withheld_fields`` entries
+    with dotted/indexed ``path`` plus ``reason``. Dict keys are not data-derived
+    in MCP (schema keys only) — only values are walked.
+    """
+    exempt = _ground_truth_exempt_values()
+    # Also exempt the static notice string(s).
+    exempt = frozenset(set(exempt) | {UNTRUSTED_DATA_NOTICE})
+
+    def walk(node: Any, path: str, fact_withheld: list | None) -> Any:
+        if isinstance(node, dict):
+            out: dict[str, Any] = {}
+            # Prefer attaching withheld_fields onto fact objects.
+            local_withheld = fact_withheld
+            is_fact = (
+                isinstance(node.get("category"), str)
+                and "fact_id" in node
+                and "capture_id" in node
+            )
+            if is_fact:
+                local_withheld = list(node.get("withheld_fields") or [])
+            for k, v in node.items():
+                if k == "withheld_fields":
+                    continue
+                child_path = f"{path}.{k}" if path else k
+                out[k] = walk(v, child_path, local_withheld)
+            if is_fact:
+                if local_withheld:
+                    out["withheld_fields"] = local_withheld
+                elif "withheld_fields" in node and node["withheld_fields"]:
+                    out["withheld_fields"] = node["withheld_fields"]
+            return out
+        if isinstance(node, list):
+            return [walk(v, f"{path}[{i}]", fact_withheld) for i, v in enumerate(node)]
+        if isinstance(node, str):
+            skip = node in exempt
+            reason = _leaf_hits_gate(node, identity, path=path, skip_containment=skip)
+            if reason is None:
+                return node
+            entry = {"field": path, "reason": reason}
+            if fact_withheld is not None:
+                fact_withheld.append(entry)
+            else:
+                # Response-level (rare); stash on payload later via accumulator
+                response_withheld.append(entry)
+            return None
+        return node
+
+    response_withheld: list[dict[str, str]] = []
+    gated = walk(payload, "", None)
+    if response_withheld:
+        # Merge into top-level if present; keep allowlist-friendly by nesting
+        # under a dedicated key only when non-empty and key is permitted.
+        # Facts responses don't list this key — fold into each fact already.
+        # For leftover response-level hits, attach to payload when possible.
+        gated = dict(gated)
+        existing = list(gated.get("withheld_fields") or [])
+        existing.extend(response_withheld)
+        gated["withheld_fields"] = existing
+    return gated
+
+
 def enforce_byte_budget(payload: dict, *, facts_key: str = "facts") -> dict:
     blob = json.dumps(payload, default=str, ensure_ascii=True)
     if len(blob.encode("utf-8")) <= MAX_OUTPUT_BYTES:
@@ -1118,7 +1298,14 @@ def list_captures(
     total = len(rows)
     page = rows[off: off + lim]
     captures: list[dict[str, Any]] = []
-    for capture, _device in page:
+    # Union identity for the outbound gate across the page.
+    labels: set[str] = set()
+    filenames: set[str] = set()
+    serials: set[str] = set()
+    ssids: set[str] = set()
+    bssids: set[str] = set()
+    device_ids: set[str] = set()
+    for capture, device in page:
         counts = _allowdict(capture_severity(session, capture.id), LIST_COUNTS_KEYS)
         item = {
             "id": capture.id,
@@ -1128,6 +1315,16 @@ def list_captures(
             "counts": counts,
         }
         captures.append(_allowdict(item, LIST_CAPTURE_ITEM_KEYS))
+        ident = load_capture_identity(session, capture.id)
+        if ident.label:
+            labels.add(ident.label)
+        if ident.filename:
+            filenames.add(ident.filename)
+        if ident.serial:
+            serials.add(ident.serial)
+        ssids |= set(ident.ssids)
+        bssids |= set(ident.bssids)
+        device_ids |= set(ident.device_ids)
 
     truncated = off + len(captures) < total
     payload = {
@@ -1141,6 +1338,17 @@ def list_captures(
         "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
     }
     payload = _allowdict(payload, LIST_RESPONSE_KEYS)
+    # Stuff every page token into ssids/device_ids so containment_tokens sees all.
+    union = CaptureIdentity(
+        label=None,
+        filename=None,
+        serial=None,
+        ssids=frozenset(ssids) | frozenset(labels) | frozenset(filenames) | frozenset(serials),
+        bssids=frozenset(bssids),
+        device_ids=frozenset(device_ids),
+    )
+    payload = apply_outbound_gate(payload, union)
+    payload = _allowdict(payload, LIST_RESPONSE_KEYS | frozenset({"withheld_fields"}))
     return enforce_byte_budget(payload, facts_key="captures")
 
 
@@ -1180,6 +1388,9 @@ def get_verified_facts(
         "byte_truncated": False,
     }
     payload = _allowdict(payload, FACTS_RESPONSE_KEYS)
+    identity = load_capture_identity(session, capture_id)
+    payload = apply_outbound_gate(payload, identity)
+    payload = _allowdict(payload, FACTS_RESPONSE_KEYS | frozenset({"withheld_fields"}))
     return enforce_byte_budget(payload, facts_key="facts")
 
 
@@ -1197,11 +1408,12 @@ def get_fact(
     if capture_id is not None:
         for fact in _facts_from_capture(session, capture_id):
             if fact.get("fact_id") == fact_id:
-                return _allowdict({
+                gated = apply_outbound_gate({
                     "fact": fact,
                     "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
                     "byte_truncated": False,
-                }, GET_FACT_RESPONSE_KEYS)
+                }, load_capture_identity(session, fact["capture_id"]))
+                return _allowdict(gated, GET_FACT_RESPONSE_KEYS | frozenset({"withheld_fields"}))
         raise FactNotFoundError("fact not found")
 
     listing = list_captures(session, offset=0, limit=MAX_GET_FACT_CAPTURE_SCAN)
@@ -1215,11 +1427,12 @@ def get_fact(
             continue
         for fact in _facts_from_capture(session, cid):
             if fact.get("fact_id") == fact_id:
-                return _allowdict({
+                gated = apply_outbound_gate({
                     "fact": fact,
                     "untrusted_data_notice": UNTRUSTED_DATA_NOTICE,
                     "byte_truncated": False,
-                }, GET_FACT_RESPONSE_KEYS)
+                }, load_capture_identity(session, fact["capture_id"]))
+                return _allowdict(gated, GET_FACT_RESPONSE_KEYS | frozenset({"withheld_fields"}))
     raise FactNotFoundError("fact not found")
 
 

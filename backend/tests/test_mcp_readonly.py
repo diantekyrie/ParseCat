@@ -1282,3 +1282,72 @@ def test_fe_rejected_permission_and_unknown_section(ro_session):
     facts_json = tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
     assert "../../etc/passwd" not in facts_json
     assert "not_a_real_section" not in facts_json
+
+
+
+def test_anr_section_shape_allowlist(ro_session):
+    """ANR sections: only anr/anr_<ts> and anr/trace_<N> from the parser."""
+    from app.services.mcp_readonly import _section_allowed, _source, CaptureIdentity
+
+    real = "anr/anr_2026-08-27-08-38-51-875"
+    trace = "anr/trace_02"
+    assert _section_allowed(real)
+    assert _section_allowed(trace)
+    src, wh = _source(real, 1, 1, CaptureIdentity())
+    assert src == {"section": real, "line_start": 1, "line_end": 1}
+    assert wh == []
+    src_t, wh_t = _source(trace, 1, 3, CaptureIdentity())
+    assert src_t["section"] == trace and wh_t == []
+
+    identity = CaptureIdentity(label=CAT_LABEL, filename=CAT_FILE, serial=CAT_SERIAL)
+    for bad in (
+        "anr/private-lab-report.zip",
+        f"anr/{CAT_LABEL}",
+        "anr/../x",
+        "anr/anr_2024",  # not the parser timestamp shape
+        "anr/traces.txt",
+        "anr/trace_02/../x",
+    ):
+        assert not _section_allowed(bad), bad
+        s, w = _source(bad, 1, 1, identity)
+        assert s is not None and s.get("section") is None
+        assert any(x.get("field") == "source.section" for x in w)
+
+    # Identity containment / key-prefix still apply on a shape-ok ANR section.
+    poisoned = f"anr/anr_2026-08-27-08-38-51-875"  # shape ok
+    # Embed label via a fake but shape-ok path is impossible; use identity
+    # match on the full section string by setting label to the real section.
+    id2 = CaptureIdentity(label=real)
+    s2, w2 = _source(real, 1, 1, id2)
+    assert s2.get("section") is None
+    assert any(x.get("reason") == "identity" for x in w2)
+
+    keyish = "anr/anr_2026-08-27-08-38-51-875"
+    # key-prefix inside an otherwise-valid-looking name is not in our ANR
+    # shape; use a stamped section that passes shape then fails key check by
+    # temporarily validating the key helper on a synthetic allowlisted section
+    # is covered elsewhere — here assert gsk_ cannot ride in via anr/ rest.
+    assert not _section_allowed("anr/gsk_evil_2026-08-27-08-38-51-875")
+    assert not _section_allowed("anr/anr_gsk_2026-08-27-08-38-51-875")
+
+    # Both fact tools: plant a wifi/crash source with the real ANR section via stamp.
+    from app.services.mcp_readonly import _stamp
+    stamped = _stamp("crash", 1, {
+        "timestamp": "08-19 12:00:00.000",
+        "thread": "main",
+        "package": "com.example.app",
+        "exception_class": "RuntimeException",
+        "confidence": "LOW",
+        "source": {"section": real, "line_start": 1, "line_end": 1},
+    }, identity=CaptureIdentity())
+    assert stamped["source"]["section"] == real
+    bad_stamped = _stamp("crash", 1, {
+        "timestamp": "08-19 12:00:00.000",
+        "thread": "main",
+        "package": "com.example.app",
+        "exception_class": "RuntimeException",
+        "confidence": "LOW",
+        "source": {"section": "anr/private-lab-report.zip", "line_start": 1, "line_end": 1},
+    }, identity=CaptureIdentity())
+    assert bad_stamped["source"]["section"] is None
+    assert any(w.get("field") == "source.section" for w in (bad_stamped.get("withheld_fields") or []))

@@ -427,7 +427,7 @@ _VERDICT_ALLOWED = frozenset({"denied", "granted"})
 _GENERIC_ID_RE = re.compile(r"^[A-Za-z0-9._+\-]{1,128}$")
 
 # Source sections the parsers actually emit (WANTED_SECTIONS + hard-coded
-# SourceRef literals + anr/<filename>). Do not invent.
+# SourceRef literals + strict anr/anr_<ts>|trace_<N>). Do not invent.
 _ALLOWED_SOURCE_SECTIONS = frozenset(WANTED_SECTIONS) | frozenset({
     "bt_hci",
     "bluetooth_manager",  # also in WANTED; kept explicit
@@ -589,15 +589,22 @@ def _executable_allowed(value: str) -> bool:
     return True
 
 
+# ANR SourceRef is f"anr/{filename}" (anr.py). Filenames the parsers actually
+# accept (ingestion + FILENAME_TS_RE / trace_* filter), not free-form paths:
+#   anr_2026-07-22-17-38-38-800  (docstring + fixtures)
+#   trace_02                     (parse_anr_trace_dump fixtures)
+_ANR_SECTION_RE = re.compile(
+    r"^anr/(?:"
+    r"anr_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-\d{3}"  # anr_<ts>
+    r"|trace_\d+"  # trace_<N>
+    r")$"
+)
+
+
 def _section_allowed(value: str) -> bool:
     if value in _ALLOWED_SOURCE_SECTIONS:
         return True
-    # anr.py emits SourceRef(f"anr/{filename}", ...)
-    if value.startswith("anr/") and len(value) > 4:
-        rest = value[4:]
-        if re.fullmatch(r"[A-Za-z0-9._+\-]+", rest):
-            return True
-    return False
+    return bool(_ANR_SECTION_RE.fullmatch(value))
 
 
 def _reason_name_allowed(value: str) -> bool:

@@ -249,7 +249,9 @@ def test_tshark_fields_uses_current_wireshark_reason_code_name():
     # live_tshark test below is the real guard; this pins the known swap.
     assert "wlan_mgt.fixed.reason_code" not in TSHARK_FIELDS
     assert "wlan.fixed.reason_code" in TSHARK_FIELDS
-    assert TSHARK_FIELDS.index("wlan.fixed.reason_code") == 6
+    assert TSHARK_FIELDS.index("wlan.fixed.reason_code") == 7
+    assert "wlan.fc.protected" in TSHARK_FIELDS
+    assert TSHARK_FIELDS.index("wlan.fc.protected") == 3
 
 
 def test_analyze_with_tshark_decodes_deauth_reason_code(monkeypatch, tmp_path):
@@ -266,7 +268,10 @@ def test_analyze_with_tshark_decodes_deauth_reason_code(monkeypatch, tmp_path):
     assert result.backend == "tshark"
     assert len(result.anomalies) == 1
     assert result.anomalies[0].kind == "deauthentication"
-    assert "0x0003" in result.anomalies[0].detail
+    # #117: numeric (not hex dump / not "unknown"), with shared reason name.
+    assert "reason code 3" in result.anomalies[0].detail
+    assert "Deauthenticated: station leaving" in result.anomalies[0].detail
+    assert "unknown" not in result.anomalies[0].detail.lower()
 
 
 def test_analyze_with_tshark_detects_tcp_reset_as_true_text(monkeypatch, tmp_path):
@@ -436,6 +441,90 @@ def test_analyze_with_tshark_skips_hidden_ssid_identity(monkeypatch, tmp_path):
     assert any(s.kind == "bssid" and s.value == "aa:bb:cc:dd:ee:ff" for s in result.identity_signals)
 
 
+
+def test_analyze_with_tshark_reason_code_zero_not_unknown(monkeypatch, tmp_path):
+    """#117: reserved reason code 0 is falsy in Python but must print as 0."""
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.fc.type": "0", "wlan.fc.subtype": "12",
+        "wlan.fixed.reason_code": "0",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    detail = result.anomalies[0].detail
+    assert "reason code 0" in detail
+    assert "Reserved/unspecified" in detail
+    assert "unknown" not in detail.lower()
+
+
+def test_analyze_with_tshark_reason_code_hex_zero_not_unknown(monkeypatch, tmp_path):
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.fc.type": "0", "wlan.fc.subtype": "10",
+        "wlan.fixed.reason_code": "0x0000",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    detail = result.anomalies[0].detail
+    assert result.anomalies[0].kind == "disassociation"
+    assert "reason code 0" in detail
+    assert "unknown" not in detail.lower()
+
+
+def test_analyze_with_tshark_reason_absent_says_not_present(monkeypatch, tmp_path):
+    """#117: empty reason + unprotected -> 'not present', never 'unknown'."""
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.fc.type": "0", "wlan.fc.subtype": "12",
+        "wlan.fc.protected": "False",
+        "wlan.fixed.reason_code": "",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    detail = result.anomalies[0].detail
+    assert "not present in this packet" in detail
+    assert "unknown" not in detail.lower()
+    assert "reason code 0" not in detail
+
+
+def test_analyze_with_tshark_reason_encrypted_pmf_says_so(monkeypatch, tmp_path):
+    """#117: empty reason + Protected bit -> encrypted wording, not 'unknown'."""
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.fc.type": "0", "wlan.fc.subtype": "12",
+        "wlan.fc.protected": "True",
+        "wlan.fixed.reason_code": "",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    detail = result.anomalies[0].detail
+    assert "encrypted (802.11w protected frame), not decodable" in detail
+    assert "unknown" not in detail.lower()
+    assert "not present" not in detail
+
+
+def test_parse_tshark_reason_code_helpers():
+    from app.parsers.packet_analysis import (
+        _parse_tshark_reason_code,
+        _tshark_mgmt_reason_detail,
+    )
+
+    assert _parse_tshark_reason_code("0") == 0
+    assert _parse_tshark_reason_code("0x0000") == 0
+    assert _parse_tshark_reason_code("0x0003") == 3
+    assert _parse_tshark_reason_code("") is None
+    assert _parse_tshark_reason_code("<MISSING>") is None
+    assert "unknown" not in _tshark_mgmt_reason_detail("Deauthentication", "0", "").lower()
+
+
 @pytest.mark.skipif(not tshark_available(), reason="tshark not on PATH")
 def test_live_tshark_dissects_synthetic_80211_fixture(tmp_path):
     # End-to-end against real tshark (gated): catches the next renamed -e
@@ -469,4 +558,5 @@ def test_live_tshark_dissects_synthetic_80211_fixture(tmp_path):
     assert "SYNTH_PCAP_QA" in ssids
     deauths = [a for a in result.anomalies if a.kind == "deauthentication"]
     assert len(deauths) == 1
-    assert "0x0003" in deauths[0].detail
+    assert "reason code 3" in deauths[0].detail
+    assert "unknown" not in deauths[0].detail.lower()

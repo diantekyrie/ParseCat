@@ -118,6 +118,10 @@ def is_supported_link_layer_pcap(linktype: int) -> str:
 # something to guess at without a live tshark to check against.
 TSHARK_FIELDS = [
     "wlan.fc.type", "wlan.fc.subtype", "wlan.fc.retry",
+    # #117: Protected bit distinguishes PMF-encrypted deauth/disassoc
+    # (reason field present but not decodable) from a truncated/absent
+    # reason field. Same FT_BOOLEAN shape as wlan.fc.retry.
+    "wlan.fc.protected",
     "radiotap.dbm_antsignal", "wlan.ssid", "wlan.bssid",
     # wlan_mgt.fixed.reason_code was Wireshark's pre-4.x field name; it no
     # longer exists (confirmed against `tshark -G fields` on 4.4.18) and an
@@ -141,6 +145,42 @@ def _tshark_bool(raw: str) -> bool:
     # builds used "1"/"0". Accept both so tcp.flags.reset and wlan.fc.retry
     # (issues #68 + review on #80) never silently under-count.
     return raw in ("1", "True", "true")
+
+
+def _parse_tshark_reason_code(raw: str) -> int | None:
+    """Parse tshark's wlan.fixed.reason_code field to int.
+
+    tshark emits hex (`0x0003`) or decimal. Empty / `<MISSING>` means the
+    field was not dissected. Reserved code 0 is a real value (`is not None`),
+    never collapsed via truthiness (#117).
+    """
+    if not raw or raw == "<MISSING>":
+        return None
+    try:
+        return int(raw, 0)
+    except ValueError:
+        return None
+
+
+def _tshark_mgmt_reason_detail(kind_label: str, reason_raw: str, protected_raw: str) -> str:
+    """Three-way wording matching the fallback backend (#116/#117).
+
+    - numeric code (including 0) with shared `_reason_name`
+    - protected + no code -> encrypted (802.11w), not decodable
+    - else -> not present in this packet
+    Never the conflated word "unknown".
+    """
+    code = _parse_tshark_reason_code(reason_raw)
+    if code is not None:
+        return (
+            f"{kind_label} frame, reason code {code} ({_reason_name(code)})"
+        )
+    if _tshark_bool(protected_raw):
+        return (
+            f"{kind_label} frame (reason code encrypted "
+            "(802.11w protected frame), not decodable)"
+        )
+    return f"{kind_label} frame (reason code not present in this packet)"
 
 
 def _decode_tshark_ssid(raw: str) -> str | None:
@@ -184,9 +224,9 @@ def analyze_with_tshark(path: Path, link_layer: str) -> PacketAnalysis:
     packets_with_type_subtype = 0
 
     for row in rows:
-        (wlan_type, wlan_subtype, retry, dbm, ssid, bssid,
+        (wlan_type, wlan_subtype, retry, protected, dbm, ssid, bssid,
          reason_code, ts, ip_src, ip_dst, tcp_rst, dns_qry,
-         tcp_retrans) = (row + [""] * 13)[:13]
+         tcp_retrans) = (row + [""] * 14)[:14]
 
         if wlan_type and wlan_subtype:
             try:
@@ -200,13 +240,17 @@ def analyze_with_tshark(path: Path, link_layer: str) -> PacketAnalysis:
                 if ftype == 0 and subtype == 12:
                     anomalies.append(PacketAnomalyEvent(
                         timestamp=ts or None, kind="deauthentication",
-                        detail=f"Deauthentication frame, reason code {reason_code or 'unknown'}",
+                        detail=_tshark_mgmt_reason_detail(
+                            "Deauthentication", reason_code, protected,
+                        ),
                         mac_or_ip=bssid or None,
                     ))
                 elif ftype == 0 and subtype == 10:
                     anomalies.append(PacketAnomalyEvent(
                         timestamp=ts or None, kind="disassociation",
-                        detail=f"Disassociation frame, reason code {reason_code or 'unknown'}",
+                        detail=_tshark_mgmt_reason_detail(
+                            "Disassociation", reason_code, protected,
+                        ),
                         mac_or_ip=bssid or None,
                     ))
         if _tshark_bool(retry):

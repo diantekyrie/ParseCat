@@ -17,6 +17,7 @@ from app.services.persistence import (
     persist_capture,
     UNVERIFIED_DEVICE_IDENTITY_WARNING,
 )
+from app.services.hard_delete import hard_delete_capture
 from app.services.pii_redaction import redact_pii
 from app.services.reasoning import diagnose, diagnose_investigation, scan_capture
 from app.services.summary import build_capture_summary, build_merged_summary, capture_severity
@@ -285,6 +286,18 @@ def capture_summary(capture_id: int, session: Session = Depends(get_session)):
     if capture is None:
         raise HTTPException(404, "Unknown capture")
     return build_capture_summary(session, capture_id)
+
+
+@router.delete("/captures/{capture_id}")
+def delete_capture(capture_id: int, session: Session = Depends(get_session)):
+    """#95 hard-delete: remove the capture and every capture_id-keyed row.
+
+    Not soft-archive. After success, GET summary/diagnose/scan for this id
+    return 404. Device/investigation archive is a separate, recoverable path.
+    """
+    if not hard_delete_capture(session, capture_id):
+        raise HTTPException(404, "Unknown capture")
+    return {"ok": True, "deleted_capture_id": capture_id}
 
 
 @router.post("/captures/{capture_id}/diagnose")

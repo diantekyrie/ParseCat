@@ -255,11 +255,10 @@ def test_llm_providers_endpoint_reports_unavailable_not_error_when_unconfigured(
 
 
 # --- Device/investigation archiving ----------------------------------------
-# No delete endpoint exists (no cascade-delete across the 30+ fact tables
-# keyed off capture_id) -- archiving hides a device/investigation from the
-# default GET list (and the frontend's <datalist> dropdown) without
-# deleting anything. Real problem found live: an unbounded, ever-growing
-# device dropdown with test/typo labels and no way to clean it up.
+# Device/investigation archiving is soft-hide only (see Device.archived).
+# Capture permanent removal is DELETE /api/captures/{id} via hard_delete
+# (#95) -- covered in test_capture_hard_delete.py. Archiving here still
+# only hides labels from the default GET list / <datalist>.
 
 def test_archived_device_is_hidden_from_default_list_but_not_deleted(client):
     _upload_txt(client, "clutter-device")

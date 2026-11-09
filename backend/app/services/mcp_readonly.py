@@ -23,7 +23,13 @@ from urllib.parse import quote
 from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, create_engine, select
 
-from app.models.db_models import Capture, Device, PacketCaptureSummaryRow
+from app.models.db_models import (
+    Capture,
+    CdmPairingEventRow,
+    CompanionDeviceAssociationRow,
+    Device,
+    PacketCaptureSummaryRow,
+)
 from app.services.citations import attach_verified_facts
 from app.services.pii_redaction import redact_pii
 from app.services.reasoning import (
@@ -52,6 +58,85 @@ UNTRUSTED_DATA_NOTICE = (
 _MAC_RE = re.compile(
     r"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}([:-]))(?:[0-9A-Fa-f]{2}\1){4}[0-9A-Fa-f]{2}"
     r"(?![0-9A-Fa-f])"
+)
+
+# Generic key=value spills of user-entered identity (legacy free text).
+_LABEL_KV_RE = re.compile(
+    r"\b((?:device[_\s-]*)?label)\s*[=:]\s*([^\s,;|]+)",
+    re.IGNORECASE,
+)
+_FILE_KV_RE = re.compile(
+    r"\b(file(?:name)?)\s*[=:]\s*([^\s,;|]+)",
+    re.IGNORECASE,
+)
+# Backstop: archive/log/pcap filenames even when the exact stored name is unknown.
+_ARCHIVE_NAME_RE = re.compile(
+    r"(?<![\w./-])([\w.-]+\.(?:zip|txt|gz|pcap|pcapng|log))(?![\w.-])",
+    re.IGNORECASE,
+)
+
+# Short / common device labels: scrub only in label=/device= forms so bare
+# diagnostic English ("Java crash", "Wi-Fi phone") is not wiped. Distinctive
+# labels (len >= MIN_DISTINCTIVE_LABEL_LEN and not in this set) are scrubbed
+# as whole tokens wherever they appear. Tradeoff documented in tests.
+MIN_DISTINCTIVE_LABEL_LEN = 6
+_COMMON_LABEL_WORDS = frozenset({
+    "phone", "crash", "test", "device", "report", "wifi", "android", "pixel",
+    "watch", "tablet", "lab", "debug", "main", "user", "home", "work",
+    "mobile", "radio", "bluetooth", "bt", "scan", "log", "file", "data",
+})
+
+LABEL_TOKEN = "[redacted-label]"
+FILENAME_TOKEN = "[redacted-filename]"
+DEVICE_NAME_TOKEN = "[redacted-device-name]"
+SSID_TOKEN = "[redacted-ssid]"
+SERIAL_TOKEN = "[redacted-serial]"
+LOCATION_TOKEN = "[redacted-location]"
+DNS_TOKEN = "[redacted-dns]"
+SECRET_TOKEN = "[redacted-secret]"
+
+# FE free-text identity / secret shapes (fail-closed key=value + bare forms).
+_SSID_KV_RE = re.compile(
+    r"\b(ssid)\s*[=:]\s*([^\s,;|'\"]+)",
+    re.IGNORECASE,
+)
+_SERIAL_KV_RE = re.compile(
+    r"\b(serial(?:_?number|no|num)?)\s*[=:]\s*([^\s,;|]+)",
+    re.IGNORECASE,
+)
+_LOCATION_KV_RE = re.compile(
+    r"\b(lat(?:itude)?|lon(?:gitude)?|lng)\s*[=:]\s*"
+    r"([+-]?\d{1,3}(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_DNS_KV_RE = re.compile(
+    r"\b(dns_?query|hostname|host)\s*[=:]\s*([^\s,;|'\"]+)",
+    re.IGNORECASE,
+)
+# display_name / display= / name= (CDM). Quoted or single token.
+_CDM_NAME_KV_RE = re.compile(
+    r"\b(display[_\s-]*name|display|device[_\s-]*name)\s*[=:]\s*"
+    r"(\"[^\"]*\"|'[^']*'|[^\s,;|]+(?:\s+[A-Za-z][\w'.-]*){0,3})",
+    re.IGNORECASE,
+)
+# Bare name=... is common in CDM logs; keep value to one token.
+_NAME_KV_RE = re.compile(
+    r"\b(name)\s*[=:]\s*"
+    r"(\"[^\"]*\"|'[^']*'|[^\s,;|)]+)",
+    re.IGNORECASE,
+)
+_PASSWORD_KV_RE = re.compile(
+    r"\b(pass(?:word|wd)?|pwd)\s*[=:]\s*([^\s,;|'\"]+)",
+    re.IGNORECASE,
+)
+_TOKEN_KV_RE = re.compile(
+    r"\b(access[_-]?token|refresh[_-]?token|api[_-]?token|auth[_-]?token|token)\s*[=:]\s*"
+    r"([^\s,;|'\"]+)",
+    re.IGNORECASE,
+)
+_BEARER_RE = re.compile(
+    r"\b(Authorization\s*:\s*Bearer)\s+(\S+)",
+    re.IGNORECASE,
 )
 
 # --- fail-closed allowlists -------------------------------------------------
@@ -147,8 +232,60 @@ def assert_engine_is_readonly(engine) -> None:
 
 # --- text / projection helpers ---------------------------------------------
 
-def scrub_text(text: str | None) -> str | None:
-    """Read-time PII (#96) + key-like (#102) + MAC scrub, then length cap."""
+def _filename_variants(filename: str | None) -> list[str]:
+    """Return filename, basename, and stem (longest first) for scrubbing."""
+    if not filename or not isinstance(filename, str):
+        return []
+    name = filename.strip()
+    if not name:
+        return []
+    base = Path(name).name
+    stem = Path(base).stem
+    variants = []
+    for v in (name, base, stem):
+        if v and v not in variants:
+            variants.append(v)
+    variants.sort(key=len, reverse=True)
+    return variants
+
+
+def _is_common_label(label: str) -> bool:
+    cleaned = label.strip().lower()
+    if len(cleaned) < MIN_DISTINCTIVE_LABEL_LEN:
+        return True
+    if cleaned in _COMMON_LABEL_WORDS:
+        return True
+    # Multi-word labels where every token is common/short stay conservative.
+    parts = [p for p in re.split(r"[\s_-]+", cleaned) if p]
+    if parts and all(len(p) < MIN_DISTINCTIVE_LABEL_LEN or p in _COMMON_LABEL_WORDS for p in parts):
+        return True
+    return False
+
+
+def _replace_whole(text: str, needle: str, token: str) -> str:
+    """Case-insensitive whole-token replace (alnum/underscore/_-/ boundaries)."""
+    if not needle:
+        return text
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9_-]){re.escape(needle)}(?![A-Za-z0-9_-])",
+        re.IGNORECASE,
+    )
+    return pattern.sub(token, text)
+
+
+def scrub_text(
+    text: str | None,
+    *,
+    labels: list[str] | tuple[str, ...] | None = None,
+    filenames: list[str] | tuple[str, ...] | None = None,
+    device_names: list[str] | tuple[str, ...] | None = None,
+) -> str | None:
+    """One read-time redaction pass over MCP free text (fail-closed).
+
+    Covers: #96 PII, #102 key-like tokens, MACs, stored device labels /
+    filenames / CDM display names, and generic spills of SSID, serial,
+    lat/long, DNS hostnames, passwords, and bearer/tokens.
+    """
     if text is None:
         return None
     if not isinstance(text, str):
@@ -158,6 +295,53 @@ def scrub_text(text: str | None) -> str | None:
     out = redact_pii(text) or ""
     out = _redact_llm_error(out, None)
     out = _MAC_RE.sub("[redacted-mac]", out)
+
+    # Exact stored filenames (full / basename / stem).
+    for fname in filenames or ():
+        for variant in _filename_variants(fname):
+            out = _replace_whole(out, variant, FILENAME_TOKEN)
+
+    # Exact stored CDM / companion display names — always scrub when len>=3.
+    # These are user-visible device nicknames, not diagnostic English.
+    names: list[str] = []
+    for name in device_names or ():
+        if not name or not isinstance(name, str):
+            continue
+        name = name.strip()
+        if len(name) < 3:
+            continue
+        names.append(name)
+    names.sort(key=len, reverse=True)
+    for name in names:
+        out = _replace_whole(out, name, DEVICE_NAME_TOKEN)
+
+    # Exact stored device labels (distinctive → everywhere).
+    distinctive_labels: list[str] = []
+    for label in labels or ():
+        if not label or not isinstance(label, str):
+            continue
+        label = label.strip()
+        if not label or _is_common_label(label):
+            continue
+        distinctive_labels.append(label)
+    distinctive_labels.sort(key=len, reverse=True)
+    for label in distinctive_labels:
+        out = _replace_whole(out, label, LABEL_TOKEN)
+
+    # Generic key=value / header backstops (unknown values too).
+    out = _LABEL_KV_RE.sub(rf"\1={LABEL_TOKEN}", out)
+    out = _FILE_KV_RE.sub(rf"\1={FILENAME_TOKEN}", out)
+    out = _CDM_NAME_KV_RE.sub(rf"\1={DEVICE_NAME_TOKEN}", out)
+    out = _NAME_KV_RE.sub(rf"\1={DEVICE_NAME_TOKEN}", out)
+    out = _SSID_KV_RE.sub(rf"\1={SSID_TOKEN}", out)
+    out = _SERIAL_KV_RE.sub(rf"\1={SERIAL_TOKEN}", out)
+    out = _LOCATION_KV_RE.sub(rf"\1={LOCATION_TOKEN}", out)
+    out = _DNS_KV_RE.sub(rf"\1={DNS_TOKEN}", out)
+    out = _PASSWORD_KV_RE.sub(rf"\1={SECRET_TOKEN}", out)
+    out = _TOKEN_KV_RE.sub(rf"\1={SECRET_TOKEN}", out)
+    out = _BEARER_RE.sub(rf"\1 {SECRET_TOKEN}", out)
+    out = _ARCHIVE_NAME_RE.sub(FILENAME_TOKEN, out)
+
     if len(out) > MAX_STRING_CHARS:
         out = out[:MAX_STRING_CHARS] + "..."
     return out
@@ -167,10 +351,18 @@ def _allowdict(data: dict, allowed: frozenset[str]) -> dict:
     return {k: data[k] for k in data.keys() if k in allowed}
 
 
-def _wrap_untrusted(text: str | None) -> dict | None:
+def _wrap_untrusted(
+    text: str | None,
+    *,
+    labels: list[str] | tuple[str, ...] | None = None,
+    filenames: list[str] | tuple[str, ...] | None = None,
+    device_names: list[str] | tuple[str, ...] | None = None,
+) -> dict | None:
     if text is None:
         return None
-    scrubbed = scrub_text(text)
+    scrubbed = scrub_text(
+        text, labels=labels, filenames=filenames, device_names=device_names,
+    )
     if scrubbed is None or scrubbed == "":
         return None
     return {
@@ -206,7 +398,14 @@ def _rewrite_safe_summary(category: str | None, summary: str | None) -> str | No
     return summary
 
 
-def project_fact(raw: dict, *, capture_id: int) -> dict | None:
+def project_fact(
+    raw: dict,
+    *,
+    capture_id: int,
+    labels: list[str] | tuple[str, ...] | None = None,
+    filenames: list[str] | tuple[str, ...] | None = None,
+    device_names: list[str] | tuple[str, ...] | None = None,
+) -> dict | None:
     """Fail-closed projection of one verified_fact for MCP output."""
     if not isinstance(raw, dict):
         return None
@@ -232,10 +431,15 @@ def project_fact(raw: dict, *, capture_id: int) -> dict | None:
 
     summary = _rewrite_safe_summary(category, raw.get("summary"))
     detail = raw.get("detail")
-    # Pairing detail can echo package (ok) but never MAC/name leftovers as keys.
     untrusted = {}
-    wrapped_summary = _wrap_untrusted(summary if isinstance(summary, str) else None)
-    wrapped_detail = _wrap_untrusted(detail if isinstance(detail, str) else None)
+    wrapped_summary = _wrap_untrusted(
+        summary if isinstance(summary, str) else None,
+        labels=labels, filenames=filenames, device_names=device_names,
+    )
+    wrapped_detail = _wrap_untrusted(
+        detail if isinstance(detail, str) else None,
+        labels=labels, filenames=filenames, device_names=device_names,
+    )
     if wrapped_summary is not None:
         untrusted["summary"] = wrapped_summary
     if wrapped_detail is not None:
@@ -249,7 +453,10 @@ def project_fact(raw: dict, *, capture_id: int) -> dict | None:
     }
     ts = raw.get("timestamp")
     if isinstance(ts, str) and ts:
-        out["timestamp"] = scrub_text(ts)  # timestamps are safe; scrub is idempotent
+        # Timestamps should not carry labels; still run identity scrub.
+        out["timestamp"] = scrub_text(
+            ts, labels=labels, filenames=filenames, device_names=device_names,
+        )
     source = _project_source(raw.get("source"))
     if source is not None:
         out["source"] = source
@@ -387,9 +594,30 @@ def _raw_verified_facts_for_capture(session: Session, capture_id: int) -> list[d
     bundle["ranked_findings"] = rank_findings(bundle)
     attach_verified_facts(bundle)
     facts = bundle.get("verified_facts") or []
+    labels = [device.label] if device.label else []
+    filenames = [capture.original_filename] if capture.original_filename else []
+    device_names: list[str] = []
+    for row in session.exec(
+        select(CompanionDeviceAssociationRow).where(
+            CompanionDeviceAssociationRow.capture_id == capture_id
+        )
+    ).all():
+        if row.display_name:
+            device_names.append(row.display_name)
+    for row in session.exec(
+        select(CdmPairingEventRow).where(CdmPairingEventRow.capture_id == capture_id)
+    ).all():
+        if row.display_name:
+            device_names.append(row.display_name)
     scoped: list[dict] = []
     for fact in facts:
-        projected = project_fact(fact, capture_id=capture_id)
+        projected = project_fact(
+            fact,
+            capture_id=capture_id,
+            labels=labels,
+            filenames=filenames,
+            device_names=device_names,
+        )
         if projected is not None:
             scoped.append(projected)
     return scoped

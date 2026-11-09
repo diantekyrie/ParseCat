@@ -14,6 +14,7 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from app.models.db_models import (
     Capture,
+    CdmPairingEventRow,
     CompanionDeviceAssociationRow,
     CrashEventRow,
     Device,
@@ -44,6 +45,7 @@ from app.services.mcp_readonly import (
     open_readonly_engine,
     project_fact,
     scrub_text,
+    _is_common_label,
 )
 
 
@@ -62,6 +64,15 @@ FAKE_FILENAME_B = "mcp-synth-report-B.zip"
 FAKE_SK = "sk-or-v1-mcpSYNTHETIC00000000000000000001"
 FAKE_AIZA = "AIzaSyMcpSyntheticTestKey00000000001"
 FAKE_GSK = "gsk_mcpSyntheticTestKey0000000000001"
+FAKE_CDM_DEVICE = "Pixel Watch FE-Lab"
+FAKE_SSID_EMBED = "HomeNet-FE42"
+FAKE_SERIAL_EMBED = "HT72C1A0FE001"
+FAKE_LAT = "37.774900"
+FAKE_LON = "-122.419400"
+FAKE_DNS = "tracker.ads.example.com"
+FAKE_PASSWORD = "s3cretFE"
+FAKE_BEARER = "aabbccddee001122"
+FAKE_TOKEN = "xyz123abcTOKEN01"
 
 
 @pytest.fixture
@@ -112,7 +123,7 @@ def writable_db(tmp_path: Path):
             capture_id=cap_a.id,
             association_id=1,
             mac_address=FAKE_MAC,
-            display_name=FAKE_CDM_NAME,
+            display_name=FAKE_CDM_DEVICE,
             package_name="com.example.companion",
             device_profile="WATCH",
             self_managed=False,
@@ -126,10 +137,32 @@ def writable_db(tmp_path: Path):
             source_line_start=1,
             source_line_end=1,
         ))
+        session.add(CdmPairingEventRow(
+            capture_id=cap_a.id,
+            timestamp="08-19 12:05:00.000",
+            level="I",
+            tag="CDM",
+            kind="association_approved",
+            mac_address=FAKE_MAC,
+            display_name=FAKE_CDM_DEVICE,
+            package_name="com.example.companion",
+            association_id=1,
+            detail=f"onAssociationApproved() name={FAKE_CDM_DEVICE}",
+            source_section="system_log",
+            source_line_start=20,
+            source_line_end=20,
+        ))
         crash_msg = (
             f"boom contact {FAKE_EMAIL} phone {FAKE_PHONE} "
             f"key {FAKE_SK} also {FAKE_AIZA} and {FAKE_GSK} "
-            f"mac {FAKE_MAC_IN_TEXT}"
+            f"mac {FAKE_MAC_IN_TEXT} "
+            f"label={FAKE_LABEL} file={FAKE_FILENAME_A} "
+            f"legacy path {FAKE_FILENAME_A} stem mcp-synth-report-A "
+            f"ssid={FAKE_SSID_EMBED} serial={FAKE_SERIAL_EMBED} "
+            f"lat={FAKE_LAT} lon={FAKE_LON} dns_query={FAKE_DNS} "
+            f"password={FAKE_PASSWORD} pwd={FAKE_PASSWORD} "
+            f"Authorization: Bearer {FAKE_BEARER} token={FAKE_TOKEN} "
+            f"display_name={FAKE_CDM_DEVICE} name={FAKE_CDM_DEVICE}"
         )
         session.add(CrashEventRow(
             capture_id=cap_a.id,
@@ -185,10 +218,13 @@ def _assert_no_leaks(blob: str):
     lowered = blob.lower()
     for needle in (
         FAKE_SSID, FAKE_BSSID, FAKE_MAC, FAKE_MAC_IN_TEXT,
-        FAKE_CDM_NAME, FAKE_EMAIL, FAKE_PHONE, FAKE_LABEL,
+        FAKE_CDM_NAME, FAKE_CDM_DEVICE, FAKE_EMAIL, FAKE_PHONE, FAKE_LABEL,
         FAKE_FILENAME_A, FAKE_FILENAME_B,
         FAKE_SK, FAKE_AIZA, FAKE_GSK,
+        FAKE_SSID_EMBED, FAKE_SERIAL_EMBED, FAKE_LAT, FAKE_LON, FAKE_DNS,
+        FAKE_PASSWORD, FAKE_BEARER, FAKE_TOKEN,
         "ssid-sibling-only", "aa:bb:cc:dd:ee:99",
+        "mcp-synth-report-A",
     ):
         assert needle.lower() not in lowered, f"leaked {needle!r}"
 
@@ -364,10 +400,12 @@ def test_get_verified_facts_privacy_and_allowlist(ro_session):
     assert wifi, "approved wifi diagnostic fact must survive"
     pairing = [f for f in payload["facts"] if f.get("category") == "pairing"]
     assert pairing, "approved pairing fact must survive without CDM name"
-    for f in pairing:
-        text = _untrusted_texts(f)
-        assert FAKE_CDM_NAME not in text
-        assert "CDM association present" in text
+    joined = "\n".join(_untrusted_texts(f) for f in pairing)
+    assert FAKE_CDM_NAME not in joined
+    assert FAKE_CDM_DEVICE not in joined
+    assert any(
+        "CDM association present" in _untrusted_texts(f) for f in pairing
+    ), "association summary template must survive"
 
 
 def test_get_verified_facts_unknown_and_archived(ro_session):
@@ -438,6 +476,124 @@ def test_mcp_server_tool_list_has_no_write_tools():
         lowered = name.lower()
         for frag in WRITEISH_TOOL_NAME_FRAGMENTS:
             assert frag not in lowered, f"tool {name!r} looks write-capable"
+
+
+
+def test_legacy_detail_embeds_label_and_filename_scrubbed(ro_session):
+    """Arch blocker: stored label/filename inside free-text detail must not leak."""
+    session, ids, _ = ro_session
+    payload = get_verified_facts(session, ids["capture_a"])
+    blob = json.dumps(payload)
+    assert FAKE_LABEL not in blob
+    assert FAKE_FILENAME_A not in blob
+    assert "mcp-synth-report-A" not in blob  # stem
+    crash = [f for f in payload["facts"] if f.get("category") == "crash"]
+    assert crash, "crash fact must survive scrubbing"
+    detail = _untrusted_texts(crash[0])
+    assert "label=[redacted-label]" in detail or "[redacted-label]" in detail
+    assert "[redacted-filename]" in detail
+
+    fact_id = crash[0]["fact_id"]
+    one = get_fact(session, fact_id, capture_id=ids["capture_a"])
+    one_blob = json.dumps(one)
+    assert FAKE_LABEL not in one_blob
+    assert FAKE_FILENAME_A not in one_blob
+    assert "mcp-synth-report-A" not in one_blob
+
+
+def test_serialized_tools_hide_embedded_label_filename(ro_session):
+    session, ids, _ = ro_session
+    facts_json = tool_get_verified_facts(capture_id=ids["capture_a"], limit=50)
+    facts_obj = json.loads(facts_json)
+    crash = [f for f in facts_obj["facts"] if f.get("category") == "crash"]
+    assert crash
+    one_json = tool_get_fact(fact_id=crash[0]["fact_id"], capture_id=ids["capture_a"])
+    for blob in (facts_json, one_json):
+        assert FAKE_LABEL not in blob
+        assert FAKE_FILENAME_A not in blob
+        assert "mcp-synth-report-A" not in blob
+        assert "private-lab" not in blob
+
+
+def test_common_word_label_tradeoff_preserves_diagnostic_english():
+    """Common/short labels scrub in label= forms only — not bare prose.
+
+    Tradeoff: a device literally nicknamed "crash" or "phone" will still
+    appear if someone writes the bare word outside a label=/device= pair.
+    Distinctive labels (e.g. private-lab-phone) are scrubbed everywhere.
+    Prefer distinctive device nicknames for MCP-exposed databases.
+    """
+    assert _is_common_label("crash")
+    assert _is_common_label("phone")
+    assert not _is_common_label("private-lab-phone")
+
+    common = scrub_text(
+        "label=crash saw a Java crash in com.example",
+        labels=["crash"],
+        filenames=[],
+    )
+    assert "label=[redacted-label]" in common
+    assert "Java crash" in common  # bare diagnostic word preserved
+
+    distinctive = scrub_text(
+        "label=private-lab-phone bare private-lab-phone in prose",
+        labels=["private-lab-phone"],
+        filenames=[],
+    )
+    assert "private-lab-phone" not in distinctive
+    assert distinctive.count("[redacted-label]") >= 2
+
+    # file= / archive backstop even without passing filenames=
+    generic = scrub_text(
+        "file=secret-upload.zip also note dump.txt",
+        labels=[],
+        filenames=[],
+    )
+    assert "secret-upload.zip" not in generic
+    assert "dump.txt" not in generic
+    assert "[redacted-filename]" in generic
+
+
+
+def test_fe_free_text_redaction_all_three_tools(ro_session):
+    """FE must-fix: one read-time pass covers CDM names, SSID/serial/latlong/DNS,
+    labels/filenames, and password/bearer/token — on serialized tool JSON.
+    """
+    session, ids, _ = ro_session
+    list_json = tool_list_captures(offset=0, limit=10)
+    facts_json = tool_get_verified_facts(capture_id=ids["capture_a"], limit=50)
+    facts_obj = json.loads(facts_json)
+    assert facts_obj["facts"]
+    # Prefer a crash fact (planted seeds) for get_fact; fall back to any.
+    crash = [f for f in facts_obj["facts"] if f.get("category") == "crash"]
+    fact_id = (crash[0] if crash else facts_obj["facts"][0])["fact_id"]
+    one_json = tool_get_fact(fact_id=fact_id, capture_id=ids["capture_a"])
+
+    for blob in (list_json, facts_json, one_json):
+        _assert_no_leaks(blob)
+        # (a) CDM device name
+        assert FAKE_CDM_DEVICE not in blob
+        # (b) SSID / serial / lat-long / DNS
+        assert FAKE_SSID_EMBED not in blob
+        assert FAKE_SERIAL_EMBED not in blob
+        assert FAKE_LAT not in blob
+        assert FAKE_LON not in blob
+        assert FAKE_DNS not in blob
+        # (c) labels / filenames
+        assert FAKE_LABEL not in blob
+        assert FAKE_FILENAME_A not in blob
+        # (d) passwords / bearer / token
+        assert FAKE_PASSWORD not in blob
+        assert FAKE_BEARER not in blob
+        assert FAKE_TOKEN not in blob
+
+    # Positive: wifi diagnostic category still present on facts tool.
+    assert any(f.get("category") == "wifi" for f in facts_obj["facts"])
+    # Pairing survives without the CDM nickname.
+    pairing = [f for f in facts_obj["facts"] if f.get("category") == "pairing"]
+    assert pairing
+    for f in pairing:
+        assert FAKE_CDM_DEVICE not in _untrusted_texts(f)
 
 
 def test_default_fact_limit_constant():

@@ -992,36 +992,62 @@ def _contains_numeric_identity(value: str, identity: CaptureIdentity | None) -> 
     return any(m.group(1) in nums for m in _NUMERIC_ID_IN_TEXT_RE.finditer(norm))
 
 
+def _compact_for_identity(value: str) -> str:
+    """NFKC+casefold with ``.`` ``_`` ``-`` ``$`` ``/`` and spaces stripped.
+
+    Used so compact labels (``Janedoe``) match separator-bearing identifiers
+    (``Jane_DoeService``, ``Jane.DoeException``). Short 2–3 labels must NOT
+    use this as a free substring (``Al`` ↛ ``AlarmException``).
+    """
+    return re.sub(r"[.$_\-/\s]+", "", _nfkc(value)).casefold()
+
+
 def _whole_word_label_hit(value: str, identity: CaptureIdentity) -> bool:
     """Hybrid FE+Arch name matching against label + CDM display names.
 
-    * Tokens / joined compact forms of length >= ``_IDENTITY_SUBSTRING_MIN_LEN``
-      (4): NFKC+casefold **substring** containment in the leaf. Tradeoff: a
-      4+ character name that is a common substring (e.g. ``Alice`` inside
-      ``xalicex``) over-withholds — fail-closed by design. Stoplist words are
-      never identity tokens, which limits the blast radius.
-    * Tokens of length 2–3: whole-token equality plus 2–3 adjacent leaf-token
-      joins only, so ``Al`` still spares ``AlarmException``.
+    For every label-token length:
+      * whole-token equality on the leaf's tokens;
+      * 2–3 adjacent leaf-token joins compared to any label token;
+      * length >= 4: NFKC+casefold substring on the leaf (fail-closed);
+      * length >= 4: same substring against the separator-stripped compact
+        leaf so ``Janedoe`` catches ``Jane_DoeService`` / ``Jane.DoeException``
+        and ``Maryjanedoe`` catches ``Mary.Jane.DoeService``.
+
+    Length 2–3 never use compact/raw substring, so ``Al`` still spares
+    ``AlarmException``. Stoplist words are never identity tokens.
     """
     label_words = identity.label_word_tokens()
     if not label_words:
         return False
     norm_leaf = _nfkc(value).casefold()
-    # Long tokens: substring containment.
-    for tok in label_words:
-        if len(tok) >= _IDENTITY_SUBSTRING_MIN_LEN and tok in norm_leaf:
-            return True
-    # Short tokens (2–3): whole-token + adjacent-join equality only.
-    short = {t for t in label_words if _IDENTITY_WORD_MIN_LEN <= len(t) < _IDENTITY_SUBSTRING_MIN_LEN}
-    if not short:
-        return False
     leaf = _tokenize_words(value)
-    if any(tok in short for tok in leaf):
+
+    # Whole-token equality (any length >= min).
+    if any(tok in label_words for tok in leaf):
         return True
+
+    # Adjacent 2–3 leaf-token joins vs any label token (any length).
+    # Closes the 5ad5ec9 regression where a sole 4+ compact label (Janedoe)
+    # skipped this branch entirely after the long-substring-only early path.
     for n in (2, 3):
         for i in range(0, len(leaf) - n + 1):
-            if "".join(leaf[i : i + n]) in short:
+            if "".join(leaf[i : i + n]) in label_words:
                 return True
+
+    long_toks = {t for t in label_words if len(t) >= _IDENTITY_SUBSTRING_MIN_LEN}
+    if not long_toks:
+        return False
+
+    # 4+ substring on the leaf as emitted (separators intact).
+    for tok in long_toks:
+        if tok in norm_leaf:
+            return True
+
+    # 4+ substring on separator-stripped compact form.
+    compact_leaf = _compact_for_identity(value)
+    for tok in long_toks:
+        if tok in compact_leaf:
+            return True
     return False
 
 

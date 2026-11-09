@@ -2406,79 +2406,152 @@ def test_cat_qa120_8_android_perms_non_selinux_still_strict():
     assert _permission_item_ok("read", category="selinux")
 
 
-# --- FE: 116 JaneDoe variants PRE-tool DB-seeded regression -----------------
+# --- Arch: 116 JaneDoe label×identifier matrix PRE-tool DB regression -------
 
 
-_JANE_DOE_STEMS = ("JaneDoe", "Janedoe", "janeDoe", "janedoe")
-_JANE_DOE_SUFFIXES = (
-    "Service", "Exception", "Helper", "Manager", "Provider", "Activity",
-    "Receiver", "Worker", "Handler", "Controller", "Factory", "Builder",
-    "Impl", "Util", "Utils", "Client", "Server", "Module", "Component",
-    "Adapter", "Proxy", "Task", "Job", "Runnable", "Callback", "Listener",
-    "Observer", "Delegate", "Processor",
-)
-assert len(_JANE_DOE_STEMS) * len(_JANE_DOE_SUFFIXES) == 116
+def _arch_jane_doe_116_cases() -> list[tuple[str, str, str]]:
+    """Arch's required 116 compact-label negatives (label, field, value).
 
-
-def _jane_doe_116_variants() -> list[str]:
-    return [f"{stem}{suf}" for stem in _JANE_DOE_STEMS for suf in _JANE_DOE_SUFFIXES]
-
-
-def test_fe_jane_doe_116_variants_preseed_db(writable_db, monkeypatch):
-    """FE: 116 JaneDoe package/exception variants seeded before tools; absent out.
-
-    Uses capture_jane (device label "Jane Doe") so identity tokens
-    jane/doe/janedoe are live. Complements unit whole-word tests with a
-    PRE-tool DB regression across both fact tools.
+    Labels are the *variant* (Janedoe / janedoe / Maryjanedoe / …); identifiers
+    carry separators the compact label must still match. 3×8×2×2 + 2×5×2 = 116.
     """
-    from sqlmodel import Session, create_engine
-    from app.models.db_models import CrashEventRow
+    cases: list[tuple[str, str, str]] = []
+    for label in ("JaneDoe", "Janedoe", "janedoe"):
+        for variant in (
+            "JaneDoe", "Janedoe", "janedoe", "Jane_Doe", "jane-doe",
+            "JaneDoe$Inner", "JANEDOE", "Jane.Doe",
+        ):
+            for shape in ("Service", "Exception"):
+                value = f"com.example.{variant}{shape}"
+                for field in ("package", "exception_class"):
+                    cases.append((label, field, value))
+    for label in ("Mary Jane Doe", "Maryjanedoe"):
+        for variant in (
+            "Mary.Jane.Doe", "Mary_Jane_Doe", "MARY.JANE.DOE",
+            "maryjanedoe", "MaryJaneDoe",
+        ):
+            value = f"com.example.{variant}Service"
+            for field in ("package", "exception_class"):
+                cases.append((label, field, value))
+    assert len(cases) == 116, len(cases)
+    return cases
 
-    variants = _jane_doe_116_variants()
-    assert len(variants) == 116
-    assert len(set(variants)) == 116
+
+def test_arch_jane_doe_three_separator_examples_unit():
+    """Arch blocker examples: compact label vs separator-bearing identifier."""
+    from app.services.mcp_readonly import CaptureIdentity, _contains_identity
+
+    assert _contains_identity(
+        "com.example.Jane_DoeService", CaptureIdentity(label="Janedoe"),
+    )
+    assert _contains_identity(
+        "com.example.Jane.DoeException", CaptureIdentity(label="janedoe"),
+    )
+    assert _contains_identity(
+        "com.example.Mary.Jane.DoeService", CaptureIdentity(label="Maryjanedoe"),
+    )
+    # Al/AlarmException positive control retained.
+    assert not _contains_identity(
+        "AlarmException", CaptureIdentity(label="Al"),
+    )
+    assert not _contains_identity(
+        "JobException", CaptureIdentity(label="Jo"),
+    )
+
+
+def test_arch_jane_doe_116_label_variants_preseed_db(writable_db, monkeypatch):
+    """Arch: 116 label×identifier variants seeded before tools; 0 leaks.
+
+    Variants apply to the **label** (and the identifier). Both fact tools ×
+    both free-text modes must omit every planted value.
+    """
+    from sqlmodel import Session, create_engine, select
+    from app.models.db_models import Device, Capture, CrashEventRow
+
+    cases = _arch_jane_doe_116_cases()
+    assert len(cases) == 116
 
     db_path = writable_db["db_path"]
-    cap_id = writable_db["capture_jane"]
     monkeypatch.setenv("PARSECAT_DB_PATH", str(db_path))
-    monkeypatch.setenv("PARSECAT_MCP_INCLUDE_FREE_TEXT", "0")
 
     eng = create_engine(
         f"sqlite:///{db_path}", connect_args={"check_same_thread": False},
     )
+    # One capture per distinct label; plant every (field,value) for that label.
+    by_label: dict[str, list[tuple[str, str]]] = {}
+    for label, field, value in cases:
+        by_label.setdefault(label, []).append((field, value))
+
+    cap_ids: dict[str, int] = {}
     with Session(eng) as s:
-        for i, var in enumerate(variants):
-            # Plant canary in both package and exception_class under live
-            # Jane Doe identity (tokens jane/doe/janedoe).
-            s.add(CrashEventRow(
-                capture_id=cap_id,
-                timestamp=f"08-19 16:{(i // 60):02d}:{(i % 60):02d}.000",
-                thread="main",
-                package=f"com.example.{var}",
-                pid=9000 + i,
-                exception_class=var,
-                message=None,
-                root_cause_class=None,
-                root_cause_message=None,
-                root_cause_frame=None,
-                source_section="system_log",
-                source_line_start=700 + i,
-                source_line_end=700 + i,
-            ))
+        for i, (label, pairs) in enumerate(by_label.items()):
+            dev = Device(label=label, archived=False)
+            s.add(dev)
+            s.commit()
+            s.refresh(dev)
+            cap = Capture(
+                device_id=dev.id,
+                original_filename=f"arch-jane-116-{i}.zip",
+            )
+            s.add(cap)
+            s.commit()
+            s.refresh(cap)
+            cap_ids[label] = cap.id
+            for j, (field, value) in enumerate(pairs):
+                pkg = value if field == "package" else "com.example.app"
+                exc = value if field == "exception_class" else "RuntimeException"
+                # Always plant the canary string in the targeted field; also
+                # mirror into the other ID field when shapes allow so both
+                # structured leaves exercise the matcher.
+                if field == "package":
+                    pkg, exc = value, value.rsplit(".", 1)[-1]
+                else:
+                    pkg, exc = value, value
+                s.add(CrashEventRow(
+                    capture_id=cap.id,
+                    timestamp=f"08-19 17:{(j // 60):02d}:{(j % 60):02d}.000",
+                    thread="main",
+                    package=pkg,
+                    pid=10000 + i * 200 + j,
+                    exception_class=exc,
+                    message=None,
+                    root_cause_class=None,
+                    root_cause_message=None,
+                    root_cause_frame=None,
+                    source_section="system_log",
+                    source_line_start=800 + j,
+                    source_line_end=800 + j,
+                ))
         s.commit()
     eng.dispose()
 
-    facts_json = tool_get_verified_facts(capture_id=cap_id, limit=500)
-    facts_obj = json.loads(facts_json)
-    assert facts_obj["facts"], "expected seeded crash facts on capture_jane"
-    one_json = tool_get_fact(
-        fact_id=facts_obj["facts"][0]["fact_id"], capture_id=cap_id,
-    )
-    for blob, tool in ((facts_json, "get_verified_facts"), (one_json, "get_fact")):
-        for var in variants:
-            assert var not in blob, f"{tool} leaked JaneDoe variant {var!r}"
-    # Spot-check get_fact on a mid-list fact that carries a package canary.
-    mid = facts_obj["facts"][len(facts_obj["facts"]) // 2]
-    mid_json = tool_get_fact(fact_id=mid["fact_id"], capture_id=cap_id)
-    for var in variants:
-        assert var not in mid_json, f"get_fact mid leaked {var!r}"
+    # Every planted canary value must be absent from both tools × FT modes.
+    canary_values = sorted({value for _, _, value in cases})
+    assert len(cases) == 116
+    assert len(canary_values) >= 20  # distinct identifier spellings in the matrix
+    for ft in ("0", "1"):
+        monkeypatch.setenv("PARSECAT_MCP_INCLUDE_FREE_TEXT", ft)
+        for label, cap_id in cap_ids.items():
+            facts_json = tool_get_verified_facts(capture_id=cap_id, limit=500)
+            facts_obj = json.loads(facts_json)
+            assert facts_obj["facts"], (label, ft)
+            # Probe get_fact on first, middle, and last facts.
+            idxs = sorted({0, len(facts_obj["facts"]) // 2, len(facts_obj["facts"]) - 1})
+            one_blobs = [
+                tool_get_fact(
+                    fact_id=facts_obj["facts"][k]["fact_id"], capture_id=cap_id,
+                )
+                for k in idxs
+            ]
+            for blob, tool in (
+                (facts_json, "get_verified_facts"),
+                *[(b, "get_fact") for b in one_blobs],
+            ):
+                for value in canary_values:
+                    # Only assert values that belong to this label's plant set.
+                    planted = {v for lab, _, v in cases if lab == label}
+                    if value not in planted:
+                        continue
+                    assert value not in blob, (
+                        f"ft={ft} label={label!r} {tool} leaked {value!r}"
+                    )

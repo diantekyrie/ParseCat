@@ -446,11 +446,12 @@ pytest -q
 (Connection Complete, Disconnection Complete, Authentication Complete,
 Encryption Change, Change Connection Link Key Complete, Link Key Request,
 Link Key Notification, Simple Pairing Complete, Command Complete, Command
-Status, LE Connection Complete), with HCI status/reason codes named from the
-Bluetooth Core Spec. Everything else is counted by event code
-(`event_code_counts`) without per-record decoding -- this is HCI-framing-level
-visibility (connections, disconnects, command failures), not a full L2CAP/
-profile-level protocol dissector.
+Status, LE Connection Complete / Enhanced Connection Complete), with HCI
+status/reason codes named from the Bluetooth Core Spec. Everything else is
+counted by event code (`event_code_counts`) without per-record decoding --
+this is HCI-framing-level visibility (connections, disconnects,
+auth/encryption/pairing, command failures), not a full L2CAP/profile-level
+protocol dissector.
 
 `wifi.py` decodes `DUMP OF SERVICE wifi`'s WifiController/ClientModeImpl
 state-machine transition log: disconnection events with their IEEE 802.11

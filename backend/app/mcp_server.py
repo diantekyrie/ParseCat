@@ -44,13 +44,14 @@ mcp = MCPServer(
     name="parsecat-readonly",
     instructions=(
         "Read-only ParseCat tools. Return allowlisted structured parser "
-        "fields only (reason codes, timestamps, PIDs, packages, severities, "
-        "counts). Capture IDs instead of filenames. Labels, filenames, CDM "
-        "display names, SSID/BSSID/MAC/serial, and coordinates are omitted. "
-        "Crash/ANR/kernel free text is omitted unless "
-        "PARSECAT_MCP_INCLUDE_FREE_TEXT=1; when enabled it is PII/key-scrubbed "
-        "evidence — residual risk: names, labels, and filenames that appear "
-        "inside log text may reach the model. No write/upload/diagnose/LLM tools. "
+        "fields only (shape-validated). Capture IDs instead of filenames. "
+        "Labels, filenames, CDM display names, SSID/BSSID/MAC/serial, and "
+        "coordinates are never returned as fields. Crash/ANR/kernel free text "
+        "is omitted unless PARSECAT_MCP_INCLUDE_FREE_TEXT=1; when enabled it "
+        "is scrubbed for PII/keys/MAC/IP and this capture's own label/"
+        "filename/serial/SSID/BSSID. Residual risk when enabled: other names "
+        "and free-form log text may still reach the model. "
+        "No write/upload/diagnose/LLM tools. "
         f"{UNTRUSTED_DATA_NOTICE}"
     ),
 )
@@ -105,9 +106,11 @@ def list_captures(offset: int | None = None, limit: int | None = None) -> str:
         f"Paginated via offset/limit (default {DEFAULT_FACT_LIMIT}, max "
         f"{MAX_FACT_LIMIT}). Allowlisted structured fields only. "
         "Crash/ANR/kernel free text omitted unless "
-        "PARSECAT_MCP_INCLUDE_FREE_TEXT=1 (residual risk when on: names, labels, and filenames that appear inside log text may reach the model). Never returns labels, "
-        "filenames, CDM names, SSID/BSSID/MAC/serial, coordinates, or LLM "
-        "narration."
+        "PARSECAT_MCP_INCLUDE_FREE_TEXT=1 (when on: scrubbed for PII/keys/"
+        "MAC/IP and this capture's own label/filename/serial/SSID/BSSID; "
+        "residual risk: other names/free-form log text may remain). Never "
+        "returns labels/filenames/CDM names/SSID/BSSID/MAC/serial/"
+        "coordinates as fields, or LLM narration."
     ),
 )
 def get_verified_facts(
@@ -135,7 +138,10 @@ def get_verified_facts(
         "scope the search to that capture (required for precise lookups). "
         "Without capture_id, at most a small number of captures are scanned. "
         "A fact from sibling capture B is never returned when capture_id=A. "
-        "Structured fields only; free text omitted unless PARSECAT_MCP_INCLUDE_FREE_TEXT=1 (residual risk: names, labels, and filenames that appear inside log text may reach the model)."
+        "Structured fields only; free text omitted unless "
+        "PARSECAT_MCP_INCLUDE_FREE_TEXT=1 (scrubbed for PII/keys/MAC/IP and "
+        "capture identity tokens; residual risk: other names/free-form log "
+        "text may remain)."
     ),
 )
 def get_fact(fact_id: str, capture_id: int | None = None) -> str:
@@ -149,6 +155,41 @@ def get_fact(fact_id: str, capture_id: int | None = None) -> str:
     except FileNotFoundError as exc:
         raise _db_unavailable(exc) from exc
 
+
+
+def _sanitize_tool_validation_error(exc: BaseException) -> ToolError | None:
+    """Map pydantic ValidationError → generic error (param names only, no values)."""
+    from pydantic import ValidationError
+
+    cause = exc.__cause__ if isinstance(exc, ToolError) else None
+    verr = cause if isinstance(cause, ValidationError) else (
+        exc if isinstance(exc, ValidationError) else None
+    )
+    if verr is None:
+        return None
+    fields = sorted({
+        ".".join(str(part) for part in err.get("loc", ()) if part != "args")
+        for err in verr.errors()
+    })
+    fields = [f for f in fields if f]
+    names = ", ".join(fields) if fields else "arguments"
+    return ToolError(f"invalid arguments: {names}")
+
+
+_orig_call_tool = mcp.call_tool
+
+
+async def _call_tool_no_echo(name: str, arguments: dict | None = None, context=None):
+    try:
+        return await _orig_call_tool(name, arguments or {}, context)
+    except ToolError as exc:
+        sanitized = _sanitize_tool_validation_error(exc)
+        if sanitized is not None:
+            raise sanitized from None
+        raise
+
+
+mcp.call_tool = _call_tool_no_echo  # type: ignore[method-assign]
 
 # Tool names registered on this server — kept for tests / docs.
 READONLY_TOOL_NAMES = frozenset({

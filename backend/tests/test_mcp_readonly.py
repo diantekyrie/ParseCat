@@ -27,14 +27,19 @@ from app.models.db_models import (
     CompanionDeviceAssociationRow,
     CrashEventRow,
     Device,
+    DeviceInfoRow,
     KernelLogEventRow,
+    SelinuxDenialRow,
+    TombstoneRow,
     WifiEventRow,
 )
+from mcp.server.mcpserver.exceptions import ToolError
 from app.services.mcp_readonly import (
     DEFAULT_FACT_LIMIT,
     DETAIL_WITHHELD,
     FACT_KIND_KEYS,
     MAX_FACT_LIMIT,
+    MAX_IDENTIFIER_CHARS,
     MCP_REDACT_KEYS,
     CaptureNotFoundError,
     FactNotFoundError,
@@ -83,6 +88,25 @@ OVER_REDACT_FILE_12 = "12.txt"
 OVER_REDACT_FILE_CRASH = "crash.zip"
 LONG_PACKAGE = "com.example.abcdefghijklmnopqrstuvwxyzabcdef"
 LONG_EXCEPTION = "com.example.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefException"
+# >240 chars, still under MAX_IDENTIFIER_CHARS, valid Android package shape.
+VERY_LONG_PACKAGE = "com.example." + ("v" * 300)
+
+# Cat QA canaries (synthetic) — planted into identifier + free-text fields.
+CAT_SSID = "CatCanarySSID"
+CAT_MAC = "de:ad:be:ef:00:01"
+CAT_SERIAL = "CATSERIAL001"
+CAT_IP = "203.0.113.50"
+CAT_EMAIL = "cat.canary@example.com"
+CAT_PHONE = "+1-415-555-0182"
+CAT_FILE = "cat-canary-report.zip"
+CAT_LABEL = "cat-canary-label"
+CAT_POISON = (
+    f"{CAT_SSID} {CAT_MAC} {CAT_SERIAL} {CAT_IP} "
+    f"{CAT_EMAIL} {CAT_PHONE} {CAT_FILE} {CAT_LABEL}"
+)
+CAT_CANARIES = (
+    CAT_SSID, CAT_MAC, CAT_SERIAL, CAT_IP, CAT_EMAIL, CAT_PHONE, CAT_FILE, CAT_LABEL,
+)
 
 
 def _assert_no_forbidden(blob: str):
@@ -99,6 +123,7 @@ def _assert_no_forbidden(blob: str):
         ARCH_LABEL_UNDERSCORE, ARCH_BARE_ALICE, "Jane Doe",
         OVER_REDACT_FILE_12, OVER_REDACT_FILE_CRASH,
         "private-lab-phone",
+        *CAT_CANARIES,
     ):
         assert needle.lower() not in lowered, f"leaked {needle!r}"
     # Arch nested / quoted forms (avoid matching the PII token [redacted-phone]).
@@ -260,6 +285,138 @@ def writable_db(tmp_path: Path):
             source_line_end=1,
         ))
 
+
+        # Cat QA canary capture: poison every allowlisted string identifier field
+        # plus free-text SSID/serial/IP/filename seeds. Ground truth keeps the poison;
+        # MCP must withhold / scrub.
+        cat_dev = Device(label=CAT_LABEL, archived=False)
+        session.add(cat_dev)
+        session.commit()
+        session.refresh(cat_dev)
+        cap_cat = Capture(device_id=cat_dev.id, original_filename=CAT_FILE)
+        session.add(cap_cat)
+        session.commit()
+        session.refresh(cap_cat)
+        session.add(DeviceInfoRow(
+            capture_id=cap_cat.id,
+            serial=CAT_SERIAL,
+            manufacturer="Synth",
+            model="CatQA",
+        ))
+        session.add(WifiEventRow(
+            capture_id=cap_cat.id,
+            timestamp="08-19 12:00:00.000",
+            kind="disconnection",
+            ssid=CAT_SSID,
+            bssid=CAT_MAC,
+            reason_code=3,
+            reason_name=CAT_POISON,  # must be withheld (shape/pii)
+            locally_generated=False,
+            roam=None,
+            source_section="wifi",
+            source_line_start=1,
+            source_line_end=1,
+        ))
+        session.add(CrashEventRow(
+            capture_id=cap_cat.id,
+            timestamp="08-19 12:01:00.000",
+            thread=CAT_POISON,
+            package=VERY_LONG_PACKAGE,
+            pid=42,
+            exception_class=CAT_POISON,
+            message=(
+                f"boom ssid={CAT_SSID} serial={CAT_SERIAL} ip={CAT_IP} "
+                f"file={CAT_FILE} label={CAT_LABEL} {CAT_EMAIL}"
+            ),
+            root_cause_class=CAT_POISON,
+            root_cause_message=f"root ssid={CAT_SSID} serial={CAT_SERIAL} ip={CAT_IP} file={CAT_FILE}",
+            root_cause_frame=None,
+            source_section="system_log",
+            source_line_start=1,
+            source_line_end=1,
+        ))
+        session.add(CrashEventRow(
+            capture_id=cap_cat.id,
+            timestamp="08-19 12:01:30.000",
+            thread="main",
+            package="com.example.ok",
+            pid=43,
+            exception_class="java.lang.RuntimeException",
+            message=None,
+            root_cause_class=None,
+            root_cause_message=None,
+            root_cause_frame=None,
+            source_section="system_log",
+            source_line_start=2,
+            source_line_end=2,
+        ))
+        session.add(TombstoneRow(
+            capture_id=cap_cat.id,
+            filename="tombstone_00",
+            modified_at="2024-01-01",
+            timestamp="08-19 12:02:00.000",
+            executable=CAT_POISON,
+            package=CAT_POISON,
+            pid=7,
+            tid=8,
+            signal_number=11,
+            signal_name="SIGSEGV",
+            signal_code=CAT_POISON,
+        ))
+        session.add(AnrRow(
+            capture_id=cap_cat.id,
+            filename="anr_cat",
+            timestamp="08-19 12:03:00.000",
+            subject="timed out",
+            pid=9,
+            package=CAT_POISON,
+            reason=f"Input dispatching timed out ssid={CAT_SSID} serial={CAT_SERIAL} ip={CAT_IP} file={CAT_FILE}",
+            timeout_ms=5000,
+            rss_kb=100,
+        ))
+        session.add(KernelLogEventRow(
+            capture_id=cap_cat.id,
+            boot_relative_sec=1.0,
+            priority=3,
+            priority_name="ERR",
+            thread=CAT_POISON,
+            message=f"oops ssid={CAT_SSID} serial={CAT_SERIAL} ip={CAT_IP} file={CAT_FILE}",
+            is_panic_family=False,
+            source_section="kernel",
+            source_line_start=1,
+            source_line_end=1,
+        ))
+        session.add(SelinuxDenialRow(
+            capture_id=cap_cat.id,
+            timestamp="08-19 12:04:00.000",
+            verdict="denied",
+            permissions="read write getattr",
+            source_domain="untrusted_app",
+            target_type="app_data_file",
+            target_class="file",
+            app="com.example.app",
+            comm="app_process",
+            enforcing=True,
+            source_section="selinux",
+            source_line_start=1,
+            source_line_end=1,
+        ))
+        session.add(CdmPairingEventRow(
+            capture_id=cap_cat.id,
+            timestamp="08-19 12:05:00.000",
+            level="I",
+            tag=CAT_POISON,
+            kind="association_approved",
+            mac_address=CAT_MAC,
+            display_name=CAT_LABEL,
+            package_name=CAT_POISON,
+            association_id=1,
+            detail="withheld",
+            source_section="system_log",
+            source_line_start=20,
+            source_line_end=20,
+        ))
+
         # Sibling B wifi only.
         session.add(WifiEventRow(
             capture_id=cap_b.id,
@@ -336,6 +493,7 @@ def writable_db(tmp_path: Path):
             "capture_b": cap_b.id,
             "capture_12": cap_12.id,
             "capture_crash_name": cap_crash_name.id,
+            "capture_cat": cap_cat.id,
             "capture_alice": cap_alice.id,
             "capture_jane": cap_jane.id,
             "capture_us": cap_us.id,
@@ -688,7 +846,7 @@ def test_free_text_omitted_by_default(ro_session):
 
 
 def test_free_text_opt_in_redacts_secrets_names_may_survive(ro_session, monkeypatch):
-    """Flag=1 includes free text after PII/key scrub; name/label/filename seeds are residual risk."""
+    """Flag=1 includes free text after PII/key + capture-identity scrub."""
     monkeypatch.setenv("PARSECAT_MCP_INCLUDE_FREE_TEXT", "1")
     session, ids, _ = ro_session
     facts_json = tool_get_verified_facts(capture_id=ids["capture_a"], limit=500)
@@ -700,21 +858,24 @@ def test_free_text_opt_in_redacts_secrets_names_may_survive(ro_session, monkeypa
     assert "message" in crash and "root_cause_message" in crash
     assert "reason" in anr
     assert "message" in kernel
-    # Secrets/PII scrubbed.
     for text in (crash["message"], crash["root_cause_message"], anr["reason"], kernel["message"]):
         assert FAKE_PASSWORD not in text
         assert FAKE_SK not in text
         assert FAKE_EMAIL not in text
         assert FAKE_BEARER not in text
-    # Residual risk (documented): name/label/filename seeds inside log text may survive.
+        # Capture-A identity tokens scrubbed in opt-in free text.
+        assert FAKE_LABEL not in text
+        assert FAKE_FILENAME_A not in text
+        assert FAKE_SSID not in text
+        assert FAKE_BSSID not in text
+    # Residual risk (documented): other name seeds may survive.
     joined = " ".join([
         crash["message"], crash["root_cause_message"], anr["reason"], kernel["message"],
     ])
-    assert ARCH_BARE_ALICE in joined or ARCH_JANE in joined or FAKE_LABEL in joined
+    assert ARCH_BARE_ALICE in joined or ARCH_JANE in joined
     one = tool_get_fact(fact_id=crash["fact_id"], capture_id=ids["capture_a"])
     assert "message" in json.loads(one)["fact"]
 
-    # Non-exact values must not enable the flag.
     monkeypatch.setenv("PARSECAT_MCP_INCLUDE_FREE_TEXT", "true")
     off = get_verified_facts(session, ids["capture_a"])
     off_crash = [f for f in off["facts"] if f["category"] == "crash"][0]
@@ -724,3 +885,128 @@ def test_free_text_opt_in_redacts_secrets_names_may_survive(ro_session, monkeypa
 def test_default_fact_limit_constant():
     assert DEFAULT_FACT_LIMIT == 100
     assert MAX_FACT_LIMIT == 500
+
+
+def _cat_blobs(ids):
+    list_json = tool_list_captures(offset=0, limit=100)
+    facts_json = tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
+    facts = json.loads(facts_json)["facts"]
+    blobs = [list_json, facts_json]
+    for fact in facts:
+        blobs.append(tool_get_fact(fact_id=fact["fact_id"], capture_id=ids["capture_cat"]))
+    return blobs, facts
+
+
+def test_cat_p1_identifier_canaries_withheld_default(ro_session):
+    """Cat P1: poisoned thread/executable/other string IDs → null + withheld_fields."""
+    session, ids, _ = ro_session
+    blobs, facts = _cat_blobs(ids)
+    assert facts
+    for blob in blobs:
+        for needle in CAT_CANARIES:
+            assert needle not in blob, f"leaked {needle!r} in default output"
+    # Crash with poisoned thread/classes withheld; clean crash keeps package.
+    crashes = [f for f in facts if f["category"] == "crash"]
+    poisoned = [c for c in crashes if c.get("package") is None or c.get("thread") is None]
+    clean = [c for c in crashes if c.get("package") == "com.example.ok"]
+    assert poisoned, "expected withheld crash fields"
+    assert clean and clean[0]["thread"] == "main"
+    assert any(
+        any(w.get("field") == "thread" for w in (c.get("withheld_fields") or []))
+        for c in crashes
+    )
+    natives = [f for f in facts if f["category"] == "native_crash"]
+    assert natives and natives[0].get("executable") is None
+    assert any(w.get("field") == "executable" for w in (natives[0].get("withheld_fields") or []))
+    # Very long package emitted byte-for-byte (no 240 truncation).
+    long_ones = [c for c in crashes if c.get("package") == VERY_LONG_PACKAGE]
+    assert long_ones, "very long package must survive verbatim"
+    assert len(long_ones[0]["package"]) == len(VERY_LONG_PACKAGE)
+    assert len(VERY_LONG_PACKAGE) > 240
+
+
+def test_cat_p1_free_text_opt_in_scrubs_ssid_serial_ip_filename(ro_session, monkeypatch):
+    """Cat P1 flag-on: SSID/serial/IP/filename scrubbed in free text."""
+    monkeypatch.setenv("PARSECAT_MCP_INCLUDE_FREE_TEXT", "1")
+    session, ids, _ = ro_session
+    facts_json = tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
+    facts = json.loads(facts_json)["facts"]
+    texts = []
+    for f in facts:
+        for k in ("message", "root_cause_message", "reason"):
+            if isinstance(f.get(k), str):
+                texts.append(f[k])
+        blobs = [facts_json, tool_get_fact(fact_id=f["fact_id"], capture_id=ids["capture_cat"])]
+        for blob in blobs:
+            assert CAT_SSID not in blob
+            assert CAT_SERIAL not in blob
+            assert CAT_IP not in blob
+            assert CAT_FILE not in blob
+            assert CAT_MAC not in blob
+            assert CAT_EMAIL not in blob
+    assert texts, "expected opt-in free text"
+    joined = " ".join(texts)
+    assert CAT_SSID not in joined
+    assert CAT_SERIAL not in joined
+    assert CAT_IP not in joined
+    assert CAT_FILE not in joined
+    assert "[redacted-ip]" in joined or "ip=" not in joined.lower()
+
+
+def test_cat_p2_identifier_never_truncated(ro_session):
+    session, ids, _ = ro_session
+    facts_json = tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
+    assert VERY_LONG_PACKAGE in facts_json
+    assert len(VERY_LONG_PACKAGE) <= MAX_IDENTIFIER_CHARS
+    # Oversize identifier → withheld, not truncated.
+    from app.services.mcp_readonly import _stamp, CaptureIdentity
+    huge = "com.example." + ("z" * (MAX_IDENTIFIER_CHARS + 50))
+    stamped = _stamp("crash", 1, {
+        "timestamp": "08-19 12:00:00.000",
+        "package": huge,
+        "thread": "main",
+        "exception_class": "RuntimeException",
+        "confidence": "LOW",
+    }, identity=CaptureIdentity())
+    assert stamped.get("package") is None
+    assert any(w["field"] == "package" and w["reason"] == "too_long"
+               for w in stamped.get("withheld_fields") or [])
+    assert huge not in json.dumps(stamped)
+
+
+def test_cat_p2_malformed_args_no_echo():
+    """SDK call_tool must not echo pydantic input_value / raw submitted args."""
+    async def _run():
+        with pytest.raises(ToolError) as ei:
+            await mcp.call_tool(
+                "get_verified_facts",
+                {"capture_id": "not-an-int", "limit": "nope"},
+            )
+        return ei.value
+
+    err = asyncio.run(_run())
+    msg = str(err)
+    assert msg.startswith("invalid arguments:")
+    assert "capture_id" in msg and "limit" in msg
+    assert "not-an-int" not in msg
+    assert "nope" not in msg
+    assert "input_value" not in msg
+    assert "ValidationError" not in msg
+
+
+def test_cat_p3_selinux_permissions_list(ro_session):
+    session, ids, _ = ro_session
+    facts_json = tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
+    facts = json.loads(facts_json)["facts"]
+    sel = [f for f in facts if f["category"] == "selinux"]
+    assert sel
+    perms = sel[0]["permissions"]
+    assert isinstance(perms, list)
+    assert perms == ["read", "write", "getattr"]
+    # Serialized JSON is a list, not a joined string.
+    assert '"permissions": ["read", "write", "getattr"]' in facts_json or (
+        '"permissions":["read","write","getattr"]' in facts_json
+    )
+    one = tool_get_fact(fact_id=sel[0]["fact_id"], capture_id=ids["capture_cat"])
+    assert isinstance(json.loads(one)["fact"]["permissions"], list)
+

@@ -468,13 +468,19 @@ Tools: `list_captures(offset?, limit?)`,
 Privacy boundary: fail-closed per-kind allowlists of structured parser
 fields (reason codes, timestamps, PIDs, packages, severities, counts;
 capture IDs instead of filenames). Labels, filenames, CDM display names,
-SSID/BSSID/MAC/serial, and coordinates are omitted — never spliced into
-MCP text. Crash/ANR/kernel free text is omitted by default; set
-`PARSECAT_MCP_INCLUDE_FREE_TEXT=1` to include it after #96 `redact_pii` +
-key-shaped scrubbing (residual risk when enabled: names, labels, and
-filenames that appear inside log text may reach the model). Capture-scoped
-(no sibling bleed). Stdio only;
-a local MCP client may still forward returned facts to its model provider.
+SSID/BSSID/MAC/serial, and coordinates are **never returned as fields**.
+String identifiers are shape-validated (and checked for PII/MAC/IP and the
+capture's own identity tokens); failures become `null` with
+`withheld_fields` — ground truth is not mutated. Crash/ANR/kernel free
+text is omitted by default; set `PARSECAT_MCP_INCLUDE_FREE_TEXT=1` to
+include it after #96 `redact_pii` + key/MAC/IP scrubbing **and** exact
+scrubbing of this capture's own label, filename (plus basename/stem when
+≥4 chars and not a pure number), serial, SSIDs and BSSIDs. Residual risk
+when enabled: **other** names and free-form log text that are not those
+capture identity tokens may still reach the model. Capture-scoped (no
+sibling bleed). Stdio only; a local MCP client may still forward returned
+facts to its model provider. SELinux `permissions` are returned as a list
+of strings (persistence stores them space-joined; MCP splits at read time).
 
 ### Client config (official formats)
 

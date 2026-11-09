@@ -623,10 +623,11 @@ _THREAD_PATTERNS = tuple(
 # Executable: FE prefixes only; conservative segments; no archive/log ext;
 # no /data/local or /tmp (Arch). Bare names withheld.
 _EXECUTABLE_PREFIXES = (
-    "/system/", "/vendor/", "/apex/", "/product/", "/data/app/",
+    "/system/", "/system_ext/", "/vendor/", "/odm/",
+    "/apex/", "/product/", "/data/app/",
 )
 _EXECUTABLE_ABS_RE = re.compile(
-    r"^/(?:system|vendor|apex|product|data/app)"
+    r"^/(?:system|system_ext|vendor|odm|apex|product|data/app)"
     r"(?:/[A-Za-z0-9._+-]+)+$"
 )
 _EXECUTABLE_BAD_EXT = frozenset({
@@ -934,8 +935,21 @@ def _shape_ok(kind: str, value: str, *, category: str | None = None) -> bool:
     return bool(_GENERIC_ID_RE.fullmatch(value))
 
 
-def _permission_item_ok(item: str) -> bool:
-    """FE: android.permission.* or package-shaped only; withhold everything else."""
+def _permission_item_ok(item: str, *, category: str | None = None) -> bool:
+    """Permission leaf allowlist (Cat QA120-8 + FE).
+
+    * ``selinux`` category: explicit AVC vocabulary (``^[a-z_]+$`` ∩ vocab).
+    * Otherwise (Android-permission style facts): ``android.permission.*`` or
+      package-shaped only — FE's rule unchanged.
+    Identity/key gates still run on kept leaves via the outbound walk.
+    """
+    if category == "selinux":
+        if _AVC_PERM_SHAPE_RE.fullmatch(item) and item in _AVC_PERM_CONSTANTS:
+            return True
+        # Also accept android.permission.* / package if somehow mixed in.
+        if _ANDROID_PERM_RE.fullmatch(item) or _PACKAGE_RE.fullmatch(item):
+            return True
+        return False
     if _ANDROID_PERM_RE.fullmatch(item):
         return True
     if _PACKAGE_RE.fullmatch(item):
@@ -1077,6 +1091,10 @@ def _validate_identifier(
     shape = _FIELD_SHAPE.get(field, "generic")
     if not _shape_ok(shape, value, category=category):
         return "shape"
+    # SELinux tclass: require membership in the fixed class vocabulary (Cat).
+    if category == "selinux" and field == "target_class":
+        if value not in _SELINUX_TCLASS_CONSTANTS:
+            return "shape"
     # Key-prefix: withhold (never mutate) on free-form IDs + exception classes.
     if field in _KEY_PREFIX_FIELDS and _has_key_prefix(value):
         return "key-shaped"
@@ -1173,7 +1191,7 @@ def _stamp(
                 if _has_key_prefix(p):
                     dropped_key += 1
                     continue
-                if not _permission_item_ok(p):
+                if not _permission_item_ok(p, category=category):
                     dropped_shape += 1
                     continue
                 kept.append(p)
@@ -1268,11 +1286,39 @@ def _clamp_offset(value: int | None) -> int:
 # or "wifi" or "12" does not null `kind: wifi` / reason codes. Key-prefix
 # checks still apply to every string leaf (never mutate — withhold only).
 
+# Explicit SELinux AVC permission vocabulary (kernel/Android policy verbs).
+# Used for selinux-category facts only — not a free lowercase allowlist.
 _AVC_PERM_CONSTANTS = frozenset({
-    # Short verbs selinux.py splits from `{ read write }` style payloads.
-    "read", "write", "getattr", "search", "open", "ioctl", "lock", "map",
-    "execute", "create", "setattr", "unlink", "rename", "connect", "bind",
-    "listen", "accept", "use", "append", "ioctl_getattr",
+    # File / dir / lnk_file
+    "read", "write", "open", "getattr", "setattr", "lock", "map", "ioctl",
+    "execute", "execute_no_trans", "entrypoint", "execmod",
+    "create", "unlink", "link", "rename", "append",
+    "search", "add_name", "remove_name", "reparent", "rmdir",
+    "quotaon", "mounton", "audit_access",
+    # Socket / net
+    "bind", "connect", "listen", "accept", "name_bind", "name_connect",
+    "send_msg", "recv_msg", "node_bind", "setopt", "getopt",
+    # Process / IPC / binder
+    "transition", "dyntransition", "sigchld", "sigkill", "sigstop", "signull",
+    "signal", "ptrace", "getsched", "setsched", "getsession", "getpgid",
+    "setpgid", "getcap", "setcap", "share",
+    "use", "call", "transfer",
+    # Misc common Android/kernel
+    "find", "add", "list", "set", "get", "mac_admin", "mac_override",
+    "setfscreate", "setsockcreate", "setrlimit", "setexec", "setcurrent",
+    "ioctl_getattr",
+})
+_AVC_PERM_SHAPE_RE = re.compile(r"^[a-z_]+$")
+
+# Common SELinux tclass values emitted as target_class.
+_SELINUX_TCLASS_CONSTANTS = frozenset({
+    "file", "dir", "lnk_file", "chr_file", "blk_file", "sock_file", "fifo_file",
+    "socket", "tcp_socket", "udp_socket", "rawip_socket", "netlink_socket",
+    "unix_stream_socket", "unix_dgram_socket", "binder", "fd", "process",
+    "capability", "cap_userns", "filesystem", "file_system", "key", "shm",
+    "sem", "msg", "msgq", "service", "hwservice_manager", "service_manager",
+    "property_service", "zygote", "anon_inode", "bpf", "perf_event",
+    "keystore2", "keystore2_key", "drmservice", "debuggerd",
 })
 _CONFIDENCE_CONSTANTS = frozenset({"LOW", "HIGH", "UNCONFIRMED", "MEDIUM"})
 _CAPTURE_KIND_CONSTANTS = frozenset({"bugreport", "pcap"})

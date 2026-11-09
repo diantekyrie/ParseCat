@@ -1277,10 +1277,11 @@ def test_cat_p3_selinux_permissions_list(ro_session):
     assert sel
     perms = sel[0]["permissions"]
     assert isinstance(perms, list)
-    # FE: only android.permission.* or package-shaped; AVC verbs + paths withheld.
+    # Cat QA120-8: SELinux AVC vocab verbs kept; path-shaped rejected;
+    # android.permission.* / package-shaped still pass (FE).
+    assert "read" in perms and "write" in perms and "getattr" in perms
     assert "android.permission.INTERNET" in perms
     assert "com.example.custom.PERM" in perms
-    assert "read" not in perms and "write" not in perms and "getattr" not in perms
     assert "../../etc/passwd" not in perms
     assert any(
         w.get("field") == "permissions" for w in (sel[0].get("withheld_fields") or [])
@@ -1427,9 +1428,14 @@ def test_fe_cdm_display_name_in_process_withheld(ro_session):
 def test_fe_executable_rejects_dotdot_and_empty_segments():
     from app.services.mcp_readonly import _executable_allowed
     assert _executable_allowed("/system/bin/surfaceflinger")
+    # FE: realistic partition prefixes that were false-positives.
+    assert _executable_allowed("/system_ext/bin/mosey_server")
+    assert _executable_allowed("/odm/bin/hw/vendor.foo-service")
     assert not _executable_allowed("/system/bin/../bin/sh")
     assert not _executable_allowed("/system/bin//sh")
     assert not _executable_allowed("/system/bin/./sh")
+    assert not _executable_allowed("/system_ext/bin/../bin/sh")
+    assert not _executable_allowed("/odm/bin/./hw")
 
 
 def test_arch_thread_allowlist_and_containment(ro_session):
@@ -2337,3 +2343,142 @@ def test_fe_outbound_gate_fuzz_preseed_db(writable_db, monkeypatch):
         "injections": injections,
         "tools": 3,
     }
+
+
+# --- Cat QA120-8: SELinux AVC permission vocabulary -------------------------
+
+
+def test_cat_qa120_8_avc_permissions_both_tools_both_ft_modes(ro_session, monkeypatch):
+    """QA120-8: avc { read write } → ['read','write'] on both tools × FT modes."""
+    session, ids, _ = ro_session
+    for ft in ("0", "1"):
+        monkeypatch.setenv("PARSECAT_MCP_INCLUDE_FREE_TEXT", ft)
+        facts_json = tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
+        facts = json.loads(facts_json)["facts"]
+        sel = [f for f in facts if f["category"] == "selinux"]
+        assert sel, ft
+        perms = sel[0]["permissions"]
+        assert "read" in perms and "write" in perms, (ft, perms)
+        one = json.loads(
+            tool_get_fact(fact_id=sel[0]["fact_id"], capture_id=ids["capture_cat"])
+        )
+        one_perms = one["fact"]["permissions"]
+        assert "read" in one_perms and "write" in one_perms, (ft, one_perms)
+
+
+def test_cat_qa120_8_non_vocab_and_label_word_withheld():
+    """QA120-8 negatives: unknown lowercase + label word withheld; Android ok."""
+    from app.services.mcp_readonly import _stamp, CaptureIdentity, apply_outbound_gate
+
+    ident = CaptureIdentity(label="Alice")
+    stamped = _stamp("selinux", 1, {
+        "timestamp": "08-19 12:00:00.000",
+        "permissions": [
+            "read", "write", "not_a_real_perm_xyz", "Alice",
+            "android.permission.INTERNET", "com.example.custom.PERM",
+        ],
+        "source_domain": "untrusted_app",
+        "target_type": "app_data_file",
+        "target_class": "file",
+        "verdict": "denied",
+        "confidence": "LOW",
+    }, identity=ident)
+    perms = stamped["permissions"]
+    assert "read" in perms and "write" in perms
+    assert "android.permission.INTERNET" in perms
+    assert "com.example.custom.PERM" in perms
+    assert "not_a_real_perm_xyz" not in perms
+    assert "Alice" not in perms
+    gated = apply_outbound_gate({"facts": [stamped]}, ident)
+    blob = json.dumps(gated)
+    assert "not_a_real_perm_xyz" not in blob
+    assert "Alice" not in blob
+
+
+def test_cat_qa120_8_android_perms_non_selinux_still_strict():
+    """FE Android rule unchanged outside selinux: short AVC verbs withheld."""
+    from app.services.mcp_readonly import _permission_item_ok
+
+    assert not _permission_item_ok("read", category="crash")
+    assert not _permission_item_ok("write", category=None)
+    assert _permission_item_ok("android.permission.INTERNET", category="crash")
+    assert _permission_item_ok("com.example.custom.PERM", category="crash")
+    assert _permission_item_ok("read", category="selinux")
+
+
+# --- FE: 116 JaneDoe variants PRE-tool DB-seeded regression -----------------
+
+
+_JANE_DOE_STEMS = ("JaneDoe", "Janedoe", "janeDoe", "janedoe")
+_JANE_DOE_SUFFIXES = (
+    "Service", "Exception", "Helper", "Manager", "Provider", "Activity",
+    "Receiver", "Worker", "Handler", "Controller", "Factory", "Builder",
+    "Impl", "Util", "Utils", "Client", "Server", "Module", "Component",
+    "Adapter", "Proxy", "Task", "Job", "Runnable", "Callback", "Listener",
+    "Observer", "Delegate", "Processor",
+)
+assert len(_JANE_DOE_STEMS) * len(_JANE_DOE_SUFFIXES) == 116
+
+
+def _jane_doe_116_variants() -> list[str]:
+    return [f"{stem}{suf}" for stem in _JANE_DOE_STEMS for suf in _JANE_DOE_SUFFIXES]
+
+
+def test_fe_jane_doe_116_variants_preseed_db(writable_db, monkeypatch):
+    """FE: 116 JaneDoe package/exception variants seeded before tools; absent out.
+
+    Uses capture_jane (device label "Jane Doe") so identity tokens
+    jane/doe/janedoe are live. Complements unit whole-word tests with a
+    PRE-tool DB regression across both fact tools.
+    """
+    from sqlmodel import Session, create_engine
+    from app.models.db_models import CrashEventRow
+
+    variants = _jane_doe_116_variants()
+    assert len(variants) == 116
+    assert len(set(variants)) == 116
+
+    db_path = writable_db["db_path"]
+    cap_id = writable_db["capture_jane"]
+    monkeypatch.setenv("PARSECAT_DB_PATH", str(db_path))
+    monkeypatch.setenv("PARSECAT_MCP_INCLUDE_FREE_TEXT", "0")
+
+    eng = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False},
+    )
+    with Session(eng) as s:
+        for i, var in enumerate(variants):
+            # Plant canary in both package and exception_class under live
+            # Jane Doe identity (tokens jane/doe/janedoe).
+            s.add(CrashEventRow(
+                capture_id=cap_id,
+                timestamp=f"08-19 16:{(i // 60):02d}:{(i % 60):02d}.000",
+                thread="main",
+                package=f"com.example.{var}",
+                pid=9000 + i,
+                exception_class=var,
+                message=None,
+                root_cause_class=None,
+                root_cause_message=None,
+                root_cause_frame=None,
+                source_section="system_log",
+                source_line_start=700 + i,
+                source_line_end=700 + i,
+            ))
+        s.commit()
+    eng.dispose()
+
+    facts_json = tool_get_verified_facts(capture_id=cap_id, limit=500)
+    facts_obj = json.loads(facts_json)
+    assert facts_obj["facts"], "expected seeded crash facts on capture_jane"
+    one_json = tool_get_fact(
+        fact_id=facts_obj["facts"][0]["fact_id"], capture_id=cap_id,
+    )
+    for blob, tool in ((facts_json, "get_verified_facts"), (one_json, "get_fact")):
+        for var in variants:
+            assert var not in blob, f"{tool} leaked JaneDoe variant {var!r}"
+    # Spot-check get_fact on a mid-list fact that carries a package canary.
+    mid = facts_obj["facts"][len(facts_obj["facts"]) // 2]
+    mid_json = tool_get_fact(fact_id=mid["fact_id"], capture_id=cap_id)
+    for var in variants:
+        assert var not in mid_json, f"get_fact mid leaked {var!r}"

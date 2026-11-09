@@ -461,8 +461,16 @@ pip install -r requirements.txt
 python -m app.mcp_server
 ```
 
-Tools: `list_captures`, `get_verified_facts(capture_id, category?, limit?)`,
+Tools: `list_captures(offset?, limit?)`,
+`get_verified_facts(capture_id, category?, limit?, offset?)`,
 `get_fact(fact_id, capture_id?)`.
+
+Privacy boundary: fail-closed per-tool allowlists (no device labels or
+filenames), capture-scoped results (no sibling-capture bleed), read-time
+`redact_pii` + key-like + MAC scrubbing on free text, byte/string/work
+caps, and log-derived summary/detail wrapped as `untrusted_log_text`
+(evidence only — never instructions). Stdio only; a local MCP client may
+still forward returned facts to its model provider.
 
 ### Client config (official formats)
 

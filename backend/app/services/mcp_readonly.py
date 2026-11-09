@@ -241,24 +241,107 @@ def assert_engine_is_readonly(engine) -> None:
 
 # --- capture identity (exact + containment token checks) --------------------
 
-# Token length floors (Arch):
-#   * Label / SSID / device *word* tokens: >= 3 chars after NFKC+casefold.
-#     Tradeoff: short real words ("Bob", "Lee", "Doe") over-withhold when they
-#     appear inside otherwise-benign identifiers (e.g. com.example.BobException,
-#     or any leaf containing "Doe" when the label is "Jane Doe").
-#   * Filename basename/stem: >= 4 chars, so "12.txt" → stem "12" never tokens
-#     and cannot punch holes in timestamps / reason codes.
-#   * Numeric identities (serial / IMEI-like): >= 8 digits, digit-boundary only.
-_IDENTITY_WORD_MIN_LEN = 3
+# Word / high-entropy floors (Arch):
+#   * Label words: whole-word match only, min length 2 after NFKC+casefold.
+#     Tokenize on case changes, digit boundaries, and punctuation so
+#     AlarmException → {alarm, exception} and worker-Jane_Doe → {worker, jane, doe}.
+#     Whole-word matching stops Al from hitting AlarmException.
+#   * Stoplist: common device/diagnostic words are never label tokens; a label
+#     made only of stoplist words is not gated (not identifying).
+#   * Substring containment is reserved for high-entropy tokens only:
+#     filename stems/basenames of 4+ chars, serials, SSIDs/BSSIDs, numeric
+#     IDs of 8+ digits (digit-boundary), and key prefixes.
+# Residuals intentionally not chased (over-withhold destroys ground truth):
+#   short filename stems (<4), serials under 8 digits, short key fragments.
+_IDENTITY_WORD_MIN_LEN = 2
 _IDENTITY_FILENAME_PART_MIN_LEN = 4
 _IDENTITY_NUMERIC_MIN_LEN = 8
 
-_WORD_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+# Generated server IDs (fact_id.py: vf_ + 16 lowercase hex). Exempt from
+# containment once the value matches; key-prefix checks still apply.
+_FACT_ID_RE = re.compile(r"^vf_[0-9a-f]{16}$")
+
+_LABEL_STOPLIST_BASE = frozenset({
+    "test", "pixel", "phone", "galaxy", "android", "device", "google",
+    "samsung", "crash", "wifi", "bt", "debug", "main", "work", "home", "lab",
+})
 
 
 def _norm_token(value: str) -> str:
     """NFKC + casefold so Bob/BOB and Straße/STRASSE compare equal."""
     return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _nfkc(value: str) -> str:
+    return unicodedata.normalize("NFKC", value)
+
+
+def _has_non_ascii_digit(value: str) -> bool:
+    """True when any digit is non-ASCII (e.g. full-width １２３)."""
+    return any(ch.isdigit() and not ("0" <= ch <= "9") for ch in value)
+
+
+def _tokenize_words(value: str) -> list[str]:
+    """NFKC, split on case/digit/punctuation, casefold; keep len >= min.
+
+    Unicode letters (e.g. ß in Straße) are preserved until casefold so
+    Straße → strasse, matching STRASSEException's strasse word.
+    """
+    if not value:
+        return []
+    text = _nfkc(value)
+    # CamelCase / acronyms / digit boundaries while case is intact.
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
+    text = re.sub(r"([A-Za-z])(\d)", r"\1 \2", text)
+    text = re.sub(r"(\d)([A-Za-z])", r"\1 \2", text)
+    # Punctuation / underscore / hyphen → separators; keep Unicode letters.
+    text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
+    text = text.replace("_", " ")
+    out: list[str] = []
+    for w in text.split():
+        cf = w.casefold()
+        if len(cf) >= _IDENTITY_WORD_MIN_LEN:
+            out.append(cf)
+    return out
+
+
+def _label_stoplist() -> frozenset[str]:
+    """Base device/diagnostic words + tokens from fixed enum/allowlist sets.
+
+    Resolved at call time so enum frozensets defined later in this module are
+    visible. Labels composed only of stoplist words produce no gate tokens.
+    """
+    words: set[str] = set(_LABEL_STOPLIST_BASE)
+    for bucket in (
+        _THREAD_EXACT,
+        _PRIORITY_NAME_ALLOWED,
+        _REASON_NAME_ALLOWED,
+        _WIFI_KIND_ALLOWED,
+        _MEMORY_KIND_ALLOWED,
+        _PAIRING_KIND_ALLOWED,
+        _VERDICT_ALLOWED,
+        _CONFIDENCE_CONSTANTS,
+        _CAPTURE_KIND_CONSTANTS,
+        FACT_KIND_KEYS.keys(),
+    ):
+        for item in bucket:
+            if isinstance(item, str):
+                words.update(_tokenize_words(item))
+    for item in _ALLOWED_SOURCE_SECTIONS:
+        words.update(_tokenize_words(item))
+    return frozenset(words)
+
+
+def _is_generated_id(value: str, path: str) -> bool:
+    """True for server-generated IDs verified against their exact format."""
+    if _FACT_ID_RE.fullmatch(value):
+        return True
+    leaf = path.split(".")[-1].split("[")[0] if path else ""
+    # capture_id is normally an int; if it appears as a decimal string, exempt.
+    if leaf == "capture_id" and value.isdigit():
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -270,63 +353,97 @@ class CaptureIdentity:
     bssids: frozenset[str] = field(default_factory=frozenset)
     device_ids: frozenset[str] = field(default_factory=frozenset)
 
-    def _add_word_tokens(self, raw: str, out: set[str], *, min_len: int) -> None:
-        if not raw:
-            return
-        out.add(raw)
-        for word in _WORD_TOKEN_RE.findall(raw):
-            if len(_norm_token(word)) >= min_len and not word.isdigit():
-                out.add(word)
+    def label_word_tokens(self) -> frozenset[str]:
+        """Whole-word label tokens (NFKC+casefold), minus stoplist.
 
-    def _text_tokens(self, *, include_filename_parts: bool) -> set[str]:
+        Empty when the label is missing or only stoplist words — those labels
+        are not identifying and are not gated (Arch usefulness).
+        """
+        if not self.label:
+            return frozenset()
+        stop = _label_stoplist()
+        words = {
+            w for w in _tokenize_words(self.label)
+            if w not in stop and not w.isdigit()
+        }
+        return frozenset(words)
+
+    def high_entropy_substring_tokens(self, *, include_filename_parts: bool) -> frozenset[str]:
+        """Serials / SSID / BSSID / filename parts for substring containment."""
         out: set[str] = set()
-        if self.label:
-            # Multi-word labels → each word token gated separately (Arch 2c),
-            # so a first name in one field and a last name in another both hit.
-            self._add_word_tokens(self.label, out, min_len=_IDENTITY_WORD_MIN_LEN)
         if self.filename:
-            out.add(self.filename)
+            out.add(_nfkc(self.filename))
             if include_filename_parts:
                 base = Path(self.filename).name
                 stem = Path(self.filename).stem
                 for part in (base, stem):
-                    if (
-                        len(_norm_token(part)) >= _IDENTITY_FILENAME_PART_MIN_LEN
-                        and not part.isdigit()
-                    ):
-                        out.add(part)
+                    n = _norm_token(part)
+                    if len(n) >= _IDENTITY_FILENAME_PART_MIN_LEN and not n.isdigit():
+                        out.add(_nfkc(part))
         for s in self.ssids:
-            self._add_word_tokens(s, out, min_len=_IDENTITY_WORD_MIN_LEN)
+            if s:
+                out.add(_nfkc(s))
+        for b in self.bssids:
+            if b:
+                out.add(_nfkc(b))
+        if self.serial:
+            serial_n = _nfkc(self.serial)
+            # Digit-only serials go through numeric_identity_tokens (8+).
+            if not serial_n.isdigit() and len(_norm_token(serial_n)) >= 4:
+                out.add(serial_n)
         for d in self.device_ids:
-            # Pure digit device ids go through numeric_identity_tokens.
-            if d.isdigit():
+            if not d:
                 continue
-            self._add_word_tokens(d, out, min_len=_IDENTITY_WORD_MIN_LEN)
-        if self.serial and not self.serial.isdigit():
-            self._add_word_tokens(self.serial, out, min_len=_IDENTITY_WORD_MIN_LEN)
-        return out
+            dn = _nfkc(d)
+            if dn.isdigit():
+                continue
+            if len(_norm_token(dn)) >= 4:
+                out.add(dn)
+        return frozenset(out)
 
     def exact_identifier_tokens(self) -> frozenset[str]:
-        return frozenset(self._text_tokens(include_filename_parts=True))
+        out: set[str] = set()
+        if self.label:
+            out.add(self.label)
+            out.add(_nfkc(self.label))
+        if self.filename:
+            out.add(self.filename)
+            out.add(_nfkc(self.filename))
+        if self.serial:
+            out.add(self.serial)
+            out.add(_nfkc(self.serial))
+        out.update(self.ssids)
+        out.update(_nfkc(s) for s in self.ssids)
+        out.update(self.device_ids)
+        out.update(_nfkc(d) for d in self.device_ids if d)
+        return frozenset(out)
 
     def containment_tokens(self) -> frozenset[str]:
-        """Text tokens incl. filename parts for free-form leaves."""
-        return frozenset(self._text_tokens(include_filename_parts=True))
+        """Union of label words + high-entropy tokens (incl. filename parts).
+
+        Prefer label_word_tokens / high_entropy_substring_tokens for new checks;
+        kept for callers and tests that inspect the combined set.
+        """
+        return frozenset(
+            set(self.label_word_tokens())
+            | set(self.high_entropy_substring_tokens(include_filename_parts=True))
+        )
 
     def containment_tokens_without_filename_parts(self) -> frozenset[str]:
-        """Label/ssid/device/full-filename words — not basename/stem.
-
-        Filename stems like ``crash`` (crash.zip) must not null package
-        segments such as ``com.example.crash``.
-        """
-        return frozenset(self._text_tokens(include_filename_parts=False))
+        return frozenset(
+            set(self.label_word_tokens())
+            | set(self.high_entropy_substring_tokens(include_filename_parts=False))
+        )
 
     def numeric_identity_tokens(self) -> frozenset[str]:
-        """Digit-only identities (serial etc.) with length >= 8."""
+        """Digit-only identities (NFKC-normalized) with length >= 8."""
         out: set[str] = set()
         for v in (self.serial, *self.device_ids):
-            if isinstance(v, str) and v.isdigit() and len(v) >= _IDENTITY_NUMERIC_MIN_LEN:
-                out.add(v)
+            if not isinstance(v, str) or not v:
+                continue
+            n = _nfkc(v)
+            if n.isdigit() and len(n) >= _IDENTITY_NUMERIC_MIN_LEN:
+                out.add(n)
         return frozenset(out)
 
     def free_text_scrub_tokens(self) -> frozenset[str]:
@@ -334,6 +451,7 @@ class CaptureIdentity:
         for v in (self.label, self.serial):
             if isinstance(v, str) and v:
                 out.add(v)
+                out.add(_nfkc(v))
         out.update(s for s in self.ssids if s)
         out.update(b for b in self.bssids if b)
         if isinstance(self.filename, str) and self.filename:
@@ -341,12 +459,9 @@ class CaptureIdentity:
             base = Path(self.filename).name
             stem = Path(self.filename).stem
             for part in (base, stem):
-                if len(part) >= _IDENTITY_FILENAME_PART_MIN_LEN and not part.isdigit():
+                if len(_norm_token(part)) >= _IDENTITY_FILENAME_PART_MIN_LEN and not part.isdigit():
                     out.add(part)
-        if self.label:
-            for word in _WORD_TOKEN_RE.findall(self.label):
-                if len(_norm_token(word)) >= _IDENTITY_WORD_MIN_LEN and not word.isdigit():
-                    out.add(word)
+        out.update(self.label_word_tokens())
         out.update(self.numeric_identity_tokens())
         return frozenset(out)
 
@@ -359,10 +474,11 @@ def load_capture_identity(session: Session, capture_id: int) -> CaptureIdentity:
     serial = info.serial if info is not None else None
     device_ids: set[str] = set()
     if info is not None:
-        # manufacturer is NOT identifying (Arch usefulness): com.google.* /
-        # com.samsung.* packages must survive when manufacturer is Google/Samsung.
+        # manufacturer and build_fingerprint are NOT identifying (Arch
+        # usefulness): vendor packages / fingerprint vendor words must survive.
+        # Keep serial (and model/hardware/radio/network).
         for attr in (
-            "serial", "build_fingerprint", "build_id", "model",
+            "serial", "build_id", "model",
             "hardware", "radio", "network",
         ):
             val = getattr(info, attr, None)
@@ -631,14 +747,19 @@ def scrub_text(text: str | None, **_ignored: Any) -> str | None:
 
 
 def _thread_allowed(value: str) -> bool:
-    if len(value) > MAX_THREAD_CHARS:
+    # Reject full-width / non-ASCII digits before patterns (Arch): Binder:１２３…_
+    # must not pass via NFKC→ASCII. Then match patterns on the NFKC form.
+    if _has_non_ascii_digit(value):
         return False
-    if value in _THREAD_EXACT:
+    norm = _nfkc(value)
+    if len(norm) > MAX_THREAD_CHARS:
+        return False
+    if norm in _THREAD_EXACT or value in _THREAD_EXACT:
         return True
-    if any(p.fullmatch(value) for p in _THREAD_PATTERNS):
+    if any(p.fullmatch(norm) for p in _THREAD_PATTERNS):
         return True
     # Package-shaped thread names (some apps name threads after the package).
-    if _PACKAGE_RE.fullmatch(value):
+    if _PACKAGE_RE.fullmatch(norm):
         return True
     return False
 
@@ -707,6 +828,16 @@ def _kind_allowed(category_hint: str | None, value: str) -> bool:
 
 
 def _shape_ok(kind: str, value: str, *, category: str | None = None) -> bool:
+    # Safe identifier patterns are ASCII-digit only (Arch). Full-width digits
+    # in Binder:/Thread-/pool- shapes are withheld even though NFKC would
+    # make them look legitimate.
+    if kind in {
+        "thread", "executable", "package", "package_or_app", "java_class",
+        "process", "comm", "tag", "selinux_id", "uid_token", "generic",
+        "section", "signal_name", "signal_code", "proc_state", "device_profile",
+        "timestamp", "confidence",
+    } and _has_non_ascii_digit(value):
+        return False
     if kind == "package":
         return bool(_PACKAGE_RE.fullmatch(value)) and len(value) <= MAX_IDENTIFIER_CHARS
     if kind == "package_or_app":
@@ -789,12 +920,6 @@ _WITHHELD_REASON_CODES = frozenset({
 _NUMERIC_ID_IN_TEXT_RE = re.compile(r"(?<!\d)(\d{8,})(?!\d)")
 
 
-def _contains_identity(value: str, identity: CaptureIdentity | None) -> bool:
-    if identity is None:
-        return False
-    return _contains_token(value, identity.containment_tokens(), segment=False)
-
-
 def _exact_identity_match(value: str, identity: CaptureIdentity | None) -> bool:
     if identity is None:
         return False
@@ -803,13 +928,50 @@ def _exact_identity_match(value: str, identity: CaptureIdentity | None) -> bool:
 
 
 def _contains_numeric_identity(value: str, identity: CaptureIdentity | None) -> bool:
-    """Digit-boundary match for serials / IMEI-like ids (>= 8 digits)."""
+    """Digit-boundary match on NFKC form for serials / IMEI-like ids (>= 8)."""
     if identity is None:
         return False
     nums = identity.numeric_identity_tokens()
     if not nums:
         return False
-    return any(m.group(1) in nums for m in _NUMERIC_ID_IN_TEXT_RE.finditer(value))
+    norm = _nfkc(value)
+    return any(m.group(1) in nums for m in _NUMERIC_ID_IN_TEXT_RE.finditer(norm))
+
+
+def _whole_word_label_hit(value: str, identity: CaptureIdentity) -> bool:
+    """True when any leaf word equals any label word (NFKC+casefold)."""
+    label_words = identity.label_word_tokens()
+    if not label_words:
+        return False
+    return bool(set(_tokenize_words(value)) & label_words)
+
+
+def _substring_high_entropy_hit(
+    value: str,
+    identity: CaptureIdentity,
+    *,
+    include_filename_parts: bool,
+) -> bool:
+    norm = _nfkc(value)
+    norm_cf = norm.casefold()
+    for tok in identity.high_entropy_substring_tokens(
+        include_filename_parts=include_filename_parts,
+    ):
+        t = _nfkc(tok)
+        if t and t.casefold() in norm_cf:
+            return True
+    return False
+
+
+def _contains_identity(value: str, identity: CaptureIdentity | None) -> bool:
+    """Label whole-word + high-entropy substring (incl. filename parts)."""
+    if identity is None:
+        return False
+    if _whole_word_label_hit(value, identity):
+        return True
+    if _contains_numeric_identity(value, identity):
+        return True
+    return _substring_high_entropy_hit(value, identity, include_filename_parts=True)
 
 
 def _sanitize_withheld_entry(
@@ -1083,13 +1245,13 @@ def _path_is_package_like(path: str) -> bool:
 
 
 def _contains_token(value: str, tokens: frozenset[str], *, segment: bool) -> bool:
-    """Containment with NFKC + casefold (Arch 2a)."""
-    norm_val = _norm_token(value)
+    """Substring containment with NFKC + casefold (high-entropy tokens only)."""
+    norm_val = _nfkc(value).casefold()
     if not segment:
-        return any(_norm_token(tok) in norm_val for tok in tokens)
-    segs = [s for s in re.split(r"[.$:]", value) if s]
-    seg_norm = {_norm_token(s) for s in segs}
-    return any(_norm_token(tok) in seg_norm for tok in tokens)
+        return any(_nfkc(tok).casefold() in norm_val for tok in tokens if tok)
+    segs = [s for s in re.split(r"[.$:]", _nfkc(value)) if s]
+    seg_norm = {s.casefold() for s in segs}
+    return any(_nfkc(tok).casefold() in seg_norm for tok in tokens if tok)
 
 
 def _leaf_hits_gate(
@@ -1099,23 +1261,30 @@ def _leaf_hits_gate(
     path: str,
     skip_containment: bool,
 ) -> str | None:
-    """Return withhold reason or None. Never mutates text."""
+    """Return withhold reason or None. Never mutates text.
+
+    Order: key-prefix → generated-ID exemption → exact → numeric (NFKC) →
+    label whole-word → high-entropy substring (filename stem skipped on
+    package-like paths).
+    """
     if _has_key_prefix(value):
         return "key-shaped"
+    # Server-generated IDs (vf_ + 16 hex, numeric capture_id strings) are exempt
+    # from containment so short labels like Ed/Ada cannot null fact_ids.
+    if _is_generated_id(value, path):
+        return None
     if skip_containment or identity is None:
         return None
     if _exact_identity_match(value, identity):
         return "identity"
     if _contains_numeric_identity(value, identity):
         return "identity"
-    if _path_is_package_like(path):
-        # Substring vs label/serial/ssid/full-filename (NOT filename stem/basename),
-        # so EscapeLabel99Exception is caught while com.example.crash survives crash.zip.
-        tokens = identity.containment_tokens_without_filename_parts()
-        if _contains_token(value, tokens, segment=False):
-            return "identity"
-        return None
-    if _contains_token(value, identity.containment_tokens(), segment=False):
+    if _whole_word_label_hit(value, identity):
+        return "identity"
+    include_fn = not _path_is_package_like(path)
+    if _substring_high_entropy_hit(
+        value, identity, include_filename_parts=include_fn,
+    ):
         return "identity"
     return None
 

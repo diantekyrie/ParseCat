@@ -1192,10 +1192,11 @@ def build_diagnosis_bundle(
         # with a concrete, repeated failure
         # ("Action REQUEST_TRANSPORT FAILED to activate") that a generic
         # W/E-level catch-all found even though it wasn't hand-anticipated.
-        # Also include the raw Bluetooth HCI and packet-capture summaries
-        # here (previously computed and shown on the dashboard but never
-        # actually reached the LLM bundle at all) since a pairing/network
-        # question is exactly when they're relevant.
+        # Also include the raw Bluetooth HCI summary here (previously
+        # computed and shown on the dashboard but never actually reached
+        # the LLM bundle at all) since a pairing/network question is
+        # exactly when it's relevant. Packet-capture evidence is gated
+        # separately on want_wifi or want_pairing (#118).
         pairing_events = session.exec(
             select(CdmPairingEventRow).where(CdmPairingEventRow.capture_id.in_(sibling_capture_ids))
         ).all()
@@ -1290,6 +1291,12 @@ def build_diagnosis_bundle(
                         ) or (e.status_code or 0) != 0
                     ],
                 })
+    # #118: pcap evidence was gated on want_pairing only. Wi-Fi / disconnect
+    # questions set want_wifi (PAIRING_TRIGGER_RE's \bconnect\w* does not
+    # match "disconnect"), so deauth reason codes in the pcap never reached
+    # the LLM. Include packet_capture_summary / packet_analysis when either
+    # trigger matches; pairing/BT HCI stay under want_pairing above.
+    if want_wifi or want_pairing:
         pcap_rows = session.exec(
             select(PacketCaptureSummaryRow).where(PacketCaptureSummaryRow.capture_id.in_(sibling_capture_ids))
         ).all()

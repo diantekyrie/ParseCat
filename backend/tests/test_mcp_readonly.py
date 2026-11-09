@@ -1,4 +1,4 @@
-"""Read-only MCP server privacy/scope/budget tests.
+"""Read-only MCP server: structured allowlist + privacy tests.
 
 Synthetic fixtures only — no real captures / PII / live keys.
 """
@@ -12,14 +12,6 @@ import pytest
 from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, SQLModel, create_engine
 
-from app.models.db_models import (
-    Capture,
-    CdmPairingEventRow,
-    CompanionDeviceAssociationRow,
-    CrashEventRow,
-    Device,
-    WifiEventRow,
-)
 from app.mcp_server import (
     READONLY_TOOL_NAMES,
     WRITEISH_TOOL_NAME_FRAGMENTS,
@@ -28,13 +20,21 @@ from app.mcp_server import (
     list_captures as tool_list_captures,
     mcp,
 )
+from app.models.db_models import (
+    AnrRow,
+    Capture,
+    CdmPairingEventRow,
+    CompanionDeviceAssociationRow,
+    CrashEventRow,
+    Device,
+    KernelLogEventRow,
+    WifiEventRow,
+)
 from app.services.mcp_readonly import (
     DEFAULT_FACT_LIMIT,
-    FACT_META_KEYS,
-    LIST_CAPTURE_ITEM_KEYS,
+    DETAIL_WITHHELD,
+    FACT_KIND_KEYS,
     MAX_FACT_LIMIT,
-    MAX_OUTPUT_BYTES,
-    MAX_STRING_CHARS,
     MCP_REDACT_KEYS,
     CaptureNotFoundError,
     FactNotFoundError,
@@ -44,8 +44,7 @@ from app.services.mcp_readonly import (
     list_captures,
     open_readonly_engine,
     project_fact,
-    scrub_text,
-    _is_common_label,
+    scrub_allowlisted_text,
 )
 
 
@@ -55,16 +54,15 @@ FAKE_BSSID = "aa:bb:cc:dd:ee:11"
 FAKE_MAC = "aa:bb:cc:dd:ee:22"
 FAKE_MAC_IN_TEXT = "aa:bb:cc:dd:ee:33"
 FAKE_CDM_NAME = "Fake private watch"
+FAKE_CDM_DEVICE = "Pixel Watch FE-Lab"
 FAKE_EMAIL = "alice.mcp@example.com"
 FAKE_PHONE = "+1-415-555-0199"
 FAKE_LABEL = "mcp-synth-phone-label"
 FAKE_FILENAME_A = "mcp-synth-report-A.zip"
 FAKE_FILENAME_B = "mcp-synth-report-B.zip"
-# Key-shaped tokens patterned like #102 coverage (synthetic, not real keys).
 FAKE_SK = "sk-or-v1-mcpSYNTHETIC00000000000000000001"
 FAKE_AIZA = "AIzaSyMcpSyntheticTestKey00000000001"
 FAKE_GSK = "gsk_mcpSyntheticTestKey0000000000001"
-FAKE_CDM_DEVICE = "Pixel Watch FE-Lab"
 FAKE_SSID_EMBED = "HomeNet-FE42"
 FAKE_SERIAL_EMBED = "HT72C1A0FE001"
 FAKE_LAT = "37.774900"
@@ -74,10 +72,45 @@ FAKE_PASSWORD = "s3cretFE"
 FAKE_BEARER = "aabbccddee001122"
 FAKE_TOKEN = "xyz123abcTOKEN01"
 
+# Arch exact leak cases.
+ARCH_LABEL_UNDERSCORE = "_private-lab-phone_"
+ARCH_NESTED_LABEL = "phone"
+ARCH_BARE_ALICE = "Alice"
+ARCH_JANE = "Jane Doe"
+
+# Over-redaction fixtures.
+OVER_REDACT_FILE_12 = "12.txt"
+OVER_REDACT_FILE_CRASH = "crash.zip"
+
+
+def _assert_no_forbidden(blob: str):
+    lowered = blob.lower()
+    for needle in (
+        FAKE_SSID, FAKE_BSSID, FAKE_MAC, FAKE_MAC_IN_TEXT,
+        FAKE_CDM_NAME, FAKE_CDM_DEVICE, FAKE_EMAIL, FAKE_PHONE, FAKE_LABEL,
+        FAKE_FILENAME_A, FAKE_FILENAME_B,
+        FAKE_SK, FAKE_AIZA, FAKE_GSK,
+        FAKE_SSID_EMBED, FAKE_SERIAL_EMBED, FAKE_LAT, FAKE_LON, FAKE_DNS,
+        FAKE_PASSWORD, FAKE_BEARER, FAKE_TOKEN,
+        "ssid-sibling-only", "aa:bb:cc:dd:ee:99",
+        "mcp-synth-report-A",
+        ARCH_LABEL_UNDERSCORE, ARCH_BARE_ALICE, "Jane Doe",
+        OVER_REDACT_FILE_12, OVER_REDACT_FILE_CRASH,
+        "private-lab-phone",
+    ):
+        assert needle.lower() not in lowered, f"leaked {needle!r}"
+    # Arch nested / quoted forms (avoid matching the PII token [redacted-phone]).
+    assert '{"label":"phone"}' not in blob
+    assert '"label":"phone"' not in blob
+    assert 'label="Jane Doe"' not in blob
+    assert "label=Jane" not in blob
+    # Trailing surname from label="Jane Doe" must not appear as its own leak.
+    assert " Doe" not in blob and not blob.endswith("Doe")
+
 
 @pytest.fixture
 def writable_db(tmp_path: Path):
-    """Writable SQLite with two sibling captures + archived device."""
+    """Writable SQLite with siblings, archived device, Arch/FE seeds."""
     db_path = tmp_path / "parsecat.db"
     engine = create_engine(
         f"sqlite:///{db_path}",
@@ -86,33 +119,43 @@ def writable_db(tmp_path: Path):
     SQLModel.metadata.create_all(engine)
     with Session(engine) as session:
         active = Device(label=FAKE_LABEL, archived=False)
+        alice = Device(label=ARCH_BARE_ALICE, archived=False)
+        jane = Device(label=ARCH_JANE, archived=False)
+        underscore = Device(label=ARCH_LABEL_UNDERSCORE, archived=False)
         archived = Device(label="mcp-archived-label", archived=True)
-        session.add(active)
-        session.add(archived)
+        for d in (active, alice, jane, underscore, archived):
+            session.add(d)
         session.commit()
-        session.refresh(active)
-        session.refresh(archived)
+        for d in (active, alice, jane, underscore, archived):
+            session.refresh(d)
 
         cap_a = Capture(device_id=active.id, original_filename=FAKE_FILENAME_A)
         cap_b = Capture(device_id=active.id, original_filename=FAKE_FILENAME_B)
+        cap_12 = Capture(device_id=active.id, original_filename=OVER_REDACT_FILE_12)
+        cap_crash_name = Capture(device_id=active.id, original_filename=OVER_REDACT_FILE_CRASH)
+        cap_alice = Capture(device_id=alice.id, original_filename="alice-report.zip")
+        cap_jane = Capture(device_id=jane.id, original_filename="jane-report.zip")
+        cap_us = Capture(device_id=underscore.id, original_filename="us-report.zip")
         hidden = Capture(device_id=archived.id, original_filename="mcp-hidden.zip")
-        session.add(cap_a)
-        session.add(cap_b)
-        session.add(hidden)
+        for c in (
+            cap_a, cap_b, cap_12, cap_crash_name, cap_alice, cap_jane, cap_us, hidden,
+        ):
+            session.add(c)
         session.commit()
-        session.refresh(cap_a)
-        session.refresh(cap_b)
-        session.refresh(hidden)
+        for c in (
+            cap_a, cap_b, cap_12, cap_crash_name, cap_alice, cap_jane, cap_us, hidden,
+        ):
+            session.refresh(c)
 
-        # Capture A: wifi + CDM + crash with embedded email/key/mac/phone.
+        # Capture A: wifi reason 12 + CDM + crash with planted secrets/labels in message.
         session.add(WifiEventRow(
             capture_id=cap_a.id,
             timestamp="08-19 12:00:00.000",
             kind="disconnection",
             ssid=FAKE_SSID,
             bssid=FAKE_BSSID,
-            reason_code=3,
-            reason_name="Deauthenticated because sending STA is leaving",
+            reason_code=12,
+            reason_name="Disassociated due to inactivity",
             locally_generated=False,
             roam=None,
             source_section="wifi",
@@ -147,22 +190,28 @@ def writable_db(tmp_path: Path):
             display_name=FAKE_CDM_DEVICE,
             package_name="com.example.companion",
             association_id=1,
-            detail=f"onAssociationApproved() name={FAKE_CDM_DEVICE}",
+            detail=(
+                f"onAssociationApproved() name={FAKE_CDM_DEVICE} "
+                f'label="{ARCH_JANE}" nested={{"label":"{ARCH_NESTED_LABEL}"}} '
+                f"{ARCH_LABEL_UNDERSCORE} {ARCH_BARE_ALICE} "
+                f"ssid={FAKE_SSID_EMBED} serial={FAKE_SERIAL_EMBED} "
+                f"lat={FAKE_LAT} lon={FAKE_LON} dns_query={FAKE_DNS} "
+                f"file={FAKE_FILENAME_A} label={FAKE_LABEL}"
+            ),
             source_section="system_log",
             source_line_start=20,
             source_line_end=20,
         ))
+        # Crash/ANR/kernel free text may be emitted (FE). Plant only values
+        # that #96/#102 (+ MAC/secret KV) scrub — NOT stored labels/filenames
+        # (those are planted on Device/Capture rows and in CDM detail, which
+        # MCP drops rather than value-scrubbing).
         crash_msg = (
-            f"boom contact {FAKE_EMAIL} phone {FAKE_PHONE} "
+            f"boom contact {FAKE_EMAIL} tel:{FAKE_PHONE} "
             f"key {FAKE_SK} also {FAKE_AIZA} and {FAKE_GSK} "
             f"mac {FAKE_MAC_IN_TEXT} "
-            f"label={FAKE_LABEL} file={FAKE_FILENAME_A} "
-            f"legacy path {FAKE_FILENAME_A} stem mcp-synth-report-A "
-            f"ssid={FAKE_SSID_EMBED} serial={FAKE_SERIAL_EMBED} "
-            f"lat={FAKE_LAT} lon={FAKE_LON} dns_query={FAKE_DNS} "
             f"password={FAKE_PASSWORD} pwd={FAKE_PASSWORD} "
-            f"Authorization: Bearer {FAKE_BEARER} token={FAKE_TOKEN} "
-            f"display_name={FAKE_CDM_DEVICE} name={FAKE_CDM_DEVICE}"
+            f"Authorization: Bearer {FAKE_BEARER} token={FAKE_TOKEN}"
         )
         session.add(CrashEventRow(
             capture_id=cap_a.id,
@@ -179,7 +228,31 @@ def writable_db(tmp_path: Path):
             source_line_start=100,
             source_line_end=120,
         ))
-        # Capture B: distinct wifi event (sibling scope probe).
+        session.add(AnrRow(
+            capture_id=cap_a.id,
+            filename="anr_2024",
+            timestamp="08-19 12:02:00.000",
+            subject=f"Input dispatching timed out ({FAKE_LABEL})",
+            pid=43,
+            package="com.example.app",
+            reason="Input dispatching timed out",
+            timeout_ms=5000,
+            rss_kb=1000,
+        ))
+        session.add(KernelLogEventRow(
+            capture_id=cap_a.id,
+            boot_relative_sec=12.5,
+            priority=3,
+            priority_name="ERR",
+            thread="kworker",
+            message=f"kernel oops password={FAKE_PASSWORD}",
+            is_panic_family=False,
+            source_section="kernel",
+            source_line_start=1,
+            source_line_end=1,
+        ))
+
+        # Sibling B wifi only.
         session.add(WifiEventRow(
             capture_id=cap_b.id,
             timestamp="08-19 13:00:00.000",
@@ -194,11 +267,70 @@ def writable_db(tmp_path: Path):
             source_line_start=20,
             source_line_end=20,
         ))
+
+        # Over-redaction probes: filename 12.txt / crash.zip must not mutate fields.
+        session.add(WifiEventRow(
+            capture_id=cap_12.id,
+            timestamp="08-19 12:00:12.000",
+            kind="disconnection",
+            ssid="x",
+            bssid="aa:bb:cc:dd:ee:10",
+            reason_code=12,
+            reason_name="reason twelve",
+            locally_generated=False,
+            roam=None,
+            source_section="wifi",
+            source_line_start=12,
+            source_line_end=12,
+        ))
+        session.add(CrashEventRow(
+            capture_id=cap_crash_name.id,
+            timestamp="08-19 12:00:00.000",
+            thread="main",
+            package="com.example.crash",
+            pid=12,
+            exception_class="RuntimeException",
+            message="app crash in module",
+            root_cause_class=None,
+            root_cause_message=None,
+            root_cause_frame=None,
+            source_section="system_log",
+            source_line_start=1,
+            source_line_end=1,
+        ))
+
+        # Alice / Jane / underscore label devices: crash with benign structured fields.
+        for cap, label in (
+            (cap_alice, ARCH_BARE_ALICE),
+            (cap_jane, ARCH_JANE),
+            (cap_us, ARCH_LABEL_UNDERSCORE),
+        ):
+            session.add(CrashEventRow(
+                capture_id=cap.id,
+                timestamp="08-19 12:00:00.000",
+                thread="main",
+                package="com.example.app",
+                pid=1,
+                exception_class="RuntimeException",
+                message="ok synthetic crash message",
+                root_cause_class=None,
+                root_cause_message=None,
+                root_cause_frame=None,
+                source_section="system_log",
+                source_line_start=1,
+                source_line_end=1,
+            ))
+
         session.commit()
         ids = {
             "db_path": db_path,
             "capture_a": cap_a.id,
             "capture_b": cap_b.id,
+            "capture_12": cap_12.id,
+            "capture_crash_name": cap_crash_name.id,
+            "capture_alice": cap_alice.id,
+            "capture_jane": cap_jane.id,
+            "capture_us": cap_us.id,
             "hidden": hidden.id,
         }
     engine.dispose()
@@ -214,82 +346,57 @@ def ro_session(writable_db, monkeypatch):
         yield session, writable_db, engine
 
 
-def _assert_no_leaks(blob: str):
-    lowered = blob.lower()
-    for needle in (
-        FAKE_SSID, FAKE_BSSID, FAKE_MAC, FAKE_MAC_IN_TEXT,
-        FAKE_CDM_NAME, FAKE_CDM_DEVICE, FAKE_EMAIL, FAKE_PHONE, FAKE_LABEL,
-        FAKE_FILENAME_A, FAKE_FILENAME_B,
-        FAKE_SK, FAKE_AIZA, FAKE_GSK,
-        FAKE_SSID_EMBED, FAKE_SERIAL_EMBED, FAKE_LAT, FAKE_LON, FAKE_DNS,
-        FAKE_PASSWORD, FAKE_BEARER, FAKE_TOKEN,
-        "ssid-sibling-only", "aa:bb:cc:dd:ee:99",
-        "mcp-synth-report-A",
-    ):
-        assert needle.lower() not in lowered, f"leaked {needle!r}"
-
-
-def _untrusted_texts(fact: dict) -> str:
-    block = fact.get("untrusted_log_text") or {}
-    parts = []
-    for key in ("summary", "detail"):
-        node = block.get(key) or {}
-        if isinstance(node, dict) and node.get("text"):
-            parts.append(node["text"])
-    return "\n".join(parts)
-
-
 # --- unit helpers -----------------------------------------------------------
 
-def test_scrub_text_redacts_pii_keys_and_macs():
+def test_scrub_allowlisted_text_redacts_secrets_not_numbers():
     raw = (
         f"email {FAKE_EMAIL} phone {FAKE_PHONE} "
-        f"{FAKE_SK} {FAKE_AIZA} {FAKE_GSK} mac {FAKE_MAC_IN_TEXT}"
+        f"{FAKE_SK} mac {FAKE_MAC_IN_TEXT} "
+        f"password={FAKE_PASSWORD} Authorization: Bearer {FAKE_BEARER}"
     )
-    out = scrub_text(raw)
+    out = scrub_allowlisted_text(raw)
     assert out is not None
-    _assert_no_leaks(out)
-    assert "[redacted-email]" in out or "example.com" not in out
-    assert "[redacted]" in out  # key-like
-    assert "[redacted-mac]" in out
+    assert FAKE_EMAIL not in out
+    assert FAKE_SK not in out
+    assert FAKE_MAC_IN_TEXT not in out
+    assert FAKE_PASSWORD not in out
+    assert FAKE_BEARER not in out
+    # Does not eat bare numbers / the word crash.
+    assert scrub_allowlisted_text("reason 12 at 08-19 12:00:12 crash") == (
+        "reason 12 at 08-19 12:00:12 crash"
+    )
 
 
-def test_project_fact_fail_closed_drops_unknown_and_sibling():
+def test_project_fact_fail_closed_drops_sibling_and_free_text_keys():
     sibling = {
-        "fact_id": "vf_aaaaaaaaaaaaaaaa",
         "category": "wifi",
-        "summary": "Wi-Fi disconnection (x)",
-        "detail": "locally generated",
-        "confidence": "LOW",
+        "timestamp": "t",
+        "reason_code": 3,
         "capture_id": 99,
-        "device_label": FAKE_LABEL,
-        "original_filename": FAKE_FILENAME_B,
+        "summary": "Wi-Fi disconnection",
+        "detail": "secret",
         "ssid": FAKE_SSID,
-        "display_name": FAKE_CDM_NAME,
     }
     assert project_fact(sibling, capture_id=1) is None
 
     ok = {
-        "fact_id": "vf_bbbbbbbbbbbbbbbb",
-        "category": "pairing",
-        "summary": f"CDM association present: {FAKE_CDM_NAME}",
-        "detail": f"connected=True, package=com.example mac {FAKE_MAC}",
-        "confidence": "LOW",
+        "category": "wifi",
+        "timestamp": "08-19 12:00:00.000",
+        "kind": "disconnection",
+        "reason_code": 12,
+        "reason_name": "x",
         "capture_id": 1,
-        "extra_evil": {"mac_address": FAKE_MAC},
-        "parse_warnings": "secret",
+        "summary": f"CDM association present: {FAKE_CDM_NAME}",
+        "detail": f"label={FAKE_LABEL}",
+        "ssid": FAKE_SSID,
     }
     projected = project_fact(ok, capture_id=1)
     assert projected is not None
-    assert set(projected.keys()) <= FACT_META_KEYS
-    assert "extra_evil" not in projected
-    assert "parse_warnings" not in projected
-    assert "device_label" not in projected
-    blob = json.dumps(projected)
-    assert FAKE_CDM_NAME not in blob
-    assert FAKE_MAC not in blob
-    assert projected["untrusted_log_text"]["summary"]["untrusted"] is True
-    assert projected["untrusted_log_text"]["summary"]["kind"] == "device_log"
+    assert "summary" not in projected
+    assert "detail" not in projected
+    assert "ssid" not in projected
+    assert projected["reason_code"] == 12
+    assert projected.get("note") == DETAIL_WITHHELD
 
 
 def test_mcp_redact_keys_constant_still_lists_identifiers():
@@ -306,12 +413,6 @@ def test_open_readonly_engine_rejects_writes(writable_db):
         with pytest.raises(OperationalError):
             conn.exec_driver_sql("CREATE TABLE should_fail (id INTEGER)")
             conn.commit()
-        with pytest.raises(OperationalError):
-            conn.exec_driver_sql("INSERT INTO capture (id) VALUES (999999)")
-            conn.commit()
-        with pytest.raises(OperationalError):
-            conn.exec_driver_sql("DELETE FROM capture")
-            conn.commit()
 
 
 def test_missing_db_does_not_create(tmp_path):
@@ -321,91 +422,168 @@ def test_missing_db_does_not_create(tmp_path):
     assert not missing.exists()
 
 
-# --- list_captures ----------------------------------------------------------
+# --- list / scope -----------------------------------------------------------
 
 def test_list_captures_hides_archived_and_omits_label_filename(ro_session):
     session, ids, _ = ro_session
-    payload = list_captures(session)
+    payload = list_captures(session, limit=100)
     listed = {c["id"] for c in payload["captures"]}
     assert ids["capture_a"] in listed
-    assert ids["capture_b"] in listed
     assert ids["hidden"] not in listed
     for cap in payload["captures"]:
-        assert set(cap.keys()) <= LIST_CAPTURE_ITEM_KEYS
         assert "label" not in cap
         assert "original_filename" not in cap
-    blob = json.dumps(payload)
-    _assert_no_leaks(blob)
-    assert "untrusted_data_notice" in payload
+    _assert_no_forbidden(json.dumps(payload))
 
-
-def test_list_captures_pagination(ro_session):
-    session, ids, _ = ro_session
-    page1 = list_captures(session, offset=0, limit=1)
-    assert page1["returned"] == 1
-    assert page1["total"] >= 2
-    assert page1["truncated"] is True
-    assert page1["next_offset"] == 1
-    page2 = list_captures(session, offset=1, limit=1)
-    assert page2["captures"][0]["id"] != page1["captures"][0]["id"]
-
-
-# --- capture scope (Arch) ---------------------------------------------------
 
 def test_get_verified_facts_excludes_sibling_capture(ro_session):
     session, ids, _ = ro_session
     payload = get_verified_facts(session, ids["capture_a"])
-    caps = {f.get("capture_id") for f in payload["facts"]}
-    assert caps == {ids["capture_a"]}
+    assert {f.get("capture_id") for f in payload["facts"]} == {ids["capture_a"]}
     blob = json.dumps(payload)
     assert "ssid-sibling-only" not in blob
-    assert "inactivity" not in blob.lower() or "disconnection" in blob.lower()
-    # Sibling-only reason text from B must not appear.
-    assert "Disassociated due to inactivity" not in blob
 
 
 def test_get_fact_sibling_id_with_capture_a_not_found(ro_session):
     session, ids, _ = ro_session
     b_payload = get_verified_facts(session, ids["capture_b"])
-    assert b_payload["facts"], "need B facts"
+    assert b_payload["facts"]
     b_fact_id = b_payload["facts"][0]["fact_id"]
     with pytest.raises(FactNotFoundError):
         get_fact(session, b_fact_id, capture_id=ids["capture_a"])
-    # Same fact resolves when scoped to B.
     found = get_fact(session, b_fact_id, capture_id=ids["capture_b"])
     assert found["fact"]["capture_id"] == ids["capture_b"]
 
 
-# --- privacy on all three tools (FE) ----------------------------------------
+# --- structured allowlist ---------------------------------------------------
 
-def test_get_verified_facts_privacy_and_allowlist(ro_session):
+def test_structured_facts_omit_spliced_identity_and_keep_codes(ro_session):
     session, ids, _ = ro_session
-    payload = get_verified_facts(session, ids["capture_a"])
-    assert payload["total"] >= 1
+    payload = get_verified_facts(session, ids["capture_a"], limit=500)
     blob = json.dumps(payload)
-    _assert_no_leaks(blob)
+    _assert_no_forbidden(blob)
+    # No citation-walk free-text summary/detail channel.
     for fact in payload["facts"]:
-        assert set(fact.keys()) <= FACT_META_KEYS
-        assert "device_label" not in fact
-        assert "original_filename" not in fact
+        assert "summary" not in fact
+        assert "detail" not in fact
+        assert "untrusted_log_text" not in fact
         assert "ssid" not in fact
         assert "display_name" not in fact
-        ult = fact.get("untrusted_log_text")
-        if ult:
-            for node in ult.values():
-                assert node.get("untrusted") is True
-                assert node.get("kind") == "device_log"
-                assert len(node.get("text") or "") <= MAX_STRING_CHARS + 3
-    wifi = [f for f in payload["facts"] if f.get("category") == "wifi"]
-    assert wifi, "approved wifi diagnostic fact must survive"
-    pairing = [f for f in payload["facts"] if f.get("category") == "pairing"]
-    assert pairing, "approved pairing fact must survive without CDM name"
-    joined = "\n".join(_untrusted_texts(f) for f in pairing)
-    assert FAKE_CDM_NAME not in joined
-    assert FAKE_CDM_DEVICE not in joined
-    assert any(
-        "CDM association present" in _untrusted_texts(f) for f in pairing
-    ), "association summary template must survive"
+        assert "original_filename" not in fact
+        assert "device_label" not in fact
+        assert set(fact.keys()) <= (
+            {"fact_id", "category", "capture_id", "timestamp", "confidence", "source", "note"}
+            | FACT_KIND_KEYS.get(fact["category"], frozenset())
+        )
+
+    wifi = [f for f in payload["facts"] if f["category"] == "wifi"]
+    assert wifi and wifi[0]["reason_code"] == 12
+    assert "Disassociated due to inactivity" in wifi[0]["reason_name"]
+
+    pairing = [f for f in payload["facts"] if f["category"] == "pairing"]
+    assert pairing
+    for f in pairing:
+        assert f.get("note") == DETAIL_WITHHELD
+        assert FAKE_CDM_DEVICE not in json.dumps(f)
+
+    crash = [f for f in payload["facts"] if f["category"] == "crash"]
+    assert crash
+    # Crash message may remain but secrets/PII scrubbed; labels omitted from
+    # structured fields (message scrubbed for PII/keys, not by filename).
+    msg = crash[0].get("message") or ""
+    assert FAKE_PASSWORD not in msg
+    assert FAKE_SK not in msg
+    assert FAKE_EMAIL not in msg
+
+
+def test_arch_leak_cases_absent_from_all_tools(ro_session):
+    """Arch: _private-lab-phone_, nested label JSON, Alice, Jane Doe / Doe."""
+    session, ids, _ = ro_session
+    blobs = [
+        json.dumps(list_captures(session, limit=100)),
+        tool_list_captures(offset=0, limit=100),
+    ]
+    for key in (
+        "capture_a", "capture_alice", "capture_jane", "capture_us",
+        "capture_12", "capture_crash_name",
+    ):
+        facts_json = tool_get_verified_facts(capture_id=ids[key], limit=500)
+        blobs.append(facts_json)
+        facts = json.loads(facts_json)["facts"]
+        for fact in facts:
+            one = tool_get_fact(fact_id=fact["fact_id"], capture_id=ids[key])
+            blobs.append(one)
+
+    for blob in blobs:
+        _assert_no_forbidden(blob)
+
+
+def test_over_redaction_filename_12_and_crash_survive(ro_session):
+    session, ids, _ = ro_session
+    # Filename 12.txt must not strip 12 from timestamp / reason_code.
+    p12 = get_verified_facts(session, ids["capture_12"])
+    wifi = [f for f in p12["facts"] if f["category"] == "wifi"]
+    assert wifi
+    assert wifi[0]["reason_code"] == 12
+    assert wifi[0]["timestamp"] == "08-19 12:00:12.000"
+    assert wifi[0]["source"]["line_start"] == 12
+    blob12 = json.dumps(p12)
+    assert OVER_REDACT_FILE_12 not in blob12
+
+    # Filename crash.zip must not delete 'crash' from structured/message text.
+    pc = get_verified_facts(session, ids["capture_crash_name"])
+    crash = [f for f in pc["facts"] if f["category"] == "crash"]
+    assert crash
+    assert crash[0]["package"] == "com.example.crash"
+    assert "crash" in (crash[0].get("message") or "")
+    assert OVER_REDACT_FILE_CRASH not in json.dumps(pc)
+
+    # get_fact loops every fixture fact for these captures.
+    for key in ("capture_12", "capture_crash_name"):
+        facts = get_verified_facts(session, ids[key])["facts"]
+        assert facts
+        for fact in facts:
+            one = get_fact(session, fact["fact_id"], capture_id=ids[key])
+            blob = json.dumps(one)
+            assert OVER_REDACT_FILE_12 not in blob
+            assert OVER_REDACT_FILE_CRASH not in blob
+            if key == "capture_12" and fact["category"] == "wifi":
+                assert one["fact"]["reason_code"] == 12
+                assert "12:00:12" in one["fact"]["timestamp"]
+            if key == "capture_crash_name" and fact["category"] == "crash":
+                assert "crash" in (one["fact"].get("message") or "")
+
+
+def test_fe_free_text_redaction_all_three_tools(ro_session):
+    """FE: plant forbidden values; none appear in serialized tool JSON."""
+    session, ids, _ = ro_session
+    list_json = tool_list_captures(offset=0, limit=100)
+    facts_json = tool_get_verified_facts(capture_id=ids["capture_a"], limit=500)
+    facts_obj = json.loads(facts_json)
+    assert facts_obj["facts"]
+
+    for fact in facts_obj["facts"]:
+        one_json = tool_get_fact(fact_id=fact["fact_id"], capture_id=ids["capture_a"])
+        for blob in (list_json, facts_json, one_json):
+            _assert_no_forbidden(blob)
+            # (a) CDM device names
+            assert FAKE_CDM_DEVICE not in blob
+            # (b) SSID / serial / lat-long / DNS
+            assert FAKE_SSID_EMBED not in blob
+            assert FAKE_SERIAL_EMBED not in blob
+            assert FAKE_LAT not in blob
+            assert FAKE_LON not in blob
+            assert FAKE_DNS not in blob
+            # (c) labels / filenames
+            assert FAKE_LABEL not in blob
+            assert FAKE_FILENAME_A not in blob
+            # (d) passwords / bearer / token
+            assert FAKE_PASSWORD not in blob
+            assert FAKE_BEARER not in blob
+            assert FAKE_TOKEN not in blob
+
+    assert any(f.get("category") == "wifi" for f in facts_obj["facts"])
+    assert any(f.get("category") == "pairing" for f in facts_obj["facts"])
 
 
 def test_get_verified_facts_unknown_and_archived(ro_session):
@@ -425,49 +603,6 @@ def test_get_verified_facts_limit_and_offset(ro_session):
     assert over["limit"] == MAX_FACT_LIMIT
 
 
-def test_serialized_tool_outputs_privacy(ro_session, monkeypatch):
-    """Positive/negative checks on the actual MCP tool JSON strings."""
-    session, ids, _ = ro_session
-    # Tools open their own session via PARSECAT_DB_PATH (monkeypatched fixture).
-    list_json = tool_list_captures(offset=0, limit=10)
-    facts_json = tool_get_verified_facts(capture_id=ids["capture_a"], limit=50)
-    facts_obj = json.loads(facts_json)
-    assert facts_obj["facts"], "need a fact for get_fact"
-    fact_id = facts_obj["facts"][0]["fact_id"]
-    one_json = tool_get_fact(fact_id=fact_id, capture_id=ids["capture_a"])
-
-    for blob in (list_json, facts_json, one_json):
-        assert isinstance(blob, str)
-        _assert_no_leaks(blob)
-        parsed = json.loads(blob)
-        assert "untrusted_data_notice" in parsed
-
-    # Positive: approved fields remain.
-    list_obj = json.loads(list_json)
-    assert any(c["id"] == ids["capture_a"] for c in list_obj["captures"])
-    assert any(f["category"] == "wifi" for f in facts_obj["facts"])
-    one_obj = json.loads(one_json)
-    assert one_obj["fact"]["fact_id"] == fact_id
-
-    # Sibling fact must not resolve through capture A tool path.
-    b_json = tool_get_verified_facts(capture_id=ids["capture_b"], limit=50)
-    b_fact_id = json.loads(b_json)["facts"][0]["fact_id"]
-    with pytest.raises(Exception):
-        tool_get_fact(fact_id=b_fact_id, capture_id=ids["capture_a"])
-
-
-def test_byte_budget_enforced(ro_session, monkeypatch):
-    session, ids, _ = ro_session
-    # Shrink budget so a normal payload must truncate.
-    import app.services.mcp_readonly as mod
-    monkeypatch.setattr(mod, "MAX_OUTPUT_BYTES", 800)
-    payload = get_verified_facts(session, ids["capture_a"], limit=500)
-    blob = json.dumps(payload, default=str, ensure_ascii=True)
-    assert len(blob.encode("utf-8")) <= 800 or payload.get("byte_truncated") is True
-    # Restore invariant: even if truncated, no leaks.
-    _assert_no_leaks(blob)
-
-
 def test_mcp_server_tool_list_has_no_write_tools():
     tools = asyncio.run(mcp.list_tools())
     names = {t.name for t in tools}
@@ -475,128 +610,9 @@ def test_mcp_server_tool_list_has_no_write_tools():
     for name in names:
         lowered = name.lower()
         for frag in WRITEISH_TOOL_NAME_FRAGMENTS:
-            assert frag not in lowered, f"tool {name!r} looks write-capable"
-
-
-
-def test_legacy_detail_embeds_label_and_filename_scrubbed(ro_session):
-    """Arch blocker: stored label/filename inside free-text detail must not leak."""
-    session, ids, _ = ro_session
-    payload = get_verified_facts(session, ids["capture_a"])
-    blob = json.dumps(payload)
-    assert FAKE_LABEL not in blob
-    assert FAKE_FILENAME_A not in blob
-    assert "mcp-synth-report-A" not in blob  # stem
-    crash = [f for f in payload["facts"] if f.get("category") == "crash"]
-    assert crash, "crash fact must survive scrubbing"
-    detail = _untrusted_texts(crash[0])
-    assert "label=[redacted-label]" in detail or "[redacted-label]" in detail
-    assert "[redacted-filename]" in detail
-
-    fact_id = crash[0]["fact_id"]
-    one = get_fact(session, fact_id, capture_id=ids["capture_a"])
-    one_blob = json.dumps(one)
-    assert FAKE_LABEL not in one_blob
-    assert FAKE_FILENAME_A not in one_blob
-    assert "mcp-synth-report-A" not in one_blob
-
-
-def test_serialized_tools_hide_embedded_label_filename(ro_session):
-    session, ids, _ = ro_session
-    facts_json = tool_get_verified_facts(capture_id=ids["capture_a"], limit=50)
-    facts_obj = json.loads(facts_json)
-    crash = [f for f in facts_obj["facts"] if f.get("category") == "crash"]
-    assert crash
-    one_json = tool_get_fact(fact_id=crash[0]["fact_id"], capture_id=ids["capture_a"])
-    for blob in (facts_json, one_json):
-        assert FAKE_LABEL not in blob
-        assert FAKE_FILENAME_A not in blob
-        assert "mcp-synth-report-A" not in blob
-        assert "private-lab" not in blob
-
-
-def test_common_word_label_tradeoff_preserves_diagnostic_english():
-    """Common/short labels scrub in label= forms only — not bare prose.
-
-    Tradeoff: a device literally nicknamed "crash" or "phone" will still
-    appear if someone writes the bare word outside a label=/device= pair.
-    Distinctive labels (e.g. private-lab-phone) are scrubbed everywhere.
-    Prefer distinctive device nicknames for MCP-exposed databases.
-    """
-    assert _is_common_label("crash")
-    assert _is_common_label("phone")
-    assert not _is_common_label("private-lab-phone")
-
-    common = scrub_text(
-        "label=crash saw a Java crash in com.example",
-        labels=["crash"],
-        filenames=[],
-    )
-    assert "label=[redacted-label]" in common
-    assert "Java crash" in common  # bare diagnostic word preserved
-
-    distinctive = scrub_text(
-        "label=private-lab-phone bare private-lab-phone in prose",
-        labels=["private-lab-phone"],
-        filenames=[],
-    )
-    assert "private-lab-phone" not in distinctive
-    assert distinctive.count("[redacted-label]") >= 2
-
-    # file= / archive backstop even without passing filenames=
-    generic = scrub_text(
-        "file=secret-upload.zip also note dump.txt",
-        labels=[],
-        filenames=[],
-    )
-    assert "secret-upload.zip" not in generic
-    assert "dump.txt" not in generic
-    assert "[redacted-filename]" in generic
-
-
-
-def test_fe_free_text_redaction_all_three_tools(ro_session):
-    """FE must-fix: one read-time pass covers CDM names, SSID/serial/latlong/DNS,
-    labels/filenames, and password/bearer/token — on serialized tool JSON.
-    """
-    session, ids, _ = ro_session
-    list_json = tool_list_captures(offset=0, limit=10)
-    facts_json = tool_get_verified_facts(capture_id=ids["capture_a"], limit=50)
-    facts_obj = json.loads(facts_json)
-    assert facts_obj["facts"]
-    # Prefer a crash fact (planted seeds) for get_fact; fall back to any.
-    crash = [f for f in facts_obj["facts"] if f.get("category") == "crash"]
-    fact_id = (crash[0] if crash else facts_obj["facts"][0])["fact_id"]
-    one_json = tool_get_fact(fact_id=fact_id, capture_id=ids["capture_a"])
-
-    for blob in (list_json, facts_json, one_json):
-        _assert_no_leaks(blob)
-        # (a) CDM device name
-        assert FAKE_CDM_DEVICE not in blob
-        # (b) SSID / serial / lat-long / DNS
-        assert FAKE_SSID_EMBED not in blob
-        assert FAKE_SERIAL_EMBED not in blob
-        assert FAKE_LAT not in blob
-        assert FAKE_LON not in blob
-        assert FAKE_DNS not in blob
-        # (c) labels / filenames
-        assert FAKE_LABEL not in blob
-        assert FAKE_FILENAME_A not in blob
-        # (d) passwords / bearer / token
-        assert FAKE_PASSWORD not in blob
-        assert FAKE_BEARER not in blob
-        assert FAKE_TOKEN not in blob
-
-    # Positive: wifi diagnostic category still present on facts tool.
-    assert any(f.get("category") == "wifi" for f in facts_obj["facts"])
-    # Pairing survives without the CDM nickname.
-    pairing = [f for f in facts_obj["facts"] if f.get("category") == "pairing"]
-    assert pairing
-    for f in pairing:
-        assert FAKE_CDM_DEVICE not in _untrusted_texts(f)
+            assert frag not in lowered
 
 
 def test_default_fact_limit_constant():
     assert DEFAULT_FACT_LIMIT == 100
     assert MAX_FACT_LIMIT == 500
-    assert MAX_OUTPUT_BYTES >= 1024

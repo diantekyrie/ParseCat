@@ -465,11 +465,13 @@ Tools: `list_captures(offset?, limit?)`,
 `get_verified_facts(capture_id, category?, limit?, offset?)`,
 `get_fact(fact_id, capture_id?)`.
 
-Privacy boundary: fail-closed per-tool allowlists (no device labels or
-filenames), capture-scoped results (no sibling-capture bleed), read-time
-`redact_pii` + key-like + MAC scrubbing on free text, byte/string/work
-caps, and log-derived summary/detail wrapped as `untrusted_log_text`
-(evidence only — never instructions). Stdio only; a local MCP client may
+Privacy boundary: fail-closed per-kind allowlists of structured parser
+fields (reason codes, timestamps, PIDs, packages, severities, counts;
+capture IDs instead of filenames). Labels, filenames, CDM display names,
+SSID/BSSID/MAC/serial, and coordinates are omitted — never spliced into
+MCP text. Crash/ANR/kernel parser message text may appear after #96
+`redact_pii` + key-shaped scrubbing (not label/filename value scrubbing).
+Capture-scoped (no sibling bleed). Stdio only; a local MCP client may
 still forward returned facts to its model provider.
 
 ### Client config (official formats)

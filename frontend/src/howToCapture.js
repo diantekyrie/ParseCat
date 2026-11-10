@@ -35,7 +35,7 @@ export const HOW_TO_CAPTURE_STEPS = [
     id: "limits",
     title: "Honest limits",
     body:
-      "If snoop was off or the OEM wrote no classic btsnoop file, ParseCat reports that HCI was not found — it does not invent traffic. HCI decode here is framing-level (connect/disconnect/command status), not full L2CAP/profile disassembly.",
+      "If snoop was off or the OEM wrote no classic btsnoop file, ParseCat reports that HCI was not found — it does not invent traffic. HCI decode covers connection/disconnection, authentication, encryption, link-key/pairing events, and command status — not full L2CAP/profile disassembly.",
   },
 ];
 

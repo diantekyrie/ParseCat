@@ -14,6 +14,7 @@ import {
 import DiagnosisStory, { IdentityStrip } from "./DiagnosisStory";
 import { getAuthHeader, logoutSession, notifyUnauthorized, refreshAccessToken } from "./authSession.js";
 import HowToCapturePanel from "./HowToCapturePanel";
+import { providerOptionDisabled, providerOptionLabel } from "./providerOptions.js";
 
 const SEVERITY_COLOR = { critical: "var(--red)", warning: "var(--amber)", info: "var(--blue)" };
 const CONFIDENCE_COLOR = { HIGH: "var(--green)", MEDIUM: "var(--amber)", LOW: "var(--orange)", UNCONFIRMED: "var(--muted)" };
@@ -381,23 +382,9 @@ const BYOK_PROVIDERS = [
 ];
 const BYOK_PROVIDER_ID_SET = new Set(BYOK_PROVIDERS.map((p) => p.id));
 
-// Issue #87: the "Narrated by" dropdown used to read ONLY p.available/
-// p.disabled_reason from GET /api/llm/providers, which reflects the
-// OPERATOR's own server-env key -- it had no idea a user had saved their
-// own BYOK key for that provider, so it kept showing "(no key set)" and
-// disabling the option even though Settings correctly said "Saved to your
-// account" and the backend (_resolve_byok) would actually use it. A saved
-// BYOK key always wins over the operator's key when both exist (see
-// _resolve_byok), so these two helpers check byokStatus FIRST.
-function providerOptionLabel(p, byokStatus) {
-  if (byokStatus?.[p.id]?.configured) return `${p.label} (your key)`;
-  if (p.available) return p.label;
-  return `${p.label}${p.disabled_reason === "egress_gated" ? " (third-party send disabled)" : " (no key set)"}`;
-}
-
-function providerOptionDisabled(p, byokStatus) {
-  return !p.available && !byokStatus?.[p.id]?.configured;
-}
+// Issue #87 (see providerOptions.js for the full rationale and its unit
+// tests): a saved BYOK key always wins over the operator's key when both
+// exist, so these two helpers check byokStatus FIRST.
 
 function ByokProviderCard({
   providerId, label, keyHint, modelPlaceholder,

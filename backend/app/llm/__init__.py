@@ -138,11 +138,24 @@ def list_providers() -> list[dict]:
     return out
 
 
-# Fixed id reported as `narrated_by` when a visitor-supplied (BYOK) key ran
-# the narration (#84). Deliberately a constant: the response must never
-# carry the key, a key prefix, the visitor's model string, or any other
-# echoed request field -- only "which kind of client actually ran".
-BYOK_PROVIDER_ID = "openrouter-byok"
+def byok_narrated_by(provider: str) -> str:
+    """The id reported as `narrated_by` when a saved/visitor-supplied (BYOK)
+    key ran the narration (#84). Never carries the key, a key prefix, the
+    caller's model string, or any other echoed request field -- only "which
+    kind of client actually ran", derived from the fixed `provider` id, not
+    from caller input.
+
+    One id per BYOK-capable provider, not a single constant (Arch review on
+    #123): BYOK originally covered only OpenRouter, back when a single
+    "openrouter-byok" constant was accurate for every BYOK call by
+    definition. Now that BYOK_PROVIDER_IDS also covers anthropic/openai/
+    grok, a single constant would mislabel every one of those as OpenRouter
+    -- the exact kind of narration-attribution bug #84 was filed to prevent,
+    just reintroduced one layer up. `provider` here is always a validated
+    member of BYOK_PROVIDER_IDS by the time this is called (see
+    get_byok_client's own check), never raw caller input.
+    """
+    return f"{provider}-byok"
 
 KNOWN_PROVIDER_IDS = frozenset(p["id"] for p in PROVIDERS)
 

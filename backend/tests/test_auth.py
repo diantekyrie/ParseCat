@@ -125,6 +125,34 @@ def test_valid_token_passes_through(client):
     assert r.status_code == 404  # past the gate -- FastAPI's own unmatched-route 404
 
 
+def test_session_secret_is_fixed_across_calls_when_env_var_is_set(monkeypatch):
+    """Arch review on #123: with more than one worker/instance sharing a
+    deploy, each process calling _load_session_secret() with no env var set
+    would get its OWN random secret, so a token signed by worker A fails
+    verification on worker B -- indistinguishable from a real expired
+    session to the user. Setting PARSECAT_SESSION_SECRET must make every
+    call (standing in for every worker) agree on the same bytes."""
+    from app.auth import _load_session_secret
+
+    monkeypatch.setenv("PARSECAT_SESSION_SECRET", "fixed-secret-for-every-worker")
+    first = _load_session_secret()
+    second = _load_session_secret()
+    assert first == second == b"fixed-secret-for-every-worker"
+
+
+def test_session_secret_is_random_per_call_when_env_var_unset(monkeypatch):
+    """The default (unset) behavior is unchanged: each call gets its own
+    fresh random secret, matching the module's existing intent (a restart
+    invalidates every outstanding session) for a single-process deploy."""
+    from app.auth import _load_session_secret
+
+    monkeypatch.delenv("PARSECAT_SESSION_SECRET", raising=False)
+    first = _load_session_secret()
+    second = _load_session_secret()
+    assert first != second
+    assert len(first) == 32
+
+
 def test_login_with_no_users_provisioned_is_503():
     c = _no_users_client()
     with c:

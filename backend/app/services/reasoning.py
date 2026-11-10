@@ -17,7 +17,7 @@ from sqlmodel import Session
 
 from sqlmodel import select
 
-from app.llm import BYOK_PROVIDER_ID, get_byok_client, get_llm_client, resolve_provider_id
+from app.llm import byok_narrated_by, get_byok_client, get_llm_client, resolve_provider_id
 from app.models.db_models import (
     AnrBlockingThreadRow,
     AnrMainThreadSnapshotRow,
@@ -1820,9 +1820,11 @@ def _run_llm(
     """Returns (report_text, llm_error, narrated_by).
 
     `narrated_by` is the provider id that actually produced report_text
-    (#84) -- BYOK_PROVIDER_ID when a visitor key ran, else the id
-    get_llm_client resolved (including auto-detect for provider=None). It
-    is always a fixed id from app.llm, never the key, a key prefix, the
+    (#84) -- byok_narrated_by(provider) when a saved/visitor key ran (one
+    id per BYOK provider since #123's multi-provider BYOK, never a single
+    constant -- see that function's docstring), else the id get_llm_client
+    resolved (including auto-detect for provider=None). It is always a
+    fixed id derived from app.llm, never the key, a key prefix, the
     visitor's model string, or the echoed request `provider`. None when
     narration failed (nothing was narrated) or the id can't be resolved,
     so the UI shows no source label rather than a wrong one.
@@ -1848,7 +1850,7 @@ def _run_llm(
         # the right one to use for the BYOK client too.
         if byok_key:
             llm = get_byok_client(provider, byok_key, byok_model)
-            narrated_by = BYOK_PROVIDER_ID
+            narrated_by = byok_narrated_by(provider)
         else:
             llm = get_llm_client(provider)
             narrated_by = resolve_provider_id(provider)

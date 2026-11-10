@@ -9,6 +9,15 @@ test_api_user_flows.py::test_diagnose_unknown_provider_...); the new
 `narrated_by` field carries only a fixed provider id -- never the key, a
 key prefix, the visitor's model string, or an echoed request field.
 
+Arch review on #123: BYOK originally covered only OpenRouter, so a single
+"openrouter-byok" constant was accurate by definition. #123 widened BYOK to
+anthropic/openai/grok too without updating this -- every one of those would
+have collapsed onto the OpenRouter label, mislabelling who actually
+narrated (the exact #84 bug, reintroduced one layer up). byok_narrated_by()
+now derives a per-provider id ("anthropic-byok", "grok-byok", ...);
+`test_scan_with_anthropic_byok_reports_its_own_id_not_openrouters` below
+pins the cross-provider case that was wrong before this fix.
+
 HTTP-level via TestClient, synthetic in-memory captures only, and the BYOK
 client is faked: no network calls, no real keys.
 """
@@ -16,7 +25,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.llm import BYOK_ENV, BYOK_PROVIDER_ID, EGRESS_ENV, resolve_provider_id
+from app.llm import BYOK_ENV, EGRESS_ENV, byok_narrated_by, resolve_provider_id
 from app.services import reasoning
 
 # Reuse the HTTP client fixture + synthetic upload helper.
@@ -71,9 +80,29 @@ def test_scan_with_byok_reports_byok_id_not_the_requested_provider(client, fake_
     assert resp.status_code == 200
     body = resp.json()
     assert body["report"].endswith("live BYOK narration (fake)")
-    assert body["narrated_by"] == "openrouter-byok" == BYOK_PROVIDER_ID
+    assert body["narrated_by"] == "openrouter-byok" == byok_narrated_by("openrouter")
     assert body["provider"] == "openrouter"  # requested value still echoed
     assert fake_byok == [("openrouter", DUMMY_KEY, DUMMY_MODEL)]
+    _assert_no_key_leak(resp)
+
+
+def test_scan_with_anthropic_byok_reports_its_own_id_not_openrouters(client, fake_byok):
+    # Arch review on #123: the bug this pins. Before byok_narrated_by(),
+    # EVERY BYOK provider's narrated_by was the single hardcoded
+    # "openrouter-byok" constant -- a saved Anthropic key would have
+    # narrated the capture but been labelled "OpenRouter (your key)" in
+    # the UI, mislabelling who actually ran it.
+    capture_id = _upload_txt(client, "Pixel").json()["capture_id"]
+    resp = client.post(
+        f"/api/captures/{capture_id}/scan",
+        data={"provider": "anthropic", "byok_api_key": DUMMY_KEY, "byok_model": DUMMY_MODEL},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["narrated_by"] == "anthropic-byok" == byok_narrated_by("anthropic")
+    assert body["narrated_by"] != "openrouter-byok"
+    assert body["provider"] == "anthropic"
+    assert fake_byok == [("anthropic", DUMMY_KEY, DUMMY_MODEL)]
     _assert_no_key_leak(resp)
 
 

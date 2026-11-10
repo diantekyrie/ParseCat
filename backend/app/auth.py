@@ -55,6 +55,7 @@ _DEFAULT_SESSION_TIMEOUT_SECONDS = 15 * 60
 REFRESH_TOKEN_DAYS_ENV = "PARSECAT_REFRESH_TOKEN_DAYS"
 _DEFAULT_REFRESH_TOKEN_DAYS = 30
 REFRESH_COOKIE_NAME = "parsecat_refresh"
+SESSION_SECRET_ENV = "PARSECAT_SESSION_SECRET"
 
 # Exempt so a host's liveness probe (Render's optional Health Check Path, or
 # any uptime monitor) can work without a session, and so the auth endpoints
@@ -66,10 +67,33 @@ _EXEMPT_PATHS = frozenset({
     "/api/health", "/api/auth/login", "/api/auth/refresh", "/api/auth/logout",
 })
 
-# Signs session tokens. Generated fresh every process start, never persisted
-# -- a restart invalidates every outstanding session, which fits the intent
-# here (periodic forced re-auth) rather than something to work around.
-_SESSION_SECRET = secrets.token_bytes(32)
+
+def _load_session_secret() -> bytes:
+    """Signs session tokens. Defaults to a fresh random secret generated at
+    process start, never persisted -- a restart invalidates every
+    outstanding session, which fits the intent here (periodic forced
+    re-auth) for a single process.
+
+    That default breaks across more than one process sharing traffic for
+    the same deploy (multiple gunicorn/uvicorn workers, or multiple
+    instances behind a load balancer): each gets its OWN random secret, so
+    a token signed by worker A fails verification on worker B -- indistinguishable
+    from a real expired session to the user, who just sees random logouts.
+    Set PARSECAT_SESSION_SECRET (any non-empty string; a random 32+ byte
+    value, e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`)
+    to a FIXED value shared by every worker/instance before running more
+    than one process. Leave it unset for local dev or a confirmed
+    single-process deploy, where the random-per-start default is strictly
+    better (forced re-auth on every restart, nothing to leak if the process
+    memory is ever dumped).
+    """
+    raw = os.environ.get(SESSION_SECRET_ENV)
+    if raw:
+        return raw.encode("utf-8")
+    return secrets.token_bytes(32)
+
+
+_SESSION_SECRET = _load_session_secret()
 
 # Paid at login time whenever the username doesn't match a real account, so
 # a request for a nonexistent user costs roughly the same wall-clock time as

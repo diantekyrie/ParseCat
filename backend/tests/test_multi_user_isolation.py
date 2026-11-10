@@ -114,6 +114,69 @@ def test_cannot_read_another_users_capture_summary(client):
     assert as_other.status_code == 404  # not 403 -- never confirms the id exists to a non-owner
 
 
+def test_cannot_diagnose_another_users_capture(client):
+    # Arch review on #123: summary was tested, but diagnose/scan -- the
+    # routes that actually reach narration, and where a user's own BYOK key
+    # would be used -- were not. Confirms _owned_capture() gates them too.
+    upload = _upload(client, USER_A_ID, "a-device")
+    capture_id = upload.json()["capture_id"]
+
+    as_owner = client.post(
+        f"/api/captures/{capture_id}/diagnose",
+        data={"question": "did it crash?"}, headers=_headers(USER_A_ID),
+    )
+    assert as_owner.status_code == 200
+
+    as_other = client.post(
+        f"/api/captures/{capture_id}/diagnose",
+        data={"question": "did it crash?"}, headers=_headers(USER_B_ID),
+    )
+    assert as_other.status_code == 404
+
+
+def test_cannot_scan_another_users_capture(client):
+    upload = _upload(client, USER_A_ID, "a-device")
+    capture_id = upload.json()["capture_id"]
+
+    as_owner = client.post(f"/api/captures/{capture_id}/scan", headers=_headers(USER_A_ID))
+    assert as_owner.status_code == 200
+
+    as_other = client.post(f"/api/captures/{capture_id}/scan", headers=_headers(USER_B_ID))
+    assert as_other.status_code == 404
+
+
+def test_cannot_diagnose_another_users_investigation(client):
+    _upload(client, USER_A_ID, "a-device", investigation_label="a-only-case")
+
+    as_owner = client.post(
+        "/api/investigations/a-only-case/diagnose",
+        data={"question": "did it crash?"}, headers=_headers(USER_A_ID),
+    )
+    assert as_owner.status_code == 200
+
+    as_other = client.post(
+        "/api/investigations/a-only-case/diagnose",
+        data={"question": "did it crash?"}, headers=_headers(USER_B_ID),
+    )
+    assert as_other.status_code == 404
+
+
+def test_a_saved_byok_key_cannot_narrate_another_users_capture(client):
+    """The scenario get_byok_client's own docstring says is closed: before
+    per-user ownership, a visitor's BYOK key could narrate ANY capture on
+    the instance. Confirms a 404 on someone else's capture happens before
+    BYOK key resolution ever runs -- not that the key silently goes unused."""
+    upload = _upload(client, USER_A_ID, "a-device")
+    capture_id = upload.json()["capture_id"]
+
+    as_other = client.post(
+        f"/api/captures/{capture_id}/diagnose",
+        data={"question": "did it crash?", "provider": "openrouter", "byok_api_key": "sk-or-not-a-real-key"},
+        headers=_headers(USER_B_ID),
+    )
+    assert as_other.status_code == 404
+
+
 def test_cannot_archive_another_users_device(client):
     _upload(client, USER_A_ID, "a-device")
 

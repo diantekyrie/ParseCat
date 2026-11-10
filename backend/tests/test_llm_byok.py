@@ -158,7 +158,11 @@ def test_run_llm_prefers_byok_over_the_provider_dropdown(monkeypatch):
 
     assert report == "byok report"
     assert llm_error is None
-    assert narrated_by == "openrouter-byok"
+    # Arch review on #123: this assertion used to say "openrouter-byok"
+    # even though `provider="anthropic"` was passed in -- the exact
+    # single-constant bug byok_narrated_by() fixes. narrated_by must match
+    # the provider that actually ran, not a fixed OpenRouter-shaped id.
+    assert narrated_by == "anthropic-byok"
     get_byok_mock.assert_called_once_with("anthropic", "visitor-key", "some/model")
     get_llm_mock.assert_not_called()
 

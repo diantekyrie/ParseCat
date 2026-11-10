@@ -2152,49 +2152,86 @@ def test_arch_outbound_gate_schema_fuzz(ro_session, monkeypatch):
                      "kernel", "memory", "battery"):
         assert required in cats, f"maximal fixture missing category {required}: {cats}"
 
+    # Arch: collision-proof canaries — zq + hex, no real-word tokens that could
+    # tokenize onto fixture values like CDM. Fixed nonce for determinism.
+    _FUZZ_NONCE = "zqa1b2c3d4e5f67890"  # zq + 16 hex
+    n = _FUZZ_NONCE
     canaries = [
-        CAT_LABEL, CAT_FILE, CAT_SERIAL, CAT_SSID, ARCH_JANE,
-        "JaneDoe", "Janedoe", "janedoe",
-        "com.example.JaneDoeService", "com.example.JanedoeService",
-        "com.example.JaneDoeException", "com.example.janedoeException",
-        "sk-escapeCANARY0001", "gsk_escapeCANARY0001",
-        "AIzaSyEscapeCANARY0001", "xai-escapeCANARY0001",
-        "pplx-escapeCANARY0001", "hf_escapeCANARY0001",
-        "readgsk_SyntheticKey000000000000000001",
+        f"lab{n}", f"file{n}.zip", f"serial{n}", f"ssid{n}", f"name{n}",
+        f"pkg{n}", f"exc{n}", f"com.example.pkg{n}", f"com.example.exc{n}Ex",
+        f"id{n}", f"tok{n}", f"val{n}",
+        f"sk-{n}", f"gsk_{n}", f"AIza{n}", f"xai-{n}", f"pplx-{n}", f"hf_{n}",
+        f"readgsk_{n}",
     ]
+    assert len(canaries) == 19
+
+    # Schema∪fixture expected templates (6864fed maximal baseline). Fail on any
+    # silent drop from observed-only discovery (Arch blocker on 92d1c18).
+    _FUZZ_EXPECTED_TEMPLATES = frozenset({
+        "captures[].ingested_at", "captures[].kind",
+        "fact.category", "fact.confidence", "fact.exception_class", "fact.fact_id",
+        "fact.message", "fact.package", "fact.root_cause_message",
+        "fact.source.section", "fact.timestamp",
+        "fact.withheld_fields[].field", "fact.withheld_fields[].reason",
+        "facts[].app", "facts[].category", "facts[].comm", "facts[].confidence",
+        "facts[].device_profile", "facts[].exception_class", "facts[].executable",
+        "facts[].fact_id", "facts[].kind", "facts[].level", "facts[].message",
+        "facts[].note", "facts[].package", "facts[].package_name",
+        "facts[].permissions[]", "facts[].priority_name", "facts[].process",
+        "facts[].reason", "facts[].reason_name", "facts[].root_cause_class",
+        "facts[].root_cause_message", "facts[].signal_code", "facts[].signal_name",
+        "facts[].source.section", "facts[].source_domain", "facts[].tag",
+        "facts[].target_class", "facts[].target_type", "facts[].thread",
+        "facts[].timestamp", "facts[].uid_token", "facts[].verdict",
+        "facts[].withheld_fields[].field", "facts[].withheld_fields[].reason",
+        "untrusted_data_notice",
+    })
+    assert len(_FUZZ_EXPECTED_TEMPLATES) == 48
+    missing = _FUZZ_EXPECTED_TEMPLATES - templates
+    assert not missing, (
+        f"fuzz silently dropped templates vs schema/fixture set: {sorted(missing)}"
+    )
+    assert templates == _FUZZ_EXPECTED_TEMPLATES, (
+        f"template set drift: extra={sorted(templates - _FUZZ_EXPECTED_TEMPLATES)} "
+        f"missing={sorted(missing)}"
+    )
 
     # Map each template → one concrete path from discovery for injection.
     concrete_for: dict[str, str] = {}
     for path in sorted(discovered_paths):
         concrete_for.setdefault(_path_template(path), path)
+    assert set(concrete_for) == templates
 
     covered: set[str] = set()
     injections = 0
 
     def _ident_for(canary: str) -> CaptureIdentity:
-        jane_forms = {"JaneDoe", "Janedoe", "janedoe", ARCH_JANE}
-        jane_pkgs = {
-            "com.example.JaneDoeService", "com.example.JanedoeService",
-            "com.example.JaneDoeException", "com.example.janedoeException",
-        }
-        if canary in jane_forms or canary in jane_pkgs:
-            # Gate against the compact CamelCase label Arch escaped.
-            return CaptureIdentity(label="JaneDoe", filename=CAT_FILE, serial=CAT_SERIAL,
-                                   ssids=frozenset({CAT_SSID}))
-        if canary == CAT_LABEL:
-            return CaptureIdentity(label=canary, filename=CAT_FILE, serial=CAT_SERIAL,
-                                   ssids=frozenset({CAT_SSID}))
-        if canary == CAT_FILE:
-            return CaptureIdentity(label=CAT_LABEL, filename=canary, serial=CAT_SERIAL,
-                                   ssids=frozenset({CAT_SSID}))
-        if canary == CAT_SERIAL:
-            return CaptureIdentity(label=CAT_LABEL, filename=CAT_FILE, serial=canary,
-                                   ssids=frozenset({CAT_SSID}))
-        if canary == CAT_SSID:
-            return CaptureIdentity(label=CAT_LABEL, filename=CAT_FILE, serial=CAT_SERIAL,
-                                   ssids=frozenset({canary}))
-        return CaptureIdentity(label=CAT_LABEL, filename=CAT_FILE, serial=CAT_SERIAL,
-                               ssids=frozenset({CAT_SSID}), device_ids=frozenset({canary}))
+        # Key-shaped canaries: gate via device_ids / key detector, not label.
+        if canary.startswith(("sk-", "gsk_", "AIza", "xai-", "pplx-", "hf_", "readgsk_")):
+            return CaptureIdentity(
+                label=f"lab{n}", filename=f"file{n}.zip", serial=f"serial{n}",
+                ssids=frozenset({f"ssid{n}"}), device_ids=frozenset({canary}),
+            )
+        if canary.startswith("file") and canary.endswith(".zip"):
+            return CaptureIdentity(
+                label=f"lab{n}", filename=canary, serial=f"serial{n}",
+                ssids=frozenset({f"ssid{n}"}),
+            )
+        if canary.startswith("serial"):
+            return CaptureIdentity(
+                label=f"lab{n}", filename=f"file{n}.zip", serial=canary,
+                ssids=frozenset({f"ssid{n}"}),
+            )
+        if canary.startswith("ssid"):
+            return CaptureIdentity(
+                label=f"lab{n}", filename=f"file{n}.zip", serial=f"serial{n}",
+                ssids=frozenset({canary}),
+            )
+        # Default: canary is the label (collision-proof nonce form).
+        return CaptureIdentity(
+            label=canary, filename=f"file{n}.zip", serial=f"serial{n}",
+            ssids=frozenset({f"ssid{n}"}),
+        )
 
     # Inject into a copy of each tool payload at the concrete path.
     base_payloads = {
@@ -2242,7 +2279,11 @@ def test_arch_outbound_gate_schema_fuzz(ro_session, monkeypatch):
         for prefix in ("sk-", "gsk_", "AIza", "xai-", "pplx-", "hf_"):
             assert prefix not in blob
 
-    assert injections >= 100, injections
+    assert injections == len(templates) * len(canaries), (
+        f"expected {len(templates)}*{len(canaries)}="
+        f"{len(templates) * len(canaries)}, got {injections}"
+    )
+    assert len(templates) == 48 and injections == 912, (len(templates), injections)
     test_arch_outbound_gate_schema_fuzz.last_stats = {  # type: ignore[attr-defined]
         "templates": sorted(templates),
         "template_count": len(templates),
@@ -2345,54 +2386,192 @@ def test_fe_outbound_gate_fuzz_preseed_db(writable_db, monkeypatch):
     }
 
 
-# --- Cat QA120-8: SELinux AVC permission vocabulary -------------------------
+# --- Cat QA120-8 / QA120-9: SELinux AVC shape (no fixed vocab) ---------------
 
 
-def test_cat_qa120_8_avc_permissions_both_tools_both_ft_modes(ro_session, monkeypatch):
-    """QA120-8: avc { read write } → ['read','write'] on both tools × FT modes."""
-    session, ids, _ = ro_session
+# Cat QA120-8: 25 verbs previously dropped by the fixed vocabulary + read/write.
+_CAT_QA120_8_PERMS = (
+    "relabelfrom", "relabelto", "watch", "watch_reads", "watch_mount",
+    "sendto", "recvfrom", "shutdown", "connectto", "impersonate",
+    "set_context_mgr", "fork", "noatsecure", "siginh", "rlimitinh",
+    "setkeycreate", "getrlimit", "execmem", "execstack", "execheap",
+    "sys_admin", "net_admin", "setuid", "setgid", "dac_override",
+    "read", "write",
+)
+_CAT_QA120_9_CLASSES = (
+    "netlink_route_socket",
+    "netlink_kobject_uevent_socket",
+    "bluetooth_socket",
+)
+
+
+def test_cat_qa120_8_avc_permissions_both_tools_both_ft_modes(writable_db, monkeypatch):
+    """QA120-8: shape rule keeps all 25 listed perms + read/write on both tools × FT."""
+    from sqlmodel import Session, create_engine
+    from app.models.db_models import SelinuxDenialRow
+
+    db_path = writable_db["db_path"]
+    cap_id = writable_db["capture_cat"]
+    monkeypatch.setenv("PARSECAT_DB_PATH", str(db_path))
+    eng = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False},
+    )
+    perms_str = " ".join(_CAT_QA120_8_PERMS)
+    with Session(eng) as s:
+        s.add(SelinuxDenialRow(
+            capture_id=cap_id,
+            timestamp="08-19 18:00:00.000",
+            verdict="denied",
+            permissions=perms_str,
+            source_domain="untrusted_app",
+            target_type="app_data_file",
+            target_class="unix_stream_socket",
+            app="com.example.app",
+            comm="app_process",
+            enforcing=True,
+            source_section="event_log",
+            source_line_start=900,
+            source_line_end=900,
+        ))
+        s.commit()
+    eng.dispose()
+
     for ft in ("0", "1"):
         monkeypatch.setenv("PARSECAT_MCP_INCLUDE_FREE_TEXT", ft)
-        facts_json = tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
+        facts_json = tool_get_verified_facts(capture_id=cap_id, limit=500)
         facts = json.loads(facts_json)["facts"]
         sel = [f for f in facts if f["category"] == "selinux"]
         assert sel, ft
-        perms = sel[0]["permissions"]
-        assert "read" in perms and "write" in perms, (ft, perms)
-        one = json.loads(
-            tool_get_fact(fact_id=sel[0]["fact_id"], capture_id=ids["capture_cat"])
-        )
+        # Find the row with the full perm set (fixture also has a smaller one).
+        full = max(sel, key=lambda f: len(f.get("permissions") or []))
+        perms = full["permissions"]
+        for verb in _CAT_QA120_8_PERMS:
+            assert verb in perms, (ft, verb, perms)
+        one = json.loads(tool_get_fact(fact_id=full["fact_id"], capture_id=cap_id))
         one_perms = one["fact"]["permissions"]
-        assert "read" in one_perms and "write" in one_perms, (ft, one_perms)
+        for verb in _CAT_QA120_8_PERMS:
+            assert verb in one_perms, (ft, verb, one_perms)
 
 
-def test_cat_qa120_8_non_vocab_and_label_word_withheld():
-    """QA120-8 negatives: unknown lowercase + label word withheld; Android ok."""
-    from app.services.mcp_readonly import _stamp, CaptureIdentity, apply_outbound_gate
+def test_cat_qa120_8_connectto_unix_stream_socket_unit():
+    """QA120-8 repro: { connectto } on unix_stream_socket → permissions kept."""
+    from app.services.mcp_readonly import _stamp, CaptureIdentity
 
-    ident = CaptureIdentity(label="Alice")
-    stamped = _stamp("selinux", 1, {
+    st = _stamp("selinux", 1, {
         "timestamp": "08-19 12:00:00.000",
-        "permissions": [
-            "read", "write", "not_a_real_perm_xyz", "Alice",
-            "android.permission.INTERNET", "com.example.custom.PERM",
-        ],
+        "permissions": ["connectto"],
+        "source_domain": "untrusted_app",
+        "target_type": "app_data_file",
+        "target_class": "unix_stream_socket",
+        "verdict": "denied",
+        "confidence": "LOW",
+    }, identity=CaptureIdentity())
+    assert st["permissions"] == ["connectto"]
+    assert st["target_class"] == "unix_stream_socket"
+
+
+def test_cat_qa120_9_target_class_shape_both_tools(writable_db, monkeypatch):
+    """QA120-9: netlink_route / kobject_uevent / bluetooth_socket survive."""
+    from sqlmodel import Session, create_engine
+    from app.models.db_models import SelinuxDenialRow
+
+    db_path = writable_db["db_path"]
+    cap_id = writable_db["capture_cat"]
+    monkeypatch.setenv("PARSECAT_DB_PATH", str(db_path))
+    eng = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False},
+    )
+    with Session(eng) as s:
+        for i, tclass in enumerate(_CAT_QA120_9_CLASSES):
+            s.add(SelinuxDenialRow(
+                capture_id=cap_id,
+                timestamp=f"08-19 18:10:0{i}.000",
+                verdict="denied",
+                permissions="read",
+                source_domain="untrusted_app",
+                target_type="app_data_file",
+                target_class=tclass,
+                app="com.example.app",
+                comm="app_process",
+                enforcing=True,
+                source_section="event_log",
+                source_line_start=910 + i,
+                source_line_end=910 + i,
+            ))
+        s.commit()
+    eng.dispose()
+
+    for ft in ("0", "1"):
+        monkeypatch.setenv("PARSECAT_MCP_INCLUDE_FREE_TEXT", ft)
+        facts = json.loads(
+            tool_get_verified_facts(capture_id=cap_id, limit=500)
+        )["facts"]
+        sel = [f for f in facts if f["category"] == "selinux"]
+        classes = {f.get("target_class") for f in sel}
+        for tclass in _CAT_QA120_9_CLASSES:
+            assert tclass in classes, (ft, tclass, classes)
+            hit = next(f for f in sel if f.get("target_class") == tclass)
+            one = json.loads(tool_get_fact(fact_id=hit["fact_id"], capture_id=cap_id))
+            assert one["fact"]["target_class"] == tclass
+            assert "read" in (one["fact"].get("permissions") or [])
+
+
+def test_cat_qa120_8_9_shape_negatives_and_identity_key_gates():
+    """Uppercase / digit-leading / over-long withheld; label+key gates still run."""
+    from app.services.mcp_readonly import (
+        _stamp, CaptureIdentity, apply_outbound_gate, _permission_item_ok,
+        _selinux_avc_shape_ok,
+    )
+
+    assert not _selinux_avc_shape_ok("ConnectTo")
+    assert not _selinux_avc_shape_ok("1abc")
+    assert not _selinux_avc_shape_ok("a" * 65)
+    assert _selinux_avc_shape_ok("connectto")
+    assert not _permission_item_ok("ConnectTo", category="selinux")
+    assert not _permission_item_ok("1read", category="selinux")
+
+    # Label-equal lowercase perm withheld by outbound identity gate.
+    ident = CaptureIdentity(label="janedoe")
+    st = _stamp("selinux", 1, {
+        "timestamp": "08-19 12:00:00.000",
+        "permissions": ["read", "janedoe", "connectto"],
         "source_domain": "untrusted_app",
         "target_type": "app_data_file",
         "target_class": "file",
         "verdict": "denied",
         "confidence": "LOW",
     }, identity=ident)
-    perms = stamped["permissions"]
-    assert "read" in perms and "write" in perms
-    assert "android.permission.INTERNET" in perms
-    assert "com.example.custom.PERM" in perms
-    assert "not_a_real_perm_xyz" not in perms
-    assert "Alice" not in perms
-    gated = apply_outbound_gate({"facts": [stamped]}, ident)
+    assert "janedoe" in st["permissions"]  # shape-ok at stamp
+    gated = apply_outbound_gate({"facts": [st]}, ident)
     blob = json.dumps(gated)
-    assert "not_a_real_perm_xyz" not in blob
-    assert "Alice" not in blob
+    assert "janedoe" not in blob
+    assert "connectto" in blob and "read" in blob
+
+    # Key-prefix-shaped values withheld.
+    st2 = _stamp("selinux", 1, {
+        "timestamp": "08-19 12:00:00.000",
+        "permissions": ["read", "sk-abcdef0123456789", "hf_abcdef0123456789abcd"],
+        "source_domain": "untrusted_app",
+        "target_type": "app_data_file",
+        "target_class": "file",
+        "verdict": "denied",
+        "confidence": "LOW",
+    }, identity=CaptureIdentity())
+    assert "sk-abcdef0123456789" not in st2["permissions"]
+    assert "hf_abcdef0123456789abcd" not in st2["permissions"]
+    assert "read" in st2["permissions"]
+
+    # target_class shape negatives
+    st3 = _stamp("selinux", 1, {
+        "timestamp": "08-19 12:00:00.000",
+        "permissions": ["read"],
+        "source_domain": "untrusted_app",
+        "target_type": "app_data_file",
+        "target_class": "Netlink_Route_Socket",
+        "verdict": "denied",
+        "confidence": "LOW",
+    }, identity=CaptureIdentity())
+    assert st3.get("target_class") is None
 
 
 def test_cat_qa120_8_android_perms_non_selinux_still_strict():
@@ -2404,6 +2583,61 @@ def test_cat_qa120_8_android_perms_non_selinux_still_strict():
     assert _permission_item_ok("android.permission.INTERNET", category="crash")
     assert _permission_item_ok("com.example.custom.PERM", category="crash")
     assert _permission_item_ok("read", category="selinux")
+    assert _permission_item_ok("connectto", category="selinux")
+
+
+def test_arch_avc_exempt_selinux_paths_only():
+    """Arch: read/open exempt from containment only on selinux facts."""
+    from app.services.mcp_readonly import CaptureIdentity, apply_outbound_gate
+
+    # Caller-supplied crash leaf equal to an AVC verb — normal checks apply.
+    # Use a label that hybrid-matches the verb as a 4+ substring/token.
+    ident = CaptureIdentity(label="open")
+    crash = {
+        "category": "crash",
+        "fact_id": "vf_0123456789abcdef",
+        "capture_id": 1,
+        "thread": "main",
+        "package": "com.example.app",
+        "exception_class": "open",  # same string as AVC verb
+        "confidence": "LOW",
+    }
+    gated = apply_outbound_gate({"facts": [crash]}, ident)
+    assert gated["facts"][0].get("exception_class") is None
+
+    # On a selinux fact, path-exempt AVC verb survives even with label=open.
+    sel = {
+        "category": "selinux",
+        "fact_id": "vf_0123456789abcde0",
+        "capture_id": 1,
+        "permissions": ["open", "read"],
+        "source_domain": "untrusted_app",
+        "target_type": "app_data_file",
+        "target_class": "file",
+        "verdict": "denied",
+        "confidence": "LOW",
+    }
+    gated2 = apply_outbound_gate({"facts": [sel]}, ident)
+    assert gated2["facts"][0]["permissions"] == ["open", "read"]
+
+
+def test_fe_cdm_exact_token_stoplist_tag_survives(ro_session):
+    """FE: display-name token cdm dropped; tag=CDM survives; FeCdmWatch42 withheld."""
+    session, ids, _ = ro_session
+    facts = json.loads(
+        tool_get_verified_facts(capture_id=ids["capture_cat"], limit=500)
+    )["facts"]
+    pairing = [f for f in facts if f["category"] == "pairing"]
+    assert pairing
+    tags = {f.get("tag") for f in pairing}
+    assert "CDM" in tags, tags
+    blob = json.dumps(facts)
+    assert FE_CDM_NAME not in blob
+    # Process wrap of CDM display name still withheld.
+    mem = [f for f in facts if f["category"] == "memory"]
+    for f in mem:
+        if f.get("process") is not None:
+            assert FE_CDM_NAME not in f["process"]
 
 
 # --- Arch: 116 JaneDoe label×identifier matrix PRE-tool DB regression -------

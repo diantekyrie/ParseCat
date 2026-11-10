@@ -269,6 +269,9 @@ _LABEL_STOPLIST_BASE = frozenset({
     "samsung", "crash", "wifi", "bt", "debug", "main", "work", "home", "lab",
     "watch",  # common device_profile / CDM noun — never identity
 })
+# FE: exact-token only, applied solely to tokens derived from display names
+# (not labels). Keeps tag=CDM usable when companion is FeCdmWatch42.
+_DISPLAY_NAME_EXACT_STOPLIST = frozenset({"cdm"})
 
 
 def _norm_token(value: str) -> str:
@@ -372,19 +375,42 @@ class CaptureIdentity:
         → ``janedoe``). Stoplist words are never treated as identity
         (Arch usefulness). Empty when every name is missing or only stoplist
         words — those names are not gated.
+
+        FE: tokens derived from *display names* additionally drop the exact
+        token ``cdm`` only (so fixture ``tag=CDM`` survives alongside
+        ``FeCdmWatch42``). The whole display name and its other distinctive
+        parts stay identity tokens; strings that merely contain ``cdm`` are
+        still gated by the normal hybrid rules.
         """
         stop = _label_stoplist()
         words: set[str] = set()
-        for raw in filter(None, (self.label, *self.display_names)):
+        if self.label:
+            words.update(
+                w for w in _tokenize_words(self.label)
+                if w not in stop and not w.isdigit()
+            )
+            joined = re.sub(r"[^\w]+", "", _nfkc(self.label), flags=re.UNICODE)
+            joined = joined.replace("_", "").casefold()
+            if (
+                len(joined) >= _IDENTITY_WORD_MIN_LEN
+                and joined not in stop
+                and not joined.isdigit()
+            ):
+                words.add(joined)
+        # Display-name path: base stoplist + exact-token ``cdm`` only.
+        display_stop = stop | _DISPLAY_NAME_EXACT_STOPLIST
+        for raw in self.display_names:
+            if not raw:
+                continue
             words.update(
                 w for w in _tokenize_words(raw)
-                if w not in stop and not w.isdigit()
+                if w not in display_stop and not w.isdigit()
             )
             joined = re.sub(r"[^\w]+", "", _nfkc(raw), flags=re.UNICODE)
             joined = joined.replace("_", "").casefold()
             if (
                 len(joined) >= _IDENTITY_WORD_MIN_LEN
-                and joined not in stop
+                and joined not in display_stop
                 and not joined.isdigit()
             ):
                 words.add(joined)
@@ -640,7 +666,13 @@ _SIGNAL_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,32}$")
 _TAG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 _LEVEL_RE = re.compile(r"^[A-Za-z]$")
 _SELINUX_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_:.-]{0,127}$")
-_SELINUX_PERM_AVC_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+# SELinux AVC permission / tclass shape (Cat QA120-8/9): lowercase,
+# starts with a letter, max 64 chars. Used ONLY when category == "selinux".
+_SELINUX_AVC_SHAPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SELINUX_AVC_SHAPE_MAX = 64
+# Back-compat alias for any lingering references.
+_SELINUX_PERM_AVC_RE = _SELINUX_AVC_SHAPE_RE
+
 _ANDROID_PERM_RE = re.compile(r"^android\.permission\.[A-Z0-9_]+$")
 _COMM_RE = re.compile(r"^[A-Za-z0-9._+:\-]{1,16}$")
 _PROC_STATE_RE = re.compile(r"^[A-Z]{1,8}$")
@@ -935,18 +967,25 @@ def _shape_ok(kind: str, value: str, *, category: str | None = None) -> bool:
     return bool(_GENERIC_ID_RE.fullmatch(value))
 
 
+def _selinux_avc_shape_ok(item: str) -> bool:
+    """Cat QA120-8/9: ``^[a-z][a-z0-9_]*$`` with max length 64."""
+    if not isinstance(item, str) or len(item) > _SELINUX_AVC_SHAPE_MAX:
+        return False
+    return bool(_SELINUX_AVC_SHAPE_RE.fullmatch(item))
+
+
 def _permission_item_ok(item: str, *, category: str | None = None) -> bool:
     """Permission leaf allowlist (Cat QA120-8 + FE).
 
-    * ``selinux`` category: explicit AVC vocabulary (``^[a-z_]+$`` ∩ vocab).
-    * Otherwise (Android-permission style facts): ``android.permission.*`` or
-      package-shaped only — FE's rule unchanged.
-    Identity/key gates still run on kept leaves via the outbound walk.
+    * ``selinux`` category: AVC shape ``^[a-z][a-z0-9_]*$`` (max 64) only —
+      no fixed vocabulary (connectto / relabelfrom / … all pass shape).
+    * Otherwise: ``android.permission.*`` or package-shaped — FE unchanged.
+    Identity / label / key-prefix gates still run on kept leaves via the
+    outbound walk (and key-prefix at stamp time).
     """
     if category == "selinux":
-        if _AVC_PERM_SHAPE_RE.fullmatch(item) and item in _AVC_PERM_CONSTANTS:
+        if _selinux_avc_shape_ok(item):
             return True
-        # Also accept android.permission.* / package if somehow mixed in.
         if _ANDROID_PERM_RE.fullmatch(item) or _PACKAGE_RE.fullmatch(item):
             return True
         return False
@@ -1117,9 +1156,9 @@ def _validate_identifier(
     shape = _FIELD_SHAPE.get(field, "generic")
     if not _shape_ok(shape, value, category=category):
         return "shape"
-    # SELinux tclass: require membership in the fixed class vocabulary (Cat).
+    # SELinux tclass: same AVC shape rule as permissions (Cat QA120-9).
     if category == "selinux" and field == "target_class":
-        if value not in _SELINUX_TCLASS_CONSTANTS:
+        if not _selinux_avc_shape_ok(value):
             return "shape"
     # Key-prefix: withhold (never mutate) on free-form IDs + exception classes.
     if field in _KEY_PREFIX_FIELDS and _has_key_prefix(value):
@@ -1312,40 +1351,34 @@ def _clamp_offset(value: int | None) -> int:
 # or "wifi" or "12" does not null `kind: wifi` / reason codes. Key-prefix
 # checks still apply to every string leaf (never mutate — withhold only).
 
-# Explicit SELinux AVC permission vocabulary (kernel/Android policy verbs).
-# Used for selinux-category facts only — not a free lowercase allowlist.
-_AVC_PERM_CONSTANTS = frozenset({
-    # File / dir / lnk_file
+# Common AVC verbs exempt from *identity containment* ONLY on selinux-fact
+# output paths (Arch). Allowlisting is shape-based (_selinux_avc_shape_ok);
+# this set is NOT an allowlist. Values like read/open in any other category
+# get normal identity/key checks.
+_AVC_PERM_PATH_EXEMPT = frozenset({
     "read", "write", "open", "getattr", "setattr", "lock", "map", "ioctl",
     "execute", "execute_no_trans", "entrypoint", "execmod",
     "create", "unlink", "link", "rename", "append",
     "search", "add_name", "remove_name", "reparent", "rmdir",
     "quotaon", "mounton", "audit_access",
-    # Socket / net
     "bind", "connect", "listen", "accept", "name_bind", "name_connect",
     "send_msg", "recv_msg", "node_bind", "setopt", "getopt",
-    # Process / IPC / binder
     "transition", "dyntransition", "sigchld", "sigkill", "sigstop", "signull",
     "signal", "ptrace", "getsched", "setsched", "getsession", "getpgid",
     "setpgid", "getcap", "setcap", "share",
     "use", "call", "transfer",
-    # Misc common Android/kernel
     "find", "add", "list", "set", "get", "mac_admin", "mac_override",
     "setfscreate", "setsockcreate", "setrlimit", "setexec", "setcurrent",
     "ioctl_getattr",
+    # Cat QA120-8 extras that previously fell outside the fixed vocab
+    "relabelfrom", "relabelto", "watch", "watch_reads", "watch_mount",
+    "sendto", "recvfrom", "shutdown", "connectto", "impersonate",
+    "set_context_mgr", "fork", "noatsecure", "siginh", "rlimitinh",
+    "setkeycreate", "getrlimit", "execmem", "execstack", "execheap",
+    "sys_admin", "net_admin", "setuid", "setgid", "dac_override",
 })
-_AVC_PERM_SHAPE_RE = re.compile(r"^[a-z_]+$")
-
-# Common SELinux tclass values emitted as target_class.
-_SELINUX_TCLASS_CONSTANTS = frozenset({
-    "file", "dir", "lnk_file", "chr_file", "blk_file", "sock_file", "fifo_file",
-    "socket", "tcp_socket", "udp_socket", "rawip_socket", "netlink_socket",
-    "unix_stream_socket", "unix_dgram_socket", "binder", "fd", "process",
-    "capability", "cap_userns", "filesystem", "file_system", "key", "shm",
-    "sem", "msg", "msgq", "service", "hwservice_manager", "service_manager",
-    "property_service", "zygote", "anon_inode", "bpf", "perf_event",
-    "keystore2", "keystore2_key", "drmservice", "debuggerd",
-})
+# Alias kept for ground-truth helpers / tests that imported the old name.
+_AVC_PERM_CONSTANTS = _AVC_PERM_PATH_EXEMPT
 _CONFIDENCE_CONSTANTS = frozenset({"LOW", "HIGH", "UNCONFIRMED", "MEDIUM"})
 _CAPTURE_KIND_CONSTANTS = frozenset({"bugreport", "pcap"})
 
@@ -1359,7 +1392,7 @@ def _ground_truth_exempt_values() -> frozenset[str]:
     exempt.update(_PAIRING_KIND_ALLOWED)
     exempt.update(_ALLOWED_SOURCE_SECTIONS)
     exempt.update(_VERDICT_ALLOWED)
-    exempt.update(_AVC_PERM_CONSTANTS)
+    # AVC verbs are NOT globally exempt — see apply_outbound_gate path scope.
     exempt.update(_CONFIDENCE_CONSTANTS)
     exempt.update(_CAPTURE_KIND_CONSTANTS)
     exempt.update(FACT_KIND_KEYS.keys())  # category names
@@ -1440,7 +1473,13 @@ def apply_outbound_gate(
     # Also exempt the static notice string(s).
     exempt = frozenset(set(exempt) | {UNTRUSTED_DATA_NOTICE})
 
-    def walk(node: Any, path: str, fact_withheld: list | None) -> Any:
+    def walk(
+        node: Any,
+        path: str,
+        fact_withheld: list | None,
+        *,
+        fact_category: str | None = None,
+    ) -> Any:
         if isinstance(node, dict):
             out: dict[str, Any] = {}
             # Prefer attaching withheld_fields onto fact objects.
@@ -1450,10 +1489,12 @@ def apply_outbound_gate(
                 and "fact_id" in node
                 and "capture_id" in node
             )
+            cat = fact_category
             if is_fact:
                 # Start empty; seed by sanitizing existing entries below so
                 # producer metadata cannot leak through pre-gate withheld_fields.
                 local_withheld = []
+                cat = node.get("category") if isinstance(node.get("category"), str) else None
             for k, v in node.items():
                 if k == "withheld_fields":
                     cleaned: list[dict[str, str]] = []
@@ -1468,14 +1509,21 @@ def apply_outbound_gate(
                         out[k] = cleaned
                     continue
                 child_path = f"{path}.{k}" if path else k
-                out[k] = walk(v, child_path, local_withheld)
+                out[k] = walk(v, child_path, local_withheld, fact_category=cat)
             if is_fact and local_withheld:
                 out["withheld_fields"] = local_withheld
             return out
         if isinstance(node, list):
-            return [walk(v, f"{path}[{i}]", fact_withheld) for i, v in enumerate(node)]
+            return [
+                walk(v, f"{path}[{i}]", fact_withheld, fact_category=fact_category)
+                for i, v in enumerate(node)
+            ]
         if isinstance(node, str):
-            skip = node in exempt
+            # Arch: AVC verb exemption is selinux-fact-path only. read/open in
+            # any other category get normal identity/key checks.
+            skip = node in exempt or (
+                fact_category == "selinux" and node in _AVC_PERM_PATH_EXEMPT
+            )
             reason = _leaf_hits_gate(node, identity, path=path, skip_containment=skip)
             if reason is None:
                 return node

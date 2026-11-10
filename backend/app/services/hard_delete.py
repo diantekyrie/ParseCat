@@ -53,7 +53,14 @@ def tables_referencing_capture(session: Session, capture_id: int) -> list[str]:
 
 
 def hard_delete_capture(session: Session, capture_id: int) -> bool:
-    """Permanently remove a capture and all capture_id-keyed dependents.
+    """Remove a capture and all capture_id-keyed dependents from ParseCat's
+    database.
+
+    This is logical removal from the live database; combined with
+    PRAGMA secure_delete=ON (see app.db) the freed pages are zeroed on disk.
+    It is NOT a guarantee about data outside the live DB: SQLite WAL/journal
+    files and any external backups or snapshots may still retain old pages
+    until they roll over or are themselves purged.
 
     Returns False if the capture id is unknown (caller maps to 404).
     Commits on success.

@@ -42,6 +42,18 @@ def _max_upload_bytes() -> int:
     return int(os.environ.get("PARSECAT_MAX_UPLOAD_BYTES", str(_DEFAULT_MAX_UPLOAD_BYTES)))
 
 
+# Capture hard-delete (#95) is irreversible and, until auth lands, has no
+# per-user ownership check -- anyone who can reach the API can wipe any
+# capture. So it ships behind a flag that is OFF by default; FE will flip it
+# on in a later auth PR. Read at request time (not import time) so ops/tests
+# can toggle PARSECAT_ENABLE_CAPTURE_DELETE without reloading the module.
+_TRUTHY_FLAG_VALUES = {"1", "true", "yes", "on"}
+
+
+def _capture_delete_enabled() -> bool:
+    return os.environ.get("PARSECAT_ENABLE_CAPTURE_DELETE", "").strip().lower() in _TRUTHY_FLAG_VALUES
+
+
 def _parse_history(raw: str | None) -> list[dict] | None:
     """The `history` form field is a JSON-encoded list of prior
     {question, report} turns from the same follow-up thread -- see
@@ -290,14 +302,36 @@ def capture_summary(capture_id: int, session: Session = Depends(get_session)):
 
 @router.delete("/captures/{capture_id}")
 def delete_capture(capture_id: int, session: Session = Depends(get_session)):
-    """#95 hard-delete: remove the capture and every capture_id-keyed row.
+    """#95 hard-delete: remove the capture and every capture_id-keyed row
+    from ParseCat's database.
+
+    Gated behind PARSECAT_ENABLE_CAPTURE_DELETE (default OFF). While OFF the
+    route behaves as if it does not exist -- it returns 404, not 403, so the
+    delete capability is not even advertised until auth lands (#122 review).
 
     Not soft-archive. After success, GET summary/diagnose/scan for this id
     return 404. Device/investigation archive is a separate, recoverable path.
     """
+    # Flag off -> pretend the route is not registered.
+    if not _capture_delete_enabled():
+        raise HTTPException(404, "Not Found")
+
     if not hard_delete_capture(session, capture_id):
         raise HTTPException(404, "Unknown capture")
-    return {"ok": True, "deleted_capture_id": capture_id}
+    return {
+        "ok": True,
+        "deleted_capture_id": capture_id,
+        # Honest wording (#122 review): this is logical removal from the live
+        # database plus secure_delete zeroing of the freed pages -- NOT a
+        # guarantee about copies outside the live DB. WAL/journal files and
+        # any backups/snapshots may still retain old pages until they roll
+        # over or are themselves purged.
+        "detail": (
+            "Capture and all capture_id-keyed rows removed from ParseCat's "
+            "database. Freed pages are zeroed via secure_delete. Note: WAL "
+            "files and backups may still retain old pages."
+        ),
+    }
 
 
 @router.post("/captures/{capture_id}/diagnose")

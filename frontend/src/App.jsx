@@ -2273,7 +2273,6 @@ export default function App() {
         .how-to-capture-list { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 8px; }
         .how-to-capture-list li strong { display: block; font-size: 13px; }
         .how-to-capture-list li p { margin: 4px 0 0; }
-        .how-to-capture-docs { margin-top: 10px; }
         .how-to-capture-body a { color: var(--blue); }
 
         .claim-card { border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px; margin-bottom: 12px; background: #0e1420; }

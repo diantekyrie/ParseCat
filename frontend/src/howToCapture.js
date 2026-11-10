@@ -39,9 +39,6 @@ export const HOW_TO_CAPTURE_STEPS = [
   },
 ];
 
-export const HOW_TO_CAPTURE_DOCS_HINT =
-  "Full steps: the AOSP Bluetooth verifying & debugging guide.";
-
 export const HOW_TO_CAPTURE_AOSP_URL =
   "https://source.android.com/docs/core/connect/bluetooth/verifying_debugging";
 

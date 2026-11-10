@@ -1,7 +1,6 @@
 import { useState } from "react";
 import {
   HOW_TO_CAPTURE_AOSP_URL,
-  HOW_TO_CAPTURE_DOCS_HINT,
   HOW_TO_CAPTURE_INTRO,
   HOW_TO_CAPTURE_STEPS,
   HOW_TO_CAPTURE_TITLE,
@@ -38,7 +37,6 @@ export default function HowToCapturePanel({ defaultOpen = false }) {
               </li>
             ))}
           </ol>
-          <p className="muted small how-to-capture-docs">{HOW_TO_CAPTURE_DOCS_HINT}</p>
           <p className="muted small">
             AOSP HCI snoop steps:{" "}
             <a href={HOW_TO_CAPTURE_AOSP_URL} target="_blank" rel="noreferrer">

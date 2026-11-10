@@ -23,7 +23,7 @@ export const HOW_TO_CAPTURE_STEPS = [
     id: "full-bugreport",
     title: "Take a full bugreport ZIP",
     body:
-      "Prefer `adb bugreport bugreport.zip`, or Developer options → Take bug report. Upload the whole .zip. Plain logcat / .txt-only uploads lack ZIP companions (tombstones, ANRs, HCI files).",
+      "Prefer adb bugreport bugreport.zip, or Developer options → Take bug report. Upload the whole .zip. Plain logcat / .txt-only uploads lack ZIP companions (tombstones, ANRs, HCI files).",
   },
   {
     id: "accepts",
@@ -35,12 +35,12 @@ export const HOW_TO_CAPTURE_STEPS = [
     id: "limits",
     title: "Honest limits",
     body:
-      "If snoop was off or the OEM wrote no classic btsnoop file, ParseCat reports that HCI was not found — it does not invent traffic. HCI decode here is framing-level (connect/disconnect/command status), not full L2CAP/profile disassembly.",
+      "If snoop was off or the OEM wrote no classic btsnoop file, ParseCat reports that HCI was not found — it does not invent traffic. HCI decode covers connection/disconnection, authentication, encryption, link-key/pairing events, and command status — not full L2CAP/profile disassembly.",
   },
 ];
 
 export const HOW_TO_CAPTURE_DOCS_HINT =
-  "Full steps and AOSP link: docs/how-to-capture.md in the repo.";
+  "Full steps: the AOSP Bluetooth verifying & debugging guide.";
 
 export const HOW_TO_CAPTURE_AOSP_URL =
   "https://source.android.com/docs/core/connect/bluetooth/verifying_debugging";

@@ -128,12 +128,12 @@ class Device(SQLModel, table=True):
         default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(AwareUTCDateTime(), nullable=False),
     )
-    # Soft-delete, not a real DELETE: no cascade-delete exists across the
-    # 30+ fact tables that key off capture_id, so hard-deleting a device
-    # would mean manually cleaning every one of those tables (and silently
-    # breaking the moment a new fact table is added and missed). Archiving
-    # just hides a device from GET /api/devices and the frontend's
-    # <datalist> by default -- fully recoverable, no schema-wide risk.
+    # Soft-hide for devices (and investigations): archiving just hides a
+    # device from GET /api/devices and the frontend's <datalist> by default
+    # -- fully recoverable. Capture-level permanent removal is a separate
+    # path: hard_delete_capture() (#95) deletes the Capture row and every
+    # capture_id-keyed dependent via metadata discovery. Device archive
+    # does NOT cascade into that hard delete.
     archived: bool = Field(default=False, index=True)
 
 

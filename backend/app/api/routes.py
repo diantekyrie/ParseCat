@@ -19,6 +19,7 @@ from app.services.persistence import (
     persist_capture,
     UNVERIFIED_DEVICE_IDENTITY_WARNING,
 )
+from app.services.hard_delete import hard_delete_capture
 from app.services.pii_redaction import redact_pii
 from app.services.reasoning import diagnose, diagnose_investigation, scan_capture
 from app.services.summary import build_capture_summary, build_merged_summary, capture_severity
@@ -70,6 +71,20 @@ def _resolve_byok(
     if row is not None:
         return row.api_key, row.model
     return None, None
+
+
+# Capture hard-delete (#95) is irreversible. On main (no auth) it ships
+# behind a flag that is OFF by default. On this branch, auth already exists,
+# so the real gate is per-user ownership (see delete_capture below) -- but
+# the flag stays too, as an explicit, separate "is this capability turned on
+# at all" switch independent of who's asking. Read at request time (not
+# import time) so ops/tests can toggle PARSECAT_ENABLE_CAPTURE_DELETE
+# without reloading the module.
+_TRUTHY_FLAG_VALUES = {"1", "true", "yes", "on"}
+
+
+def _capture_delete_enabled() -> bool:
+    return os.environ.get("PARSECAT_ENABLE_CAPTURE_DELETE", "").strip().lower() in _TRUTHY_FLAG_VALUES
 
 
 def _parse_history(raw: str | None) -> list[dict] | None:
@@ -464,6 +479,50 @@ def capture_summary(
     if capture is None:
         raise HTTPException(404, "Unknown capture")
     return build_capture_summary(session, capture_id)
+
+
+@router.delete("/captures/{capture_id}")
+def delete_capture(
+    capture_id: int,
+    session: Session = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """#95 hard-delete: remove the capture and every capture_id-keyed row
+    from ParseCat's database.
+
+    Gated behind PARSECAT_ENABLE_CAPTURE_DELETE (default OFF). While OFF the
+    route behaves as if it does not exist -- it returns 404, not 403, so the
+    delete capability is not even advertised until the flag is turned on.
+    #122's review deferred the per-user ownership check to "the auth PR" --
+    this is that PR, so it's added here rather than left for a third pass:
+    same _owned_capture() scoping as every other /captures/{id} route, 404
+    (not 403) for someone else's capture, same as an unknown id.
+
+    Not soft-archive. After success, GET summary/diagnose/scan for this id
+    return 404. Device/investigation archive is a separate, recoverable path.
+    """
+    # Flag off -> pretend the route is not registered.
+    if not _capture_delete_enabled():
+        raise HTTPException(404, "Not Found")
+
+    if _owned_capture(session, capture_id, current_user_id) is None:
+        raise HTTPException(404, "Unknown capture")
+    if not hard_delete_capture(session, capture_id):
+        raise HTTPException(404, "Unknown capture")
+    return {
+        "ok": True,
+        "deleted_capture_id": capture_id,
+        # Honest wording (#122 review): this is logical removal from the live
+        # database plus secure_delete zeroing of the freed pages -- NOT a
+        # guarantee about copies outside the live DB. WAL/journal files and
+        # any backups/snapshots may still retain old pages until they roll
+        # over or are themselves purged.
+        "detail": (
+            "Capture and all capture_id-keyed rows removed from ParseCat's "
+            "database. Freed pages are zeroed via secure_delete. Note: WAL "
+            "files and backups may still retain old pages."
+        ),
+    }
 
 
 @router.post("/captures/{capture_id}/diagnose")

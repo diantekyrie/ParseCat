@@ -31,6 +31,7 @@ from app.parsers.packet_analysis import (
     _analyze_dot11_fallback,
     _decode_tshark_ssid,
     _dot11_frame_control,
+    ReasonCodeUnavailable,
     _dot11_reason_code,
     _radiotap_rssi_and_header_len,
     _tshark_bool,
@@ -60,14 +61,20 @@ def _radiotap_with_rssi(rssi_dbm: int) -> bytes:
     return header + rssi_byte  # 9 bytes total
 
 
-def _dot11_frame_control_bytes(ftype: int, subtype: int, retry: bool = False) -> bytes:
+def _dot11_frame_control_bytes(
+    ftype: int, subtype: int, retry: bool = False,
+    protected: bool = False, order: bool = False,
+) -> bytes:
     byte0 = ((subtype & 0xF) << 4) | ((ftype & 0x3) << 2)
-    byte1 = 0x08 if retry else 0x00
+    byte1 = (0x08 if retry else 0x00) | (0x40 if protected else 0x00) | (0x80 if order else 0x00)
     return bytes([byte0, byte1])
 
 
-def _dot11_mgmt_header(ftype: int, subtype: int, addr2: bytes, retry: bool = False) -> bytes:
-    fc = _dot11_frame_control_bytes(ftype, subtype, retry)
+def _dot11_mgmt_header(
+    ftype: int, subtype: int, addr2: bytes, retry: bool = False,
+    protected: bool = False, order: bool = False,
+) -> bytes:
+    fc = _dot11_frame_control_bytes(ftype, subtype, retry, protected, order)
     duration = b"\x00\x00"
     addr1 = b"\xff\xff\xff\xff\xff\xff"
     addr3 = b"\x11\x22\x33\x44\x55\x66"
@@ -144,18 +151,72 @@ def test_dot11_reason_code_reads_the_two_byte_field_after_the_mgmt_header():
     pkt = (
         _radiotap_with_rssi(-60)
         + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff")
-        + struct.pack("<H", 3)  # reason 3: Deauthenticated due to inactivity
+        + struct.pack("<H", 3)  # reason 3: "Deauthenticated: station leaving"
     )
     _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
     assert _dot11_reason_code(pkt, rt_len) == 3
 
 
-def test_dot11_reason_code_is_none_when_bytes_are_absent():
+def test_dot11_reason_code_is_encrypted_when_protected_bit_set():
+    # Arch review on #115: under 802.11w/PMF, a protected deauth/disassoc's
+    # body starts with a CCMP/GCMP header, not a plaintext reason code --
+    # these 2 bytes would be ciphertext, not frame 3's actual reason. Must
+    # return ENCRYPTED (present but unreadable), never a decoded value and
+    # never ABSENT (Arch review on #116: "not present" would be false).
+    pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff", protected=True)
+        + struct.pack("<H", 3)  # would read as reason 3 if the guard were missing
+    )
+    _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
+    assert _dot11_reason_code(pkt, rt_len) is ReasonCodeUnavailable.ENCRYPTED
+
+
+def test_dot11_reason_code_is_absent_when_order_bit_set_but_body_truncated():
+    # Arch review on #116: +HTC present but no reason bytes after it. The
+    # un-shifted offset would read the HTC bytes as a reason; must be ABSENT.
+    pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff", order=True)
+        + b"\x07\x00\x00\x00"  # +HT Control only; first 2 bytes look like reason 7
+    )
+    _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
+    assert _dot11_reason_code(pkt, rt_len) is ReasonCodeUnavailable.ABSENT
+
+
+def test_dot11_reason_code_is_encrypted_when_protected_and_order_both_set():
+    # Arch review on #116: Protected wins over Order -- even with a
+    # correctly shifted offset, the body is ciphertext.
+    pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff", protected=True, order=True)
+        + b"\x00\x00\x00\x00"
+        + struct.pack("<H", 7)
+    )
+    _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
+    assert _dot11_reason_code(pkt, rt_len) is ReasonCodeUnavailable.ENCRYPTED
+
+
+def test_dot11_reason_code_shifts_past_ht_control_when_order_bit_set():
+    # Arch review on #115: the Order bit adds a 4-byte +HT Control field
+    # between SeqCtrl and the frame body, shifting the reason code 4 bytes
+    # further in. Reading the un-shifted offset would decode HTC bytes.
+    pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff", order=True)
+        + b"\x00\x00\x00\x00"  # +HT Control (4 bytes), value irrelevant here
+        + struct.pack("<H", 7)  # actual reason code, after the HTC field
+    )
+    _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
+    assert _dot11_reason_code(pkt, rt_len) == 7
+
+
+def test_dot11_reason_code_is_absent_when_bytes_are_absent():
     # The pre-existing deauth fixture above has no reason-code bytes --
-    # must degrade to None, not a wrong guess or an IndexError.
+    # must return ReasonCodeUnavailable.ABSENT, not a wrong guess or an IndexError.
     pkt = _radiotap_with_rssi(-60) + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff")
     _rssi, rt_len = _radiotap_rssi_and_header_len(pkt)
-    assert _dot11_reason_code(pkt, rt_len) is None
+    assert _dot11_reason_code(pkt, rt_len) is ReasonCodeUnavailable.ABSENT
 
 
 def test_fallback_backend_decodes_deauth_and_disassoc_reason_codes(tmp_path):
@@ -184,8 +245,12 @@ def test_fallback_backend_decodes_deauth_and_disassoc_reason_codes(tmp_path):
     assert "reason code 3 (Deauthenticated: station leaving)" in by_kind["deauthentication"].detail
     assert "reason code 4 (Disassociated due to inactivity)" in by_kind["disassociation"].detail
     # Still real per-packet facts, not guesses -- note no longer claims
-    # reason codes are undecoded on this backend.
-    assert "reason code" not in result.note.lower() or "NOT decoded" not in result.note
+    # reason codes are undecoded on this backend (Arch review on #115:
+    # the prior assertion here was vacuous, true regardless of the note's
+    # actual wording -- this checks the two concrete claims instead).
+    assert "NOT decoded" not in result.note
+    assert "reason codes are exact per-packet facts" in result.note
+    assert "reported as consistent with encryption" in result.note
 
 
 def test_fallback_backend_reason_code_absent_says_so_not_unknown(tmp_path):
@@ -202,6 +267,80 @@ def test_fallback_backend_reason_code_absent_says_so_not_unknown(tmp_path):
     assert len(result.anomalies) == 1
     assert "not present in this packet" in result.anomalies[0].detail
     assert "reason code 0" not in result.anomalies[0].detail
+
+
+def test_fallback_backend_protected_deauth_reports_encrypted_not_a_wrong_reason(tmp_path):
+    # Arch review on #115/#116, end-to-end through _analyze_dot11_fallback:
+    # a PMF-protected deauth must never surface a decoded-looking reason
+    # code (its body is ciphertext), and must not claim the code is absent
+    # either -- it's present but encrypted.
+    deauth_pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff", protected=True)
+        + struct.pack("<H", 3)
+    )
+    pcap_path = tmp_path / "synthetic.pcap"
+    pcap_path.write_bytes(_pcap_global_header(127) + _pcap_record(deauth_pkt))
+
+    result = _analyze_dot11_fallback(pcap_path)
+    assert len(result.anomalies) == 1
+    # Arch review on #117: the Protected-bit inference is hedged, not asserted
+    # as decoded fact -- and this hedged wording is shared verbatim with the
+    # tshark backend via _reason_code_detail.
+    assert (
+        "reason field not dissected; Protected bit set, consistent with 802.11w encryption"
+        in result.anomalies[0].detail
+    )
+    assert "not present" not in result.anomalies[0].detail
+    assert "reason code 3" not in result.anomalies[0].detail
+
+
+def test_llm_bound_anomaly_rows_keep_reason_code_text_drop_mac(tmp_path):
+    # Arch review on #115: a fixture-based check of the actual LLM-bound
+    # payload (not just the parser's own PacketAnomalyEvent), mirroring how
+    # persistence.py serializes anomalies and reasoning._llm_safe_evidence_row
+    # filters them before they reach the prompt. Confirms SYSTEM_PROMPT rule
+    # 10a's claim holds end to end: a decoded reason code's detail text
+    # survives into the LLM-bound row untouched, a not-decodable one still
+    # says it's encrypted (never a fabricated number, never "not present"),
+    # and mac_or_ip never reaches it.
+    from app.services.reasoning import _llm_safe_evidence_row
+
+    decoded_pkt = (
+        _radiotap_with_rssi(-60)
+        + _dot11_mgmt_header(0, 12, addr2=b"\xaa\xbb\xcc\xdd\xee\xff")
+        + struct.pack("<H", 3)
+    )
+    protected_pkt = (
+        _radiotap_with_rssi(-55)
+        + _dot11_mgmt_header(0, 12, addr2=b"\x11\x22\x33\x44\x55\x66", protected=True)
+        + struct.pack("<H", 7)
+    )
+    pcap_path = tmp_path / "synthetic.pcap"
+    pcap_path.write_bytes(
+        _pcap_global_header(127)
+        + _pcap_record(decoded_pkt)
+        + _pcap_record(protected_pkt)
+    )
+
+    result = _analyze_dot11_fallback(pcap_path)
+    assert len(result.anomalies) == 2
+
+    # Same dict shape persistence.py writes to anomalies_json.
+    rows = [
+        {"timestamp": a.timestamp, "kind": a.kind, "detail": a.detail, "mac_or_ip": a.mac_or_ip}
+        for a in result.anomalies
+    ]
+    llm_rows = [_llm_safe_evidence_row(r) for r in rows]
+
+    decoded_row = next(r for r in llm_rows if "reason code 3" in r["detail"])
+    protected_row = next(r for r in llm_rows if r is not decoded_row)
+
+    assert "Deauthenticated: station leaving" in decoded_row["detail"]
+    assert "consistent with 802.11w encryption" in protected_row["detail"]
+    assert "not present" not in protected_row["detail"]
+    assert "reason code 7" not in protected_row["detail"]
+    assert "mac_or_ip" not in decoded_row and "mac_or_ip" not in protected_row
 
 
 def test_analyze_packet_capture_uses_fallback_when_tshark_unavailable(tmp_path, monkeypatch):
@@ -249,7 +388,9 @@ def test_tshark_fields_uses_current_wireshark_reason_code_name():
     # live_tshark test below is the real guard; this pins the known swap.
     assert "wlan_mgt.fixed.reason_code" not in TSHARK_FIELDS
     assert "wlan.fixed.reason_code" in TSHARK_FIELDS
-    assert TSHARK_FIELDS.index("wlan.fixed.reason_code") == 6
+    assert TSHARK_FIELDS.index("wlan.fixed.reason_code") == 7
+    assert "wlan.fc.protected" in TSHARK_FIELDS
+    assert TSHARK_FIELDS.index("wlan.fc.protected") == 3
 
 
 def test_analyze_with_tshark_decodes_deauth_reason_code(monkeypatch, tmp_path):
@@ -266,7 +407,15 @@ def test_analyze_with_tshark_decodes_deauth_reason_code(monkeypatch, tmp_path):
     assert result.backend == "tshark"
     assert len(result.anomalies) == 1
     assert result.anomalies[0].kind == "deauthentication"
-    assert "0x0003" in result.anomalies[0].detail
+    # #117: numeric (not hex dump / not the bare word "unknown"), with shared
+    # reason name. Re-scoped (Arch review on #117): the claim is that the old
+    # collapsed `reason code unknown` / raw-hex form is gone, not that the
+    # substring "unknown" never appears -- _reason_name legitimately emits
+    # "Unknown (802.11 reason N)" for an unmapped code (see the unmapped test).
+    assert "reason code 3" in result.anomalies[0].detail
+    assert "Deauthenticated: station leaving" in result.anomalies[0].detail
+    assert "reason code unknown" not in result.anomalies[0].detail.lower()
+    assert "0x" not in result.anomalies[0].detail
 
 
 def test_analyze_with_tshark_detects_tcp_reset_as_true_text(monkeypatch, tmp_path):
@@ -436,6 +585,122 @@ def test_analyze_with_tshark_skips_hidden_ssid_identity(monkeypatch, tmp_path):
     assert any(s.kind == "bssid" and s.value == "aa:bb:cc:dd:ee:ff" for s in result.identity_signals)
 
 
+
+def test_analyze_with_tshark_reason_code_zero_not_unknown(monkeypatch, tmp_path):
+    """#117: reserved reason code 0 is falsy in Python but must print as 0."""
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.fc.type": "0", "wlan.fc.subtype": "12",
+        "wlan.fixed.reason_code": "0",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    detail = result.anomalies[0].detail
+    assert "reason code 0" in detail
+    assert "Reserved/unspecified" in detail
+    assert "reason code unknown" not in detail.lower()
+
+
+def test_analyze_with_tshark_reason_code_hex_zero_not_unknown(monkeypatch, tmp_path):
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.fc.type": "0", "wlan.fc.subtype": "10",
+        "wlan.fixed.reason_code": "0x0000",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    detail = result.anomalies[0].detail
+    assert result.anomalies[0].kind == "disassociation"
+    assert "reason code 0" in detail
+    assert "reason code unknown" not in detail.lower()
+
+
+def test_analyze_with_tshark_reason_absent_says_not_present(monkeypatch, tmp_path):
+    """#117: empty reason + unprotected -> 'not present', never 'unknown'."""
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.fc.type": "0", "wlan.fc.subtype": "12",
+        "wlan.fc.protected": "False",
+        "wlan.fixed.reason_code": "",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    detail = result.anomalies[0].detail
+    assert "not present in this packet" in detail
+    assert "reason code unknown" not in detail.lower()
+    assert "reason code 0" not in detail
+
+
+def test_analyze_with_tshark_reason_encrypted_pmf_says_so(monkeypatch, tmp_path):
+    """#117: empty reason + Protected bit -> hedged encrypted wording.
+
+    Arch review on #117: the Protected bit is an *inference*, so the wording is
+    hedged ("consistent with 802.11w encryption"), not asserted as decoded
+    fact. The string is shared verbatim with the fallback backend.
+    """
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.fc.type": "0", "wlan.fc.subtype": "12",
+        "wlan.fc.protected": "True",
+        "wlan.fixed.reason_code": "",
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    detail = result.anomalies[0].detail
+    assert "reason field not dissected; Protected bit set, consistent with 802.11w encryption" in detail
+    assert "reason code unknown" not in detail.lower()
+    assert "not present" not in detail
+
+
+def test_analyze_with_tshark_unmapped_reason_code_uses_mapped_style(monkeypatch, tmp_path):
+    """#117: an UNMAPPED but present reason code renders in the mapped style
+    `reason code N (Unknown (802.11 reason N))`, NOT the old collapsed bare
+    `reason code unknown` / raw-`0xNNNN` form.
+
+    _reason_name returns the parenthesized "Unknown (802.11 reason N)" for a
+    code outside REASON_CODE_NAMES, so the substring "unknown" legitimately
+    appears here -- the claim (Arch review on #117) is that the decimal code
+    number survives and is not conflated away into a bare verdict. This is why
+    `"unknown" not in detail` would be the wrong assertion for this case.
+    """
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.fc.type": "0", "wlan.fc.subtype": "12",
+        "wlan.fixed.reason_code": "0x0063",  # 99, not in REASON_CODE_NAMES
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    detail = result.anomalies[0].detail
+    assert "reason code 99 (Unknown (802.11 reason 99))" in detail
+    # The decimal code survives and there is no raw-hex dump of the field.
+    assert "reason code unknown" not in detail.lower()
+    assert "0x" not in detail
+
+
+def test_parse_tshark_reason_code_helpers():
+    from app.parsers.packet_analysis import (
+        _parse_tshark_reason_code,
+        _tshark_mgmt_reason_detail,
+    )
+
+    assert _parse_tshark_reason_code("0") == 0
+    assert _parse_tshark_reason_code("0x0000") == 0
+    assert _parse_tshark_reason_code("0x0003") == 3
+    assert _parse_tshark_reason_code("") is None
+    assert _parse_tshark_reason_code("<MISSING>") is None
+    assert "reason code unknown" not in _tshark_mgmt_reason_detail("Deauthentication", "0", "").lower()
+
+
 @pytest.mark.skipif(not tshark_available(), reason="tshark not on PATH")
 def test_live_tshark_dissects_synthetic_80211_fixture(tmp_path):
     # End-to-end against real tshark (gated): catches the next renamed -e
@@ -469,4 +734,5 @@ def test_live_tshark_dissects_synthetic_80211_fixture(tmp_path):
     assert "SYNTH_PCAP_QA" in ssids
     deauths = [a for a in result.anomalies if a.kind == "deauthentication"]
     assert len(deauths) == 1
-    assert "0x0003" in deauths[0].detail
+    assert "reason code 3" in deauths[0].detail
+    assert "reason code unknown" not in deauths[0].detail.lower()

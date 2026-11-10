@@ -62,6 +62,7 @@ Gap-matrix decisions (issue #70, PC-pcap-004):
 """
 from __future__ import annotations
 
+import enum
 import shutil
 import struct
 import subprocess
@@ -118,6 +119,10 @@ def is_supported_link_layer_pcap(linktype: int) -> str:
 # something to guess at without a live tshark to check against.
 TSHARK_FIELDS = [
     "wlan.fc.type", "wlan.fc.subtype", "wlan.fc.retry",
+    # #117: Protected bit distinguishes PMF-encrypted deauth/disassoc
+    # (reason field present but not decodable) from a truncated/absent
+    # reason field. Same FT_BOOLEAN shape as wlan.fc.retry.
+    "wlan.fc.protected",
     "radiotap.dbm_antsignal", "wlan.ssid", "wlan.bssid",
     # wlan_mgt.fixed.reason_code was Wireshark's pre-4.x field name; it no
     # longer exists (confirmed against `tshark -G fields` on 4.4.18) and an
@@ -141,6 +146,77 @@ def _tshark_bool(raw: str) -> bool:
     # builds used "1"/"0". Accept both so tcp.flags.reset and wlan.fc.retry
     # (issues #68 + review on #80) never silently under-count.
     return raw in ("1", "True", "true")
+
+
+def _parse_tshark_reason_code(raw: str) -> int | None:
+    """Parse tshark's wlan.fixed.reason_code field to int.
+
+    tshark emits hex (`0x0003`) or decimal. Empty / `<MISSING>` means the
+    field was not dissected. Reserved code 0 is a real value (`is not None`),
+    never collapsed via truthiness (#117).
+    """
+    if not raw or raw == "<MISSING>":
+        return None
+    try:
+        return int(raw, 0)
+    except ValueError:
+        return None
+
+
+class ReasonCodeUnavailable(enum.Enum):
+    """Why a deauth/disassoc reason code couldn't be read (Arch review on #116).
+
+    ABSENT: the frame is too short to hold the 2-byte field.
+    ENCRYPTED: the field is there but the Protected bit (802.11w/PMF) is set,
+    which is consistent with the body being an encrypted CCMP/GCMP payload
+    rather than a plaintext reason code. We infer this from the Protected bit;
+    we do not decrypt to confirm. Saying "not present" for this case would be
+    false, and asserting the value "encrypted" as decoded fact would overclaim.
+    """
+
+    ABSENT = "absent"
+    ENCRYPTED = "encrypted"
+
+
+def _reason_code_detail(kind_label: str, outcome: "int | ReasonCodeUnavailable") -> str:
+    """Single source of truth for deauth/disassoc reason-code detail wording.
+
+    Used verbatim by BOTH the tshark and the hand-rolled fallback backend
+    (Arch review on #117) so their anomaly detail strings are provably
+    identical -- there is no second copy to drift. Three outcomes:
+
+    - numeric code (including reserved 0) -> `reason code N (<shared name>)`
+    - ENCRYPTED -> hedged: the Protected bit is set, which is *consistent with*
+      802.11w encryption, but we do not assert the frame is encrypted/
+      undecodable as established fact from that bit alone.
+    - ABSENT -> the reason-code bytes are not present in this packet.
+
+    Never the old conflated bare word "unknown".
+    """
+    if outcome is ReasonCodeUnavailable.ENCRYPTED:
+        return (
+            f"{kind_label} frame (reason field not dissected; Protected bit "
+            "set, consistent with 802.11w encryption)"
+        )
+    if outcome is ReasonCodeUnavailable.ABSENT:
+        return f"{kind_label} frame (reason code not present in this packet)"
+    return f"{kind_label} frame, reason code {outcome} ({_reason_name(outcome)})"
+
+
+def _tshark_mgmt_reason_detail(kind_label: str, reason_raw: str, protected_raw: str) -> str:
+    """Map tshark's raw reason/protected fields onto the shared wording.
+
+    Delegates to `_reason_code_detail`, the single wording source shared with
+    the fallback backend, so the two backends cannot drift (Arch review on
+    #117). Distinguishes an encrypted body (Protected bit set, reason field
+    not dissected) from a truly absent field, and keeps reserved code 0.
+    """
+    code = _parse_tshark_reason_code(reason_raw)
+    if code is not None:
+        return _reason_code_detail(kind_label, code)
+    if _tshark_bool(protected_raw):
+        return _reason_code_detail(kind_label, ReasonCodeUnavailable.ENCRYPTED)
+    return _reason_code_detail(kind_label, ReasonCodeUnavailable.ABSENT)
 
 
 def _decode_tshark_ssid(raw: str) -> str | None:
@@ -184,9 +260,9 @@ def analyze_with_tshark(path: Path, link_layer: str) -> PacketAnalysis:
     packets_with_type_subtype = 0
 
     for row in rows:
-        (wlan_type, wlan_subtype, retry, dbm, ssid, bssid,
+        (wlan_type, wlan_subtype, retry, protected, dbm, ssid, bssid,
          reason_code, ts, ip_src, ip_dst, tcp_rst, dns_qry,
-         tcp_retrans) = (row + [""] * 13)[:13]
+         tcp_retrans) = (row + [""] * 14)[:14]
 
         if wlan_type and wlan_subtype:
             try:
@@ -200,13 +276,17 @@ def analyze_with_tshark(path: Path, link_layer: str) -> PacketAnalysis:
                 if ftype == 0 and subtype == 12:
                     anomalies.append(PacketAnomalyEvent(
                         timestamp=ts or None, kind="deauthentication",
-                        detail=f"Deauthentication frame, reason code {reason_code or 'unknown'}",
+                        detail=_tshark_mgmt_reason_detail(
+                            "Deauthentication", reason_code, protected,
+                        ),
                         mac_or_ip=bssid or None,
                     ))
                 elif ftype == 0 and subtype == 10:
                     anomalies.append(PacketAnomalyEvent(
                         timestamp=ts or None, kind="disassociation",
-                        detail=f"Disassociation frame, reason code {reason_code or 'unknown'}",
+                        detail=_tshark_mgmt_reason_detail(
+                            "Disassociation", reason_code, protected,
+                        ),
                         mac_or_ip=bssid or None,
                     ))
         if _tshark_bool(retry):
@@ -336,15 +416,40 @@ def _dot11_addr2(pkt: bytes, dot11_start: int, ftype: int) -> str | None:
     return ":".join(f"{b:02x}" for b in mac)
 
 
-def _dot11_reason_code(pkt: bytes, dot11_start: int) -> int | None:
-    # #70: for Deauthentication and Disassociation frames, the frame body
-    # is the Reason Code field ALONE (2 bytes, little-endian) -- no other
-    # fixed fields, no IEs -- immediately after the same 24-byte non-QoS/
-    # non-4-address management header used by _dot11_addr2 above: FC(2) +
-    # Duration(2) + addr1(6) + addr2(6) + addr3(6) + SeqCtrl(2).
+def _dot11_reason_code(pkt: bytes, dot11_start: int) -> int | ReasonCodeUnavailable:
+    # #70 / Arch review on #115: for Deauthentication and Disassociation
+    # frames, the frame body is the Reason Code field ALONE (2 bytes,
+    # little-endian) -- no other fixed fields, no IEs -- immediately after
+    # the same 24-byte non-QoS/non-4-address management header used by
+    # _dot11_addr2 above: FC(2) + Duration(2) + addr1(6) + addr2(6) +
+    # addr3(6) + SeqCtrl(2). But that only holds for a plaintext frame with
+    # no +HT Control field:
+    #   * Protected bit (FC byte 1, 0x40) -- under 802.11w/PMF, deauth/
+    #     disassoc sent after association are encrypted: the body starts
+    #     with a CCMP/GCMP header, not the reason code. Reading these 2
+    #     bytes would decode ciphertext as a confident-looking (wrong)
+    #     reason -- exactly the fabricated fact this parser must not
+    #     produce. The reason code IS present, just encrypted, so return
+    #     ENCRYPTED (not ABSENT) and let the caller say so truthfully.
+    #   * Order bit (FC byte 1, 0x80) -- adds a 4-byte +HT Control field
+    #     between SeqCtrl and the frame body, shifting the reason code.
+    # Scope: non-QoS management frames only. The +HTC shift is the only
+    # variable offset handled; deauth/disassoc are never 4-address frames.
+    # Protected wins over Order: if both are set, the body is still
+    # ciphertext, so ENCRYPTED. Deterministic for a given byte string.
+    # addr2's offset is unaffected by either bit -- it's part of the fixed
+    # MAC header, before SeqCtrl/+HTC/body -- so _dot11_addr2 needs no
+    # equivalent guard.
+    if dot11_start + 2 > len(pkt):
+        return ReasonCodeUnavailable.ABSENT
+    fc_byte1 = pkt[dot11_start + 1]
+    if fc_byte1 & 0x40:  # Protected Frame
+        return ReasonCodeUnavailable.ENCRYPTED
     off = dot11_start + 2 + 2 + 6 + 6 + 6 + 2
+    if fc_byte1 & 0x80:  # Order (+HT Control present)
+        off += 4
     if off + 2 > len(pkt):
-        return None
+        return ReasonCodeUnavailable.ABSENT
     return struct.unpack("<H", pkt[off:off + 2])[0]
 
 
@@ -410,13 +515,9 @@ def _analyze_dot11_fallback(path: Path) -> PacketAnalysis:
             elif ftype == 0 and subtype in (10, 12):  # Disassoc, Deauth
                 bssid = _dot11_addr2(pkt, rt_len, ftype)
                 reason_code = _dot11_reason_code(pkt, rt_len)
-                if reason_code is None:
-                    detail = f"{dot11_frame_label(ftype, subtype)} frame (reason code not present in this packet)"
-                else:
-                    detail = (
-                        f"{dot11_frame_label(ftype, subtype)} frame, reason code "
-                        f"{reason_code} ({_reason_name(reason_code)})"
-                    )
+                detail = _reason_code_detail(
+                    dot11_frame_label(ftype, subtype), reason_code
+                )
                 anomalies.append(PacketAnomalyEvent(
                     timestamp=None,
                     kind="deauthentication" if subtype == 12 else "disassociation",
@@ -445,7 +546,10 @@ def _analyze_dot11_fallback(path: Path) -> PacketAnalysis:
         note=(
             "Hand-rolled radiotap/802.11 header parser (tshark not available). Frame "
             "type/subtype, retry flag, RSSI, and deauthentication/disassociation "
-            "reason codes are exact per-packet facts. No TCP/retransmission analysis "
+            "reason codes are exact per-packet facts when plaintext; a set "
+            "Protected bit (PMF/802.11w) is reported as consistent with "
+            "encryption rather than decoded to a reason value. No "
+            "TCP/retransmission analysis "
             "is attempted on this 802.11 monitor-mode path -- that stays tshark-only "
             "by design, not a gap to be closed here."
         ),

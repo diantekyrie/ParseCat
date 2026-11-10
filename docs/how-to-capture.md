@@ -8,7 +8,7 @@ the evidence.
 
 This guide covers the two capture mistakes that matter most for Bluetooth
 and full-platform diagnosis. It does **not** claim every OEM matches the
-AOSP paths below — labels and folders vary; Prefer uploading the **whole
+AOSP paths below — labels and folders vary. Prefer uploading the **whole
 bugreport ZIP** and let ParseCat search known locations.
 
 No sample captures, serials, or personal data belong in this doc.
@@ -88,8 +88,9 @@ the Developer-options toggle is what enables fuller HCI logging. See
   file ParseCat can decode; when none is found, ParseCat reports
   `No Bluetooth HCI snoop log found` (or a format mismatch warning).
 - A `.txt`-only upload cannot include the ZIP-resident HCI file.
-- HCI framing decode covers load-bearing connection / disconnect / command
-  status events — **not** full L2CAP / profile disassembly (see README).
+- HCI framing decode covers connection / disconnection, authentication,
+  encryption, link-key / pairing, and command status events — **not** full
+  L2CAP / profile disassembly (see README).
 
 ## Quick checklist
 

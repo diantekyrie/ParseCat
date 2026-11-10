@@ -1,11 +1,28 @@
 from __future__ import annotations
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlmodel import SQLModel, Session, create_engine
 
 DATABASE_URL = "sqlite:///./parsecat.db"
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+
+
+# Capture hard-delete (#95) is meant to actually get PII-bearing free-text off
+# disk, not just unlink it from the live tables. By default SQLite leaves the
+# old bytes sitting in freed pages until they're reused, so a deleted capture's
+# content can linger in the database file. PRAGMA secure_delete=ON makes SQLite
+# zero out freed pages as part of the DELETE, so hard_delete_capture's freed
+# pages hold zeros rather than stale rows. It applies per-connection, so set it
+# on every connect. (This is about the live DB file only -- WAL/journal files
+# and external backups are out of scope; see hard_delete_capture's docstring.)
+@event.listens_for(engine, "connect")
+def _enable_secure_delete(dbapi_connection, connection_record):  # noqa: ANN001
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA secure_delete=ON")
+    finally:
+        cursor.close()
 
 # No migration framework in this project (no Alembic) -- create_all() only
 # creates tables that don't exist yet, it never alters an existing table to

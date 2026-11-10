@@ -8,7 +8,7 @@ the evidence.
 
 This guide covers the two capture mistakes that matter most for Bluetooth
 and full-platform diagnosis. It does **not** claim every OEM matches the
-AOSP paths below — labels and folders vary; Prefer uploading the **whole
+AOSP paths below — labels and folders vary. Prefer uploading the **whole
 bugreport ZIP** and let ParseCat search known locations.
 
 No sample captures, serials, or personal data belong in this doc.

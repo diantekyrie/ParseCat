@@ -250,7 +250,7 @@ def test_fallback_backend_decodes_deauth_and_disassoc_reason_codes(tmp_path):
     # actual wording -- this checks the two concrete claims instead).
     assert "NOT decoded" not in result.note
     assert "reason codes are exact per-packet facts" in result.note
-    assert "PMF-protected (802.11w) reason codes are reported as encrypted" in result.note
+    assert "reported as consistent with encryption" in result.note
 
 
 def test_fallback_backend_reason_code_absent_says_so_not_unknown(tmp_path):
@@ -284,7 +284,13 @@ def test_fallback_backend_protected_deauth_reports_encrypted_not_a_wrong_reason(
 
     result = _analyze_dot11_fallback(pcap_path)
     assert len(result.anomalies) == 1
-    assert "reason code encrypted (802.11w protected frame), not decodable" in result.anomalies[0].detail
+    # Arch review on #117: the Protected-bit inference is hedged, not asserted
+    # as decoded fact -- and this hedged wording is shared verbatim with the
+    # tshark backend via _reason_code_detail.
+    assert (
+        "reason field not dissected; Protected bit set, consistent with 802.11w encryption"
+        in result.anomalies[0].detail
+    )
     assert "not present" not in result.anomalies[0].detail
     assert "reason code 3" not in result.anomalies[0].detail
 
@@ -331,7 +337,7 @@ def test_llm_bound_anomaly_rows_keep_reason_code_text_drop_mac(tmp_path):
     protected_row = next(r for r in llm_rows if r is not decoded_row)
 
     assert "Deauthenticated: station leaving" in decoded_row["detail"]
-    assert "reason code encrypted" in protected_row["detail"]
+    assert "consistent with 802.11w encryption" in protected_row["detail"]
     assert "not present" not in protected_row["detail"]
     assert "reason code 7" not in protected_row["detail"]
     assert "mac_or_ip" not in decoded_row and "mac_or_ip" not in protected_row
@@ -401,10 +407,15 @@ def test_analyze_with_tshark_decodes_deauth_reason_code(monkeypatch, tmp_path):
     assert result.backend == "tshark"
     assert len(result.anomalies) == 1
     assert result.anomalies[0].kind == "deauthentication"
-    # #117: numeric (not hex dump / not "unknown"), with shared reason name.
+    # #117: numeric (not hex dump / not the bare word "unknown"), with shared
+    # reason name. Re-scoped (Arch review on #117): the claim is that the old
+    # collapsed `reason code unknown` / raw-hex form is gone, not that the
+    # substring "unknown" never appears -- _reason_name legitimately emits
+    # "Unknown (802.11 reason N)" for an unmapped code (see the unmapped test).
     assert "reason code 3" in result.anomalies[0].detail
     assert "Deauthenticated: station leaving" in result.anomalies[0].detail
-    assert "unknown" not in result.anomalies[0].detail.lower()
+    assert "reason code unknown" not in result.anomalies[0].detail.lower()
+    assert "0x" not in result.anomalies[0].detail
 
 
 def test_analyze_with_tshark_detects_tcp_reset_as_true_text(monkeypatch, tmp_path):
@@ -589,7 +600,7 @@ def test_analyze_with_tshark_reason_code_zero_not_unknown(monkeypatch, tmp_path)
     detail = result.anomalies[0].detail
     assert "reason code 0" in detail
     assert "Reserved/unspecified" in detail
-    assert "unknown" not in detail.lower()
+    assert "reason code unknown" not in detail.lower()
 
 
 def test_analyze_with_tshark_reason_code_hex_zero_not_unknown(monkeypatch, tmp_path):
@@ -605,7 +616,7 @@ def test_analyze_with_tshark_reason_code_hex_zero_not_unknown(monkeypatch, tmp_p
     detail = result.anomalies[0].detail
     assert result.anomalies[0].kind == "disassociation"
     assert "reason code 0" in detail
-    assert "unknown" not in detail.lower()
+    assert "reason code unknown" not in detail.lower()
 
 
 def test_analyze_with_tshark_reason_absent_says_not_present(monkeypatch, tmp_path):
@@ -622,12 +633,17 @@ def test_analyze_with_tshark_reason_absent_says_not_present(monkeypatch, tmp_pat
     result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
     detail = result.anomalies[0].detail
     assert "not present in this packet" in detail
-    assert "unknown" not in detail.lower()
+    assert "reason code unknown" not in detail.lower()
     assert "reason code 0" not in detail
 
 
 def test_analyze_with_tshark_reason_encrypted_pmf_says_so(monkeypatch, tmp_path):
-    """#117: empty reason + Protected bit -> encrypted wording, not 'unknown'."""
+    """#117: empty reason + Protected bit -> hedged encrypted wording.
+
+    Arch review on #117: the Protected bit is an *inference*, so the wording is
+    hedged ("consistent with 802.11w encryption"), not asserted as decoded
+    fact. The string is shared verbatim with the fallback backend.
+    """
     import app.parsers.packet_analysis as pa_module
 
     row = _tshark_row(**{
@@ -639,9 +655,36 @@ def test_analyze_with_tshark_reason_encrypted_pmf_says_so(monkeypatch, tmp_path)
 
     result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
     detail = result.anomalies[0].detail
-    assert "encrypted (802.11w protected frame), not decodable" in detail
-    assert "unknown" not in detail.lower()
+    assert "reason field not dissected; Protected bit set, consistent with 802.11w encryption" in detail
+    assert "reason code unknown" not in detail.lower()
     assert "not present" not in detail
+
+
+def test_analyze_with_tshark_unmapped_reason_code_uses_mapped_style(monkeypatch, tmp_path):
+    """#117: an UNMAPPED but present reason code renders in the mapped style
+    `reason code N (Unknown (802.11 reason N))`, NOT the old collapsed bare
+    `reason code unknown` / raw-`0xNNNN` form.
+
+    _reason_name returns the parenthesized "Unknown (802.11 reason N)" for a
+    code outside REASON_CODE_NAMES, so the substring "unknown" legitimately
+    appears here -- the claim (Arch review on #117) is that the decimal code
+    number survives and is not conflated away into a bare verdict. This is why
+    `"unknown" not in detail` would be the wrong assertion for this case.
+    """
+    import app.parsers.packet_analysis as pa_module
+
+    row = _tshark_row(**{
+        "wlan.fc.type": "0", "wlan.fc.subtype": "12",
+        "wlan.fixed.reason_code": "0x0063",  # 99, not in REASON_CODE_NAMES
+    })
+    monkeypatch.setattr(pa_module, "_run_tshark_fields", lambda path: [row])
+
+    result = analyze_with_tshark(tmp_path / "unused.pcap", "802.11")
+    detail = result.anomalies[0].detail
+    assert "reason code 99 (Unknown (802.11 reason 99))" in detail
+    # The decimal code survives and there is no raw-hex dump of the field.
+    assert "reason code unknown" not in detail.lower()
+    assert "0x" not in detail
 
 
 def test_parse_tshark_reason_code_helpers():
@@ -655,7 +698,7 @@ def test_parse_tshark_reason_code_helpers():
     assert _parse_tshark_reason_code("0x0003") == 3
     assert _parse_tshark_reason_code("") is None
     assert _parse_tshark_reason_code("<MISSING>") is None
-    assert "unknown" not in _tshark_mgmt_reason_detail("Deauthentication", "0", "").lower()
+    assert "reason code unknown" not in _tshark_mgmt_reason_detail("Deauthentication", "0", "").lower()
 
 
 @pytest.mark.skipif(not tshark_available(), reason="tshark not on PATH")
@@ -692,4 +735,4 @@ def test_live_tshark_dissects_synthetic_80211_fixture(tmp_path):
     deauths = [a for a in result.anomalies if a.kind == "deauthentication"]
     assert len(deauths) == 1
     assert "reason code 3" in deauths[0].detail
-    assert "unknown" not in deauths[0].detail.lower()
+    assert "reason code unknown" not in deauths[0].detail.lower()

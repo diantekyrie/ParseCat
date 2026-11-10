@@ -163,25 +163,60 @@ def _parse_tshark_reason_code(raw: str) -> int | None:
         return None
 
 
-def _tshark_mgmt_reason_detail(kind_label: str, reason_raw: str, protected_raw: str) -> str:
-    """Three-way wording matching the fallback backend (#116/#117).
+class ReasonCodeUnavailable(enum.Enum):
+    """Why a deauth/disassoc reason code couldn't be read (Arch review on #116).
 
-    - numeric code (including 0) with shared `_reason_name`
-    - protected + no code -> encrypted (802.11w), not decodable
-    - else -> not present in this packet
-    Never the conflated word "unknown".
+    ABSENT: the frame is too short to hold the 2-byte field.
+    ENCRYPTED: the field is there but the Protected bit (802.11w/PMF) is set,
+    which is consistent with the body being an encrypted CCMP/GCMP payload
+    rather than a plaintext reason code. We infer this from the Protected bit;
+    we do not decrypt to confirm. Saying "not present" for this case would be
+    false, and asserting the value "encrypted" as decoded fact would overclaim.
+    """
+
+    ABSENT = "absent"
+    ENCRYPTED = "encrypted"
+
+
+def _reason_code_detail(kind_label: str, outcome: "int | ReasonCodeUnavailable") -> str:
+    """Single source of truth for deauth/disassoc reason-code detail wording.
+
+    Used verbatim by BOTH the tshark and the hand-rolled fallback backend
+    (Arch review on #117) so their anomaly detail strings are provably
+    identical -- there is no second copy to drift. Three outcomes:
+
+    - numeric code (including reserved 0) -> `reason code N (<shared name>)`
+    - ENCRYPTED -> hedged: the Protected bit is set, which is *consistent with*
+      802.11w encryption, but we do not assert the frame is encrypted/
+      undecodable as established fact from that bit alone.
+    - ABSENT -> the reason-code bytes are not present in this packet.
+
+    Never the old conflated bare word "unknown".
+    """
+    if outcome is ReasonCodeUnavailable.ENCRYPTED:
+        return (
+            f"{kind_label} frame (reason field not dissected; Protected bit "
+            "set, consistent with 802.11w encryption)"
+        )
+    if outcome is ReasonCodeUnavailable.ABSENT:
+        return f"{kind_label} frame (reason code not present in this packet)"
+    return f"{kind_label} frame, reason code {outcome} ({_reason_name(outcome)})"
+
+
+def _tshark_mgmt_reason_detail(kind_label: str, reason_raw: str, protected_raw: str) -> str:
+    """Map tshark's raw reason/protected fields onto the shared wording.
+
+    Delegates to `_reason_code_detail`, the single wording source shared with
+    the fallback backend, so the two backends cannot drift (Arch review on
+    #117). Distinguishes an encrypted body (Protected bit set, reason field
+    not dissected) from a truly absent field, and keeps reserved code 0.
     """
     code = _parse_tshark_reason_code(reason_raw)
     if code is not None:
-        return (
-            f"{kind_label} frame, reason code {code} ({_reason_name(code)})"
-        )
+        return _reason_code_detail(kind_label, code)
     if _tshark_bool(protected_raw):
-        return (
-            f"{kind_label} frame (reason code encrypted "
-            "(802.11w protected frame), not decodable)"
-        )
-    return f"{kind_label} frame (reason code not present in this packet)"
+        return _reason_code_detail(kind_label, ReasonCodeUnavailable.ENCRYPTED)
+    return _reason_code_detail(kind_label, ReasonCodeUnavailable.ABSENT)
 
 
 def _decode_tshark_ssid(raw: str) -> str | None:
@@ -381,18 +416,6 @@ def _dot11_addr2(pkt: bytes, dot11_start: int, ftype: int) -> str | None:
     return ":".join(f"{b:02x}" for b in mac)
 
 
-class ReasonCodeUnavailable(enum.Enum):
-    """Why a deauth/disassoc reason code couldn't be read (Arch review on #116).
-
-    ABSENT: the frame is too short to hold the 2-byte field.
-    ENCRYPTED: the field is there but encrypted (802.11w/PMF Protected bit),
-    so it can't be decoded. Saying "not present" for this case would be false.
-    """
-
-    ABSENT = "absent"
-    ENCRYPTED = "encrypted"
-
-
 def _dot11_reason_code(pkt: bytes, dot11_start: int) -> int | ReasonCodeUnavailable:
     # #70 / Arch review on #115: for Deauthentication and Disassociation
     # frames, the frame body is the Reason Code field ALONE (2 bytes,
@@ -492,18 +515,9 @@ def _analyze_dot11_fallback(path: Path) -> PacketAnalysis:
             elif ftype == 0 and subtype in (10, 12):  # Disassoc, Deauth
                 bssid = _dot11_addr2(pkt, rt_len, ftype)
                 reason_code = _dot11_reason_code(pkt, rt_len)
-                if reason_code is ReasonCodeUnavailable.ENCRYPTED:
-                    detail = (
-                        f"{dot11_frame_label(ftype, subtype)} frame (reason code encrypted "
-                        "(802.11w protected frame), not decodable)"
-                    )
-                elif reason_code is ReasonCodeUnavailable.ABSENT:
-                    detail = f"{dot11_frame_label(ftype, subtype)} frame (reason code not present in this packet)"
-                else:
-                    detail = (
-                        f"{dot11_frame_label(ftype, subtype)} frame, reason code "
-                        f"{reason_code} ({_reason_name(reason_code)})"
-                    )
+                detail = _reason_code_detail(
+                    dot11_frame_label(ftype, subtype), reason_code
+                )
                 anomalies.append(PacketAnomalyEvent(
                     timestamp=None,
                     kind="deauthentication" if subtype == 12 else "disassociation",
@@ -532,8 +546,9 @@ def _analyze_dot11_fallback(path: Path) -> PacketAnalysis:
         note=(
             "Hand-rolled radiotap/802.11 header parser (tshark not available). Frame "
             "type/subtype, retry flag, RSSI, and deauthentication/disassociation "
-            "reason codes are exact per-packet facts when plaintext; PMF-protected "
-            "(802.11w) reason codes are reported as encrypted, not decoded. No "
+            "reason codes are exact per-packet facts when plaintext; a set "
+            "Protected bit (PMF/802.11w) is reported as consistent with "
+            "encryption rather than decoded to a reason value. No "
             "TCP/retransmission analysis "
             "is attempted on this 802.11 monitor-mode path -- that stays tshark-only "
             "by design, not a gap to be closed here."

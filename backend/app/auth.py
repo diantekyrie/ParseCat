@@ -56,6 +56,7 @@ REFRESH_TOKEN_DAYS_ENV = "PARSECAT_REFRESH_TOKEN_DAYS"
 _DEFAULT_REFRESH_TOKEN_DAYS = 30
 REFRESH_COOKIE_NAME = "parsecat_refresh"
 SESSION_SECRET_ENV = "PARSECAT_SESSION_SECRET"
+_MIN_SESSION_SECRET_LENGTH = 32
 
 # Exempt so a host's liveness probe (Render's optional Health Check Path, or
 # any uptime monitor) can work without a session, and so the auth endpoints
@@ -79,16 +80,28 @@ def _load_session_secret() -> bytes:
     instances behind a load balancer): each gets its OWN random secret, so
     a token signed by worker A fails verification on worker B -- indistinguishable
     from a real expired session to the user, who just sees random logouts.
-    Set PARSECAT_SESSION_SECRET (any non-empty string; a random 32+ byte
-    value, e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`)
-    to a FIXED value shared by every worker/instance before running more
-    than one process. Leave it unset for local dev or a confirmed
-    single-process deploy, where the random-per-start default is strictly
-    better (forced re-auth on every restart, nothing to leak if the process
-    memory is ever dumped).
+    Set PARSECAT_SESSION_SECRET (a random 32+ byte value, e.g.
+    `python -c "import secrets; print(secrets.token_urlsafe(32))"`) to a
+    FIXED value shared by every worker/instance before running more than
+    one process. Leave it unset for local dev or a confirmed single-process
+    deploy, where the random-per-start default is strictly better (forced
+    re-auth on every restart, nothing to leak if the process memory is ever
+    dumped).
+
+    Rejects a value shorter than _MIN_SESSION_SECRET_LENGTH rather than
+    silently signing every token with a brute-forceable HMAC key -- a typo'd
+    short value (Arch review on #123) must fail loudly at startup, not
+    quietly weaken every session.
     """
     raw = os.environ.get(SESSION_SECRET_ENV)
     if raw:
+        if len(raw) < _MIN_SESSION_SECRET_LENGTH:
+            raise RuntimeError(
+                f"{SESSION_SECRET_ENV} is set but only {len(raw)} characters long -- "
+                f"need at least {_MIN_SESSION_SECRET_LENGTH} to resist brute-forcing the "
+                f"HMAC key every session token is signed with. Generate one with "
+                f'`python -c "import secrets; print(secrets.token_urlsafe(32))"`.'
+            )
         return raw.encode("utf-8")
     return secrets.token_bytes(32)
 

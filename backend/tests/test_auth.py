@@ -134,10 +134,10 @@ def test_session_secret_is_fixed_across_calls_when_env_var_is_set(monkeypatch):
     call (standing in for every worker) agree on the same bytes."""
     from app.auth import _load_session_secret
 
-    monkeypatch.setenv("PARSECAT_SESSION_SECRET", "fixed-secret-for-every-worker")
+    monkeypatch.setenv("PARSECAT_SESSION_SECRET", "fixed-secret-for-every-worker-32-chars-ok")
     first = _load_session_secret()
     second = _load_session_secret()
-    assert first == second == b"fixed-secret-for-every-worker"
+    assert first == second == b"fixed-secret-for-every-worker-32-chars-ok"
 
 
 def test_session_secret_is_random_per_call_when_env_var_unset(monkeypatch):
@@ -151,6 +151,17 @@ def test_session_secret_is_random_per_call_when_env_var_unset(monkeypatch):
     second = _load_session_secret()
     assert first != second
     assert len(first) == 32
+
+
+def test_session_secret_rejects_a_short_value(monkeypatch):
+    """Arch review on #123: a typo'd short PARSECAT_SESSION_SECRET must
+    fail loudly at startup rather than quietly sign every session token
+    with a brute-forceable HMAC key."""
+    from app.auth import _load_session_secret
+
+    monkeypatch.setenv("PARSECAT_SESSION_SECRET", "too-short")
+    with pytest.raises(RuntimeError, match="PARSECAT_SESSION_SECRET"):
+        _load_session_secret()
 
 
 def test_login_with_no_users_provisioned_is_503():

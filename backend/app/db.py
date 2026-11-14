@@ -96,6 +96,13 @@ def _run_label_ownership_index_migrations() -> None:
     Detects both shapes by the COLUMNS a unique index covers, not by name,
     so this is idempotent and a true no-op on a DB that's already correct
     (fresh, or previously migrated) -- safe to run on every startup.
+
+    The drop path (DROP INDEX) assumes the legacy unique index is a
+    standalone one, e.g. from Field(index=True, unique=True) -- which is
+    the only shape `main` has ever produced for `label`. SQLite refuses to
+    drop a `sqlite_autoindex_*` backing an inline UNIQUE constraint, so if
+    a legacy DB ever had `label` unique that way instead, this would raise
+    inside init_db() (Arch review on #123's re-review of 30a373f).
     """
     with engine.begin() as conn:
         for table, legacy_col, owner_cols, new_index_name in _LABEL_OWNERSHIP_INDEX_MIGRATIONS:

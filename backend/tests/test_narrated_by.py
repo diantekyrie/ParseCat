@@ -9,6 +9,15 @@ test_api_user_flows.py::test_diagnose_unknown_provider_...); the new
 `narrated_by` field carries only a fixed provider id -- never the key, a
 key prefix, the visitor's model string, or an echoed request field.
 
+Arch review on #123: BYOK originally covered only OpenRouter, so a single
+"openrouter-byok" constant was accurate by definition. #123 widened BYOK to
+anthropic/openai/grok too without updating this -- every one of those would
+have collapsed onto the OpenRouter label, mislabelling who actually
+narrated (the exact #84 bug, reintroduced one layer up). byok_narrated_by()
+now derives a per-provider id ("anthropic-byok", "grok-byok", ...);
+`test_scan_with_anthropic_byok_reports_its_own_id_not_openrouters` below
+pins the cross-provider case that was wrong before this fix.
+
 HTTP-level via TestClient, synthetic in-memory captures only, and the BYOK
 client is faked: no network calls, no real keys.
 """
@@ -16,7 +25,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.llm import BYOK_ENV, BYOK_PROVIDER_ID, EGRESS_ENV, resolve_provider_id
+from app.llm import BYOK_ENV, EGRESS_ENV, byok_narrated_by, resolve_provider_id
 from app.services import reasoning
 
 # Reuse the HTTP client fixture + synthetic upload helper.
@@ -44,8 +53,8 @@ def fake_byok(monkeypatch):
     monkeypatch.setenv(BYOK_ENV, "1")
     calls = []
 
-    def _fake_get_byok_client(api_key, model=None):
-        calls.append((api_key, model))
+    def _fake_get_byok_client(provider, api_key, model=None):
+        calls.append((provider, api_key, model))
         return _FakeByokClient()
 
     monkeypatch.setattr(reasoning, "get_byok_client", _fake_get_byok_client)
@@ -59,32 +68,55 @@ def _assert_no_key_leak(resp):
     assert DUMMY_MODEL not in raw
 
 
-def test_scan_with_byok_reports_byok_id_not_the_requested_stub(client, fake_byok):
+def test_scan_with_byok_reports_byok_id_not_the_requested_provider(client, fake_byok):
+    # _resolve_byok only applies a BYOK key when the selected provider is
+    # itself BYOK-capable (app.llm.BYOK_PROVIDER_IDS) -- "stub" never
+    # qualifies, so this exercises a real BYOK-capable selection instead.
     capture_id = _upload_txt(client, "Pixel").json()["capture_id"]
     resp = client.post(
         f"/api/captures/{capture_id}/scan",
-        data={"provider": "stub", "byok_api_key": DUMMY_KEY, "byok_model": DUMMY_MODEL},
+        data={"provider": "openrouter", "byok_api_key": DUMMY_KEY, "byok_model": DUMMY_MODEL},
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["report"].endswith("live BYOK narration (fake)")
-    assert body["narrated_by"] == "openrouter-byok" == BYOK_PROVIDER_ID
-    assert body["provider"] == "stub"  # requested value still echoed
-    assert fake_byok == [(DUMMY_KEY, DUMMY_MODEL)]
+    assert body["narrated_by"] == "openrouter-byok" == byok_narrated_by("openrouter")
+    assert body["provider"] == "openrouter"  # requested value still echoed
+    assert fake_byok == [("openrouter", DUMMY_KEY, DUMMY_MODEL)]
     _assert_no_key_leak(resp)
 
 
-def test_diagnose_with_byok_reports_byok_id_not_the_requested_stub(client, fake_byok):
+def test_scan_with_anthropic_byok_reports_its_own_id_not_openrouters(client, fake_byok):
+    # Arch review on #123: the bug this pins. Before byok_narrated_by(),
+    # EVERY BYOK provider's narrated_by was the single hardcoded
+    # "openrouter-byok" constant -- a saved Anthropic key would have
+    # narrated the capture but been labelled "OpenRouter (your key)" in
+    # the UI, mislabelling who actually ran it.
+    capture_id = _upload_txt(client, "Pixel").json()["capture_id"]
+    resp = client.post(
+        f"/api/captures/{capture_id}/scan",
+        data={"provider": "anthropic", "byok_api_key": DUMMY_KEY, "byok_model": DUMMY_MODEL},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["narrated_by"] == "anthropic-byok" == byok_narrated_by("anthropic")
+    assert body["narrated_by"] != "openrouter-byok"
+    assert body["provider"] == "anthropic"
+    assert fake_byok == [("anthropic", DUMMY_KEY, DUMMY_MODEL)]
+    _assert_no_key_leak(resp)
+
+
+def test_diagnose_with_byok_reports_byok_id_not_the_requested_provider(client, fake_byok):
     capture_id = _upload_txt(client, "Pixel").json()["capture_id"]
     resp = client.post(
         f"/api/captures/{capture_id}/diagnose",
-        data={"question": "did it crash?", "provider": "stub",
+        data={"question": "did it crash?", "provider": "openrouter",
               "byok_api_key": DUMMY_KEY, "byok_model": DUMMY_MODEL},
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["narrated_by"] == "openrouter-byok"
-    assert body["provider"] == "stub"
+    assert body["provider"] == "openrouter"
     assert body["llm_error"] is None
     _assert_no_key_leak(resp)
 
@@ -93,13 +125,13 @@ def test_investigation_diagnose_with_byok_reports_byok_id(client, fake_byok):
     _upload_txt(client, "Pixel", investigation_label="inv-84")
     resp = client.post(
         "/api/investigations/inv-84/diagnose",
-        data={"question": "did it crash?", "provider": "stub",
+        data={"question": "did it crash?", "provider": "openrouter",
               "byok_api_key": DUMMY_KEY, "byok_model": DUMMY_MODEL},
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["narrated_by"] == "openrouter-byok"
-    assert body["provider"] == "stub"
+    assert body["provider"] == "openrouter"
     _assert_no_key_leak(resp)
 
 
@@ -125,12 +157,13 @@ def test_explicit_stub_without_key_reports_stub(client):
 
 
 def test_byok_with_gate_closed_reports_no_narrator(client):
-    # BYOK default-off: key supplied, gate closed -> narration fails, so
-    # nothing narrated and no source label (never "Stub", never the key).
+    # BYOK default-off: key supplied for a BYOK-capable provider, gate
+    # closed -> narration fails, so nothing narrated and no source label
+    # (never "Stub", never the key).
     capture_id = _upload_txt(client, "Pixel").json()["capture_id"]
     resp = client.post(
         f"/api/captures/{capture_id}/scan",
-        data={"provider": "stub", "byok_api_key": DUMMY_KEY},
+        data={"provider": "openrouter", "byok_api_key": DUMMY_KEY},
     )
     body = resp.json()
     assert body["report"] is None

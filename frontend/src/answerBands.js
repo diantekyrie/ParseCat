@@ -64,14 +64,20 @@ export function splitNarrationSections(reportText) {
   };
 }
 
-/** "Narrated by" source label (#84).
+/** "Narrated by" source label (#84, widened for multi-provider BYOK on #123).
  *
  * The backend echoes the REQUESTED `provider` (e.g. "stub" from the
  * dropdown) but a BYOK key overrides it, so that echo must never be used as
  * the source label when `narrated_by` (the provider that actually ran) is
  * available. Rules:
- *   - `narrated_by` present and non-empty -> label for that id
- *     ("openrouter-byok" -> "OpenRouter (your key)").
+ *   - `narrated_by` present and non-empty -> label for that id. A BYOK id
+ *     is "<base provider id>-byok" (e.g. "anthropic-byok"), one per
+ *     provider now that BYOK covers more than just OpenRouter -- see
+ *     `byokProviderId` below, which backend/app/llm/__init__.py's
+ *     `byok_narrated_by()` mirrors. Labelled as that provider's own
+ *     `providers` list label + " (your key)", so it can never say the
+ *     wrong vendor ran it (the #116-era bug this replaces: every BYOK
+ *     provider used to collapse onto a single hardcoded "openrouter-byok").
  *   - `narrated_by` present but null -> no label (narration failed or the
  *     backend could not resolve what ran) rather than a guessed one.
  *   - `narrated_by` absent (older backend) -> fall back to `provider`, but
@@ -79,12 +85,24 @@ export function splitNarrationSections(reportText) {
  *     then `provider` is not what ran.
  *   - A BYOK request never gets the Stub label.
  */
-export const BYOK_PROVIDER_ID = "openrouter-byok";
-export const BYOK_PROVIDER_LABEL = "OpenRouter (your key)";
+const BYOK_SUFFIX = "-byok";
 export const UNKNOWN_NARRATOR_EXPORT = "unknown (no narration, or source not reported)";
 
+/** The narrated_by id for a BYOK call to `baseProviderId` (e.g.
+ * "anthropic" -> "anthropic-byok"). Mirrors backend/app/llm/__init__.py's
+ * byok_narrated_by() -- kept here too since labelForId needs to recognize
+ * the shape without a round-trip to the backend. */
+export function byokProviderId(baseProviderId) {
+  return `${baseProviderId}${BYOK_SUFFIX}`;
+}
+
 function labelForId(id, providers) {
-  if (id === BYOK_PROVIDER_ID) return BYOK_PROVIDER_LABEL;
+  if (id.endsWith(BYOK_SUFFIX)) {
+    const baseId = id.slice(0, -BYOK_SUFFIX.length);
+    const match = (providers || []).find((p) => p && p.id === baseId);
+    const baseLabel = (match && match.label) || baseId;
+    return `${baseLabel} (your key)`;
+  }
   const match = (providers || []).find((p) => p && p.id === id);
   return (match && match.label) || id;
 }

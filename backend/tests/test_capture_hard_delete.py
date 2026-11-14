@@ -14,6 +14,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.db import get_session
 from app.main import app
+from tests.conftest import TEST_USER_ID, auth_headers
 from app.models.db_models import (
     Capture,
     CrashEventRow,
@@ -57,7 +58,10 @@ def client(engine):
             yield session
 
     app.dependency_overrides[get_session] = _override_session
-    with TestClient(app) as c:
+    # SessionAuthMiddleware gates every /api/* route on this branch -- a
+    # bare TestClient(app) 401s before the route body (and _owned_capture's
+    # ownership check) ever runs. See tests/conftest.py's auth_headers().
+    with TestClient(app, headers=auth_headers()) as c:
         yield c
     app.dependency_overrides.clear()
 
@@ -155,7 +159,11 @@ def _seed_one_row_in_every_fk_table(session, capture_id: int) -> list[str]:
 
 
 def _device(session, label="synthetic-hard-delete-phone"):
-    device = Device(label=label)
+    # owner_user_id must match auth_headers()'s TEST_USER_ID, or
+    # delete_capture's _owned_capture() ownership check 404s the HTTP-level
+    # tests even though the capture is real (this branch scopes every
+    # capture route through its owning Device -- see routes.py).
+    device = Device(label=label, owner_user_id=TEST_USER_ID)
     session.add(device)
     session.commit()
     session.refresh(device)
@@ -410,6 +418,36 @@ def test_delete_endpoint_returns_404_afterward(client, session, delete_enabled):
     # Re-deleting an already-deleted capture (flag still ON) is "Unknown
     # capture" 404, not the flag-off 404.
     assert client.delete(f"/api/captures/{cid}").status_code == 404
+
+
+def test_delete_endpoint_404s_and_leaves_intact_for_another_users_capture(
+    session, delete_enabled,
+):
+    """#122's ownership gap, closed here: the auth token in `client` carries
+    TEST_USER_ID, but a capture owned by a DIFFERENT user must 404 the same
+    way an unknown id does -- same _owned_capture() scoping as every other
+    /captures/{id} route -- and the capture must survive the attempt."""
+    other_user_device = Device(label="someone-elses-phone", owner_user_id=TEST_USER_ID + 1)
+    session.add(other_user_device)
+    session.commit()
+    session.refresh(other_user_device)
+    cap = _capture(session, other_user_device)
+    _seed_dependent_rows(session, cap.id)
+    cid = cap.id
+
+    def _override_session():
+        yield session
+
+    app.dependency_overrides[get_session] = _override_session
+    try:
+        with TestClient(app, headers=auth_headers()) as other_client:
+            resp = other_client.delete(f"/api/captures/{cid}")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 404
+    assert session.get(Capture, cid) is not None
+    assert tables_referencing_capture(session, cid)  # still non-empty
 
 
 def test_delete_endpoint_then_scan_returns_404(client, session, delete_enabled):

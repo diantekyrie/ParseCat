@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import pytest
 
+from app.auth import issue_session_token
+
 
 @pytest.fixture(autouse=True, scope="session")
 def _no_real_llm_keys_in_tests():
@@ -40,3 +42,34 @@ def _no_real_llm_keys_in_tests():
     for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "PARSECAT_ALLOW_LLM_EGRESS"):
         os.environ.pop(key, None)
     yield
+
+
+# app/auth.py's SessionAuthMiddleware fails every /api/* request that lacks
+# a valid session token -- correct for a real deploy, but it would 401 every
+# HTTP-level test in this suite otherwise. A fixed numeric id, not a real
+# provisioned User row: these call sites (test_api_user_flows.py and
+# friends) only need a token that gets them PAST the gate as some
+# consistent "logged-in user" so owner-scoped queries behave sensibly
+# within one test's own temp DB -- they aren't exercising the login flow or
+# real account data, so there's no need for an actual User row to exist.
+# test_auth.py is the one file that tests the real POST /api/auth/login
+# path end to end, including seeding a real user.
+TEST_USER_ID = 1
+
+
+def auth_headers() -> dict[str, str]:
+    """Authorization header carrying a freshly-minted, valid session token
+    for TEST_USER_ID -- pass to TestClient(app, headers=auth_headers())
+    wherever a test constructs a client directly, so it isn't 401'd by
+    SessionAuthMiddleware. Mints the token directly via issue_session_token()
+    rather than going through POST /api/auth/login, since these call sites
+    only need a client that's already past the gate, not to exercise the
+    login flow itself.
+
+    Named to avoid pytest collecting this as a test itself (anything
+    literally named test_* in a test file/module is fair game for pytest's
+    default collection, even a plain helper with no assertions in it).
+    """
+    token, _ = issue_session_token(TEST_USER_ID)
+    return {"Authorization": f"Bearer {token}"}
+

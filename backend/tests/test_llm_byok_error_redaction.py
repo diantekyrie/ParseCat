@@ -23,6 +23,7 @@ from app.db import get_session
 from app.llm import BYOK_ENV, EGRESS_ENV
 from app.main import app
 from app.services import reasoning
+from tests.conftest import auth_headers
 
 DUMMY_KEY = "sk-or-v1-0000dummy0000test0000fake0000notreal0000abcd"
 DUMMY_PREFIX = DUMMY_KEY[:8]
@@ -54,7 +55,7 @@ class _KeyEchoingClient:
 def client(monkeypatch):
     monkeypatch.delenv(EGRESS_ENV, raising=False)
     monkeypatch.setenv(BYOK_ENV, "1")
-    monkeypatch.setattr(reasoning, "get_byok_client", lambda key, model=None: _KeyEchoingClient())
+    monkeypatch.setattr(reasoning, "get_byok_client", lambda provider, key, model=None: _KeyEchoingClient())
 
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool,
@@ -66,7 +67,7 @@ def client(monkeypatch):
             yield session
 
     app.dependency_overrides[get_session] = _override_session
-    with TestClient(app) as c:
+    with TestClient(app, headers=auth_headers()) as c:
         yield c
     app.dependency_overrides.clear()
 
@@ -93,10 +94,12 @@ def _assert_no_key_material(body: dict):
 
 
 def test_diagnose_llm_error_does_not_echo_byok_key(client):
+    # _resolve_byok only applies byok_api_key when `provider` is itself
+    # BYOK-capable (app.llm.BYOK_PROVIDER_IDS) -- see routes.py.
     capture_id = _upload(client)
     resp = client.post(
         f"/api/captures/{capture_id}/diagnose",
-        data={"question": "why did it crash?", "byok_api_key": DUMMY_KEY},
+        data={"question": "why did it crash?", "provider": "openrouter", "byok_api_key": DUMMY_KEY},
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["report"] is None
@@ -105,7 +108,10 @@ def test_diagnose_llm_error_does_not_echo_byok_key(client):
 
 def test_scan_llm_error_does_not_echo_byok_key(client):
     capture_id = _upload(client)
-    resp = client.post(f"/api/captures/{capture_id}/scan", data={"byok_api_key": DUMMY_KEY})
+    resp = client.post(
+        f"/api/captures/{capture_id}/scan",
+        data={"provider": "openrouter", "byok_api_key": DUMMY_KEY},
+    )
     assert resp.status_code == 200, resp.text
     _assert_no_key_material(resp.json())
 
@@ -120,7 +126,7 @@ def test_run_llm_redacts_key_and_key_like_tokens_directly(monkeypatch):
                 f"and {DUMMY_MASKED}"
             )
 
-    monkeypatch.setattr(reasoning, "get_byok_client", lambda key, model=None: _Raiser())
+    monkeypatch.setattr(reasoning, "get_byok_client", lambda provider, key, model=None: _Raiser())
     report, llm_error, narrated_by = reasoning._run_llm(
         {"question": "t"}, "sys", provider=None, byok_api_key=DUMMY_KEY,
     )

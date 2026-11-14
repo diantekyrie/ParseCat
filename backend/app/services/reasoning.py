@@ -17,7 +17,7 @@ from sqlmodel import Session
 
 from sqlmodel import select
 
-from app.llm import BYOK_PROVIDER_ID, get_byok_client, get_llm_client, resolve_provider_id
+from app.llm import byok_narrated_by, get_byok_client, get_llm_client, resolve_provider_id
 from app.models.db_models import (
     AnrBlockingThreadRow,
     AnrMainThreadSnapshotRow,
@@ -1820,9 +1820,11 @@ def _run_llm(
     """Returns (report_text, llm_error, narrated_by).
 
     `narrated_by` is the provider id that actually produced report_text
-    (#84) -- BYOK_PROVIDER_ID when a visitor key ran, else the id
-    get_llm_client resolved (including auto-detect for provider=None). It
-    is always a fixed id from app.llm, never the key, a key prefix, the
+    (#84) -- byok_narrated_by(provider) when a saved/visitor key ran (one
+    id per BYOK provider since #123's multi-provider BYOK, never a single
+    constant -- see that function's docstring), else the id get_llm_client
+    resolved (including auto-detect for provider=None). It is always a
+    fixed id derived from app.llm, never the key, a key prefix, the
     visitor's model string, or the echoed request `provider`. None when
     narration failed (nothing was narrated) or the id can't be resolved,
     so the UI shows no source label rather than a wrong one.
@@ -1839,13 +1841,16 @@ def _run_llm(
         # could still hand this a whitespace-only string, which `if
         # byok_api_key:` alone would treat as a real key.
         byok_key = (byok_api_key or "").strip()
-        # A visitor-supplied key always wins over the `provider` dropdown --
-        # see get_byok_client for why this is a distinct consent path, not
-        # a bypass of the operator's own egress gate (and why it's gated
-        # off by default via BYOK_ENV).
+        # A user's own key always wins over the operator's configured key
+        # for whichever provider is selected -- see get_byok_client for why
+        # this is a distinct consent path (and why it's gated off by
+        # default via BYOK_ENV). The caller (app/api/routes.py's
+        # _resolve_byok) only ever hands byok_api_key through when
+        # `provider` is itself BYOK-capable, so `provider` here is already
+        # the right one to use for the BYOK client too.
         if byok_key:
-            llm = get_byok_client(byok_key, byok_model)
-            narrated_by = BYOK_PROVIDER_ID
+            llm = get_byok_client(provider, byok_key, byok_model)
+            narrated_by = byok_narrated_by(provider)
         else:
             llm = get_llm_client(provider)
             narrated_by = resolve_provider_id(provider)

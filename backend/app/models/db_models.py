@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Column, Dialect, types
+from sqlalchemy import Column, Dialect, UniqueConstraint, types
 from sqlalchemy.types import TypeDecorator
 from sqlmodel import Field, SQLModel
 
@@ -46,9 +46,84 @@ class AwareUTCDateTime(TypeDecorator):
         return value.astimezone(timezone.utc)
 
 
-class Device(SQLModel, table=True):
+class User(SQLModel, table=True):
+    """An account under the per-user login (see app/auth.py). Deliberately
+    no self-service signup: accounts are provisioned by the operator via
+    PARSECAT_BOOTSTRAP_USERS at startup, not created through the API --
+    see provision_bootstrap_users().
+    """
+
     id: Optional[int] = Field(default=None, primary_key=True)
-    label: str = Field(index=True, unique=True)  # user-chosen nickname, e.g. "work phone" -- not a serial
+    username: str = Field(index=True, unique=True)
+    password_hash: str
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(AwareUTCDateTime(), nullable=False),
+    )
+
+
+class UserByokKey(SQLModel, table=True):
+    """One user's own key for one third-party LLM provider -- see
+    app.llm.BYOK_PROVIDER_IDS (anthropic/openai/grok/openrouter) and
+    app/api/routes.py's /api/account/byok/{provider} endpoints. A separate
+    table, not columns on User, because BYOK now spans 4 distinct provider
+    APIs rather than being OpenRouter-only (its original, narrower design);
+    one row per (user, provider) lets someone save a key for just the
+    providers they actually have, not all-or-nothing.
+
+    Stored as plaintext, not encrypted at rest: this is a small-team
+    internal tool on a single SQLite file, not a service that holds other
+    people's keys at scale, and PUT /api/account/byok/{provider} is the
+    only write path while GET only ever reports whether one is set (never
+    echoes the value back) -- see routes.py for why that boundary matters
+    more here than encryption would.
+    """
+
+    __table_args__ = (UniqueConstraint("user_id", "provider", name="uq_byok_user_provider"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    provider: str = Field(index=True)  # one of app.llm.BYOK_PROVIDER_IDS
+    api_key: str
+    model: Optional[str] = None
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(AwareUTCDateTime(), nullable=False),
+    )
+
+
+class RefreshToken(SQLModel, table=True):
+    """Long-lived credential behind the httpOnly refresh cookie (see
+    app/auth.py's refresh-token flow). Stored hashed, never the raw value --
+    same spirit as User.password_hash, a DB leak shouldn't hand out usable
+    tokens. Unlike the short-lived, stateless access token, this is a real
+    DB row, which is what makes POST /api/auth/logout an actual revocation
+    rather than just the browser discarding a cookie it still technically
+    could have reused.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    token_hash: str = Field(index=True, unique=True)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(AwareUTCDateTime(), nullable=False),
+    )
+    expires_at: datetime = Field(sa_column=Column(AwareUTCDateTime(), nullable=False))
+    revoked_at: Optional[datetime] = Field(default=None, sa_column=Column(AwareUTCDateTime(), nullable=True))
+
+
+class Device(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("owner_user_id", "label", name="uq_device_owner_label"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    label: str = Field(index=True)  # user-chosen nickname, e.g. "work phone" -- unique per owner, not globally
+    # Nullable so synthetic/unit tests that construct a Device without an
+    # authenticated request still work (see persistence.py's default), but
+    # every device created through the real upload API always has one --
+    # see app/auth.py get_current_user_id and app/db.py's backfill for
+    # anything pre-existing from before this column existed.
+    owner_user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(AwareUTCDateTime(), nullable=False),
@@ -79,8 +154,11 @@ class Capture(SQLModel, table=True):
 
 
 class Investigation(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("owner_user_id", "label", name="uq_investigation_owner_label"),)
+
     id: Optional[int] = Field(default=None, primary_key=True)
-    label: str = Field(index=True, unique=True)
+    label: str = Field(index=True)  # unique per owner, not globally -- see Device.label
+    owner_user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)  # see Device.owner_user_id
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(AwareUTCDateTime(), nullable=False),

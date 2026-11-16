@@ -531,8 +531,9 @@ class LocationSnapshotRow(SQLModel, table=True):
 class LocationProviderRow(SQLModel, table=True):
     """One provider's last known fix. Latitude/longitude are a real physical
     position; new rows store them coarsened to 2 decimal degrees (~1 km)
-    at persist time. Existing rows are not backfilled. Callers still use
-    location.redacted_coords() before any of this leaves the machine.
+    at persist time. Existing rows are not backfilled. Anything sent
+    off-device omits coordinates (see reasoning.py); redacted_coords()
+    is available if a coarse form is ever needed.
     """
 
     id: Optional[int] = Field(default=None, primary_key=True)

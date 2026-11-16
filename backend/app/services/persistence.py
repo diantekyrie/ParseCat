@@ -235,8 +235,10 @@ def coarsen_lat_long(value: float | None) -> float | None:
 # redact_pii() (emails, phones, IMEI/MEID/IMSI/ICCID, account names).
 # Structured identifiers (serial, fingerprint, MAC, SSID/BSSID) stay
 # intact per Knucklez's Nov 10 call on #95 -- they are the diagnosis
-# itself. Latitude/longitude are coarsened to 2 decimal degrees
-# (~1 km) at this persist boundary only; see coarsen_lat_long().
+# itself. Structured latitude/longitude on LocationProviderRow are
+# coarsened to 2 decimal degrees (~1 km) at this persist boundary only;
+# see coarsen_lat_long(). Coordinate-shaped values in free-text columns
+# (crash messages, kernel lines, etc.) are not coarsened here.
 # CDM/companion display_name (a user-chosen nickname, e.g. "Jane's Watch")
 # also goes through redact_pii() to catch an email/phone typed into the
 # field, but whether the nickname itself should be redacted outright is

@@ -32,10 +32,10 @@ very easy to overclaim:
 
 * **Coordinates are treated as sensitive.** A last-known fix is the
   user's real physical location, frequently their home. Coordinates are
-  parsed and stored locally, but `redacted_coords()` exists so callers
-  can keep them out of anything sent to a third-party LLM; the
-  diagnostic value lives in the accuracy radius and provider, not the
-  latitude.
+  parsed at full precision and coarsened to 2 decimal degrees (~1 km)
+  when stored. `redacted_coords()` exists so callers can keep them out
+  of anything sent to a third-party LLM; the diagnostic value lives in
+  the accuracy radius and provider, not the latitude.
 
 * **"none" is not "poor".** Android emits `none` both while a fix is
   being acquired and when GPS is off. Treating it as a bad-reception
@@ -122,8 +122,10 @@ def redacted_coords(lat: float | None, lon: float | None) -> str:
 
     Rounded to one decimal degree -- roughly 11 km, enough to distinguish
     "a fix existed here" from "a fix existed 300 km away" without carrying
-    someone's home address into a third-party API request. The precise
-    values stay in the local database for the UI.
+    someone's home address into a third-party API request. Stored values
+    are separately coarsened to 2 decimal degrees (~1 km) at persist time;
+    this helper is the coarser form used when a fix would leave the machine.
+    Parser output keeps full precision.
     """
     if lat is None or lon is None:
         return "unknown"

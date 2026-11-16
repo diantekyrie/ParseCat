@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_EVEN
 
 from sqlmodel import Session, select
 
@@ -206,10 +207,36 @@ def _as_utc(dt: datetime | None) -> datetime | None:
     return dt
 
 
+# Two decimal degrees is about 1 km at the equator (Knucklez, #95, Nov 10).
+_LAT_LONG_AT_REST_QUANTUM = Decimal("0.01")
+
+
+def coarsen_lat_long(value: float | None) -> float | None:
+    """Round a latitude or longitude to 2 decimal degrees for storage.
+
+    None stays None. The value is converted with Decimal(str(value)) so
+    rounding uses the number's decimal representation rather than the
+    binary float, then quantized with ROUND_HALF_EVEN (banker's rounding).
+    Halfway cases go to the even hundredth, and negatives are handled
+    correctly (for example -122.419416 becomes -122.42).
+
+    Applied only at the persist boundary. Parser output and in-memory
+    diagnosis keep full precision. Existing rows are not backfilled.
+    """
+    if value is None:
+        return None
+    quantized = Decimal(str(value)).quantize(
+        _LAT_LONG_AT_REST_QUANTUM, rounding=ROUND_HALF_EVEN,
+    )
+    return float(quantized)
+
+
 # Free-text columns copied verbatim from device logs go through
 # redact_pii() (emails, phones, IMEI/MEID/IMSI/ICCID, account names).
-# Structured identifiers (serial, fingerprint, MAC, SSID/BSSID, lat/long)
-# are intentionally untouched pending a separate FE/owner policy decision.
+# Structured identifiers (serial, fingerprint, MAC, SSID/BSSID) stay
+# intact per Knucklez's Nov 10 call on #95 -- they are the diagnosis
+# itself. Latitude/longitude are coarsened to 2 decimal degrees
+# (~1 km) at this persist boundary only; see coarsen_lat_long().
 # CDM/companion display_name (a user-chosen nickname, e.g. "Jane's Watch")
 # also goes through redact_pii() to catch an email/phone typed into the
 # field, but whether the nickname itself should be redacted outright is
@@ -540,7 +567,8 @@ def persist_capture(
         for pr in loc.providers:
             session.add(LocationProviderRow(
                 capture_id=capture.id, name=pr.name, last_fix_provider=pr.last_fix_provider,
-                latitude=pr.latitude, longitude=pr.longitude,
+                latitude=coarsen_lat_long(pr.latitude),
+                longitude=coarsen_lat_long(pr.longitude),
                 horizontal_accuracy_m=pr.horizontal_accuracy_m, satellites=pr.satellites,
                 max_cn0=pr.max_cn0, mean_cn0=pr.mean_cn0,
                 source_section=pr.source_ref.section,

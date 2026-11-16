@@ -6,8 +6,11 @@ Scope, deliberately narrow:
     (crash / root-cause messages, kernel log lines, ANR subject/reason,
     focus / BT-framework / CDM detail, am_kill reason, tombstone cmdline).
   * Structured identifiers the parsers extract on purpose (serial, build
-    fingerprint, BT / companion MAC, SSID / BSSID, lat/long) are NOT touched
-    here; whether to keep them at rest is a separate FE / owner policy call.
+    fingerprint, BT / companion MAC, SSID / BSSID) are NOT touched here;
+    Knucklez's Nov 10 call on #95 keeps them at rest. Latitude/longitude
+    are also left alone here; they are coarsened to 2 decimal degrees at
+    the persist boundary (see persistence.coarsen_lat_long), not by this
+    free-text scrubber.
 
 Patterns are conservative by design: a missed bare number is preferable to
 mangling a timestamp, PID, hex address, MAC, version string or build

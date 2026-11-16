@@ -605,8 +605,10 @@ class LocationProviderState:
     """One location provider's last known fix.
 
     `latitude`/`longitude` are a real physical position -- often someone's
-    home. They are kept locally for the UI; use location.redacted_coords()
-    before putting a fix into anything sent off-device.
+    home. This in-memory object keeps full parser precision; persist
+    coarsens stored values to 2 decimal degrees (~1 km). Use
+    location.redacted_coords() before putting a fix into anything sent
+    off-device.
     """
 
     name: str                        # "gps" | "network" | "fused" | "passive" | ...

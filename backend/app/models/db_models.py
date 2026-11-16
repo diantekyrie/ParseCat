@@ -530,8 +530,10 @@ class LocationSnapshotRow(SQLModel, table=True):
 
 class LocationProviderRow(SQLModel, table=True):
     """One provider's last known fix. Latitude/longitude are a real physical
-    position and stay local -- callers use location.redacted_coords() before
-    any of this leaves the machine."""
+    position; new rows store them coarsened to 2 decimal degrees (~1 km)
+    at persist time. Existing rows are not backfilled. Callers still use
+    location.redacted_coords() before any of this leaves the machine.
+    """
 
     id: Optional[int] = Field(default=None, primary_key=True)
     capture_id: int = Field(foreign_key="capture.id", index=True)
